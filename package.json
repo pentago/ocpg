@@ -15,11 +15,12 @@
   "keywords": [
     "opencode-plugin",
     "opencode",
+    "postgres",
     "memory"
   ],
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+ssh://git@github.com/pentago/opmem.git"
+    "url": "https://github.com/pentago/opmem.git"
   }
 }

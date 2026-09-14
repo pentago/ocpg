@@ -1,0 +1,267 @@
+// opmem - DB access layer for OpenCode persistent memory plugin.
+// Canonical source: /home/dzhi/git/personal/opmem/opmem.ts
+// OpenCode loads it via a symlink at ~/.config/opencode/plugins/opmem.ts (created at cutover).
+import { SQL } from "bun";
+import type { Plugin } from "@opencode-ai/plugin";
+import { tool } from "@opencode-ai/plugin";
+import { z } from "zod";
+
+// Credentials resolved ONCE at module init — the only permitted spawn in this file.
+const user = process.env.POSTGRES_MEMORY_MCP_USER || "pguser";
+const password =
+  process.env.POSTGRES_MEMORY_MCP_PASSWORD ||
+  Bun.spawnSync(["pass", "show", "postgres-workstation-password"])
+    .stdout.toString()
+    .trim();
+
+const sql = new SQL(
+  `postgres://${encodeURIComponent(user)}:${encodeURIComponent(password)}@localhost:5432/agent-memory`,
+  { max: 2 },
+);
+
+export interface MemoryRow {
+  id: number;
+  content: string;
+  tags: string[] | null;
+  project: string;
+  date: string;
+}
+
+// --- Rate-limited error logging ---
+
+const lastLogTime = new Map<string, number>();
+
+function rateLimitOk(kind: string): boolean {
+  const now = Date.now();
+  const last = lastLogTime.get(kind) ?? 0;
+  if (now - last < 60_000) return false;
+  lastLogTime.set(kind, now);
+  return true;
+}
+
+let pluginClient: { app: { log: (entry: unknown) => void } } | null = null;
+
+function logError(
+  client: { app: { log: (entry: unknown) => void } } | null,
+  message: string,
+): void {
+  const c = client ?? pluginClient;
+  if (!c?.app?.log) return;
+  if (!rateLimitOk("db-error")) return;
+  c.app.log({ body: { service: "opmem", level: "error", message } });
+}
+
+// --- Injection pipeline ---
+
+function truncateMemory(content: string): string {
+  if (content.length <= 600) return content;
+  return content.slice(0, 600) + "…[truncated]";
+}
+
+function formatBlock(rows: MemoryRow[], projectDir: string): string {
+  const lines: string[] = [
+    "<persistent-project-memory>",
+    `Project: ${projectDir}`,
+    "Memories:",
+  ];
+  for (const row of rows) {
+    const tags = row.tags ?? [];
+    const tagStr = tags.length ? ` [${tags.join(", ")}]` : "";
+    lines.push(`- [${row.date}]${tagStr} ${truncateMemory(row.content)}`);
+  }
+  lines.push("");
+  lines.push(
+    "Before non-trivial work, check these. After user corrections, architecture decisions, or non-trivial fixes, call memory_remember. Use memory_recall to search past lessons.",
+  );
+  lines.push("</persistent-project-memory>");
+  return lines.join("\n");
+}
+
+const injectionCache = new Map<string, string>();
+
+async function handleTransform(
+  input: { sessionID?: string; model: Record<string, unknown> },
+  output: { system: string[] },
+  directory: string,
+): Promise<void> {
+  if (!input.sessionID) return;
+  const sid = input.sessionID;
+  const cached = injectionCache.get(sid);
+  if (cached !== undefined) {
+    output.system.push(cached);
+    return;
+  }
+  try {
+    const rows = await sql`
+      SELECT content, coalesce(tags, '{}') AS tags,
+             to_char(created_at, 'YYYY-MM-DD') AS date
+      FROM memories
+      WHERE project = ${directory}
+      ORDER BY created_at DESC
+      LIMIT 5
+    ` as MemoryRow[];
+    const block = formatBlock(rows, directory);
+    // Evict oldest entry when cache exceeds 32
+    if (injectionCache.size >= 32) {
+      const firstKey = injectionCache.keys().next().value!;
+      injectionCache.delete(firstKey);
+    }
+    injectionCache.set(sid, block);
+    output.system.push(block);
+  } catch (e: unknown) {
+    logError(null, `opmem injection failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
+// --- Dispose ---
+
+async function dispose(): Promise<void> {
+  await sql.close().catch(() => {});
+}
+
+// --- Agent tools: recall + remember with dedup-on-write ---
+
+function normalizeTags(tags: string[] | undefined, projectDir: string): string[] {
+  const input = tags ?? [];
+  const base = projectDir.split('/').pop() ?? projectDir;
+  return [...input, `project:${base}`];
+}
+
+async function recall(
+  args: { query?: string; global?: boolean; limit?: number },
+  ctx: { directory: string },
+): Promise<string> {
+  try {
+    const limit = Math.min(Math.max(args.limit ?? 5, 1), 20);
+    const projectCond = args.global
+      ? sql``
+      : sql`AND project = ${ctx.directory}`;
+    const queryCond = args.query
+      ? sql`AND search_vector @@ plainto_tsquery('english', ${args.query})`
+      : sql``;
+
+    const rows = await sql`
+      SELECT id, content, coalesce(tags, '{}') AS tags,
+             to_char(created_at, 'YYYY-MM-DD') AS date,
+             project
+      FROM memories
+      WHERE 1=1 ${projectCond} ${queryCond}
+      ORDER BY created_at DESC
+      LIMIT ${limit}
+    ` as MemoryRow[];
+
+    if (rows.length === 0) return "No memories found.";
+
+    return rows
+      .map((r) => {
+        const tags = r.tags ?? [];
+        const tagStr = tags.length ? ` (${tags.join(', ')})` : '';
+        return `[${r.date}] [${r.project}]${tagStr}\n#${r.id}\n${r.content}`;
+      })
+      .join('\n---\n');
+  } catch (e: unknown) {
+    logError(null, `opmem recall failed: ${e instanceof Error ? e.message : String(e)}`);
+    return `ERROR: ${e instanceof Error ? e.message : String(e)}`;
+  }
+}
+
+async function remember(
+  args: { content: string; tags?: string[] },
+  ctx: { directory: string; sessionID: string },
+): Promise<string> {
+  try {
+    if (args.content.length < 10) {
+      return 'ERROR: content must be at least 10 characters.';
+    }
+
+    const normalizedTags = normalizeTags(args.tags, ctx.directory);
+    const basename = ctx.directory.split('/').pop() ?? ctx.directory;
+
+    // Dedup: project-scoped, common-opening-words AND-match via FTS
+    const dedup = await sql`
+      SELECT id FROM memories
+      WHERE project = ${ctx.directory}
+        AND (
+          content = ${args.content}
+          OR search_vector @@ plainto_tsquery('english', ${args.content.slice(0, 60)})
+        )
+      ORDER BY created_at DESC
+      LIMIT 1
+    ` as { id: number }[];
+
+    if (dedup.length > 0) {
+      // ponytail: dedup uses common-opening-words AND-match across rows via FTS
+      // so false positives are expected; upgrade path = pg_trgm similarity or
+      // wider dedup scope.
+      return `Similar memory already stored as #${dedup[0].id} for this project; skipping insert.`;
+    }
+
+    const inserted = await sql`
+      INSERT INTO memories (content, tags, session_id, project)
+      VALUES (${args.content}, ${normalizedTags}, ${ctx.sessionID}, ${ctx.directory})
+      RETURNING id
+    ` as { id: number }[];
+
+    invalidateInjection(ctx.sessionID);
+    return `Stored memory #${inserted[0].id} for project ${basename}.`;
+  } catch (e: unknown) {
+    logError(null, `opmem remember failed: ${e instanceof Error ? e.message : String(e)}`);
+    return `ERROR: ${e instanceof Error ? e.message : String(e)}`;
+  }
+}
+
+function invalidateInjection(sessionID: string): void {
+  injectionCache.delete(sessionID);
+}
+
+export const __internals = {
+  sql,
+  truncateMemory,
+  formatBlock,
+  handleTransform,
+  normalizeTags,
+  recall,
+  remember,
+  invalidateInjection,
+  logError,
+  rateLimitOk,
+  setClient: (client: { app: { log: (entry: unknown) => void } }) => {
+    pluginClient = client;
+  },
+  dispose,
+};
+
+export default (async (client) => {
+  setClient(client);
+  return {
+    "experimental.chat.system.transform": async (input, output) => {
+      await handleTransform(input, output, client.directory);
+    },
+    tool: {
+      memory_recall: tool({
+        description:
+          "Search past memories stored for this project. Use before non-trivial work to check for relevant lessons, fixes, and decisions.",
+        args: {
+          query: z.string().optional(),
+          global: z.boolean().optional(),
+          limit: z.number().optional(),
+        },
+        execute: async (args, ctx) => {
+          return await recall(args, ctx);
+        },
+      }),
+      memory_remember: tool({
+        description:
+          "Store a memory for this project. Use after user corrections, architecture decisions, or non-trivial fixes.",
+        args: {
+          content: z.string().min(10),
+          tags: z.array(z.string()).optional(),
+        },
+        execute: async (args, ctx) => {
+          return await remember(args, ctx);
+        },
+      }),
+    },
+    dispose,
+  };
+}) satisfies Plugin;

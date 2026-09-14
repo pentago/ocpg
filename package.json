@@ -1,0 +1,25 @@
+{
+  "name": "opmem",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Postgres-backed persistent memory plugin for OpenCode",
+  "main": "opmem.ts",
+  "exports": {
+    ".": "./opmem.ts",
+    "./server": "./opmem.ts"
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "^1.18.29",
+    "zod": "^4.1.8"
+  },
+  "keywords": [
+    "opencode-plugin",
+    "opencode",
+    "memory"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/pentago/opmem.git"
+  }
+}

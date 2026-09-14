@@ -1,5 +1,5 @@
 import { describe, test, expect } from "bun:test";
-import { __internals } from "../opmem";
+import { __internals } from "../ocpg";
 import { SQL } from "bun";
 
 describe("DB access layer", () => {
@@ -126,6 +126,14 @@ test("QA: dispose on never-connected client does not throw", async () => {
   expect(true).toBe(true);
 });
 
+test("QA: reconfigure swaps pool; options override defaults", async () => {
+  const before = __internals.sql;
+  __internals.reconfigure({ host: "127.0.0.1", port: 5433, user: "x", database: "y" });
+  expect(__internals.sql).not.toBe(before);
+  await __internals.sql.close().catch(() => {});
+  __internals.reconfigure({}); // restore env/default pool
+});
+
 test("QA: rate-limited error logging on DB failure", async () => {
   const captured: unknown[] = [];
   const stubClient = { app: { log: (i: unknown) => captured.push(i) } };
@@ -157,9 +165,9 @@ test("QA: rate-limited error logging on DB failure", async () => {
   expect(captured.length).toBe(1);
   expect(captured[0]).toEqual({
     body: {
-      service: "opmem",
+      service: "ocpg",
       level: "error",
-      message: expect.stringContaining("opmem injection failed"),
+      message: expect.stringContaining("ocpg injection failed"),
     },
   });
 

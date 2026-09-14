@@ -1,21 +1,44 @@
-// opmem - DB access layer for OpenCode persistent memory plugin.
+// ocpg - DB access layer for OpenCode persistent memory plugin.
 import { SQL } from "bun";
 import type { Plugin } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import { z } from "zod";
 
-// Credentials resolved ONCE at module init — the only permitted spawn in this file.
-const user = process.env.POSTGRES_MEMORY_MCP_USER || "pguser";
+// --- DB config: plugin options > env > defaults. Password is deliberately env-only (never in config).
+type DbOptions = {
+  host?: string;
+  port?: number;
+  user?: string;
+  database?: string;
+};
+type DbConfig = Required<DbOptions>;
+
+// Defaults resolved ONCE at module init — the pass lookup here is the only permitted spawn in this file.
+const defaultConfig: DbConfig = {
+  host: process.env.OCPG_HOST || "localhost",
+  port: Number(process.env.OCPG_PORT) || 5432,
+  user: process.env.OCPG_USER || "pguser",
+  database: process.env.OCPG_DB || "agent-memory",
+};
 const password =
-  process.env.POSTGRES_MEMORY_MCP_PASSWORD ||
+  process.env.OCPG_PASSWORD ||
   Bun.spawnSync(["pass", "show", "postgres-workstation-password"])
     .stdout.toString()
     .trim();
 
-const sql = new SQL(
-  `postgres://${encodeURIComponent(user)}:${encodeURIComponent(password)}@localhost:5432/agent-memory`,
-  { max: 2 },
-);
+function connectUrl(cfg: DbConfig): string {
+  return `postgres://${encodeURIComponent(cfg.user)}:${encodeURIComponent(password)}@${cfg.host}:${cfg.port}/${cfg.database}`;
+}
+
+let sql = new SQL(connectUrl(defaultConfig), { max: 2 });
+
+// Swap the pool when the plugin loads with config options (["pentago/ocpg", {...}] in opencode.json).
+// No-op without options so the module-level env/default config stands. Pools are lazy — a never-connected pool closes cleanly.
+function reconfigure(options?: DbOptions): void {
+  if (!options) return;
+  void sql.close().catch(() => {});
+  sql = new SQL(connectUrl({ ...defaultConfig, ...options }), { max: 2 });
+}
 
 export interface MemoryRow {
   id: number;
@@ -46,7 +69,7 @@ function logError(
   const c = client ?? pluginClient;
   if (!c?.app?.log) return;
   if (!rateLimitOk("db-error")) return;
-  c.app.log({ body: { service: "opmem", level: "error", message } });
+  c.app.log({ body: { service: "ocpg", level: "error", message } });
 }
 
 // --- Injection pipeline ---
@@ -107,7 +130,7 @@ async function handleTransform(
     injectionCache.set(sid, block);
     output.system.push(block);
   } catch (e: unknown) {
-    logError(null, `opmem injection failed: ${e instanceof Error ? e.message : String(e)}`);
+    logError(null, `ocpg injection failed: ${e instanceof Error ? e.message : String(e)}`);
   }
 }
 
@@ -158,7 +181,7 @@ async function recall(
       })
       .join('\n---\n');
   } catch (e: unknown) {
-    logError(null, `opmem recall failed: ${e instanceof Error ? e.message : String(e)}`);
+    logError(null, `ocpg recall failed: ${e instanceof Error ? e.message : String(e)}`);
     return `ERROR: ${e instanceof Error ? e.message : String(e)}`;
   }
 }
@@ -203,7 +226,7 @@ async function remember(
     invalidateInjection(ctx.sessionID);
     return `Stored memory #${inserted[0].id} for project ${basename}.`;
   } catch (e: unknown) {
-    logError(null, `opmem remember failed: ${e instanceof Error ? e.message : String(e)}`);
+    logError(null, `ocpg remember failed: ${e instanceof Error ? e.message : String(e)}`);
     return `ERROR: ${e instanceof Error ? e.message : String(e)}`;
   }
 }
@@ -213,7 +236,10 @@ function invalidateInjection(sessionID: string): void {
 }
 
 export const __internals = {
-  sql,
+  get sql() {
+    return sql;
+  },
+  reconfigure,
   truncateMemory,
   formatBlock,
   handleTransform,
@@ -229,8 +255,9 @@ export const __internals = {
   dispose,
 };
 
-export default (async (client) => {
+export default (async (client, options) => {
   setClient(client);
+  reconfigure(options as DbOptions | undefined);
   return {
     "experimental.chat.system.transform": async (input, output) => {
       await handleTransform(input, output, client.directory);

@@ -1,5 +1,7 @@
 import { describe, test, expect } from "bun:test";
-import { __internals } from "../ocpg";
+import ocpg from "../ocpg";
+
+const { __internals } = ocpg;
 import { SQL } from "bun";
 
 describe("DB access layer", () => {

@@ -26,18 +26,27 @@ const password =
     .stdout.toString()
     .trim();
 
-function connectUrl(cfg: DbConfig): string {
-  return `postgres://${encodeURIComponent(cfg.user)}:${encodeURIComponent(password)}@${cfg.host}:${cfg.port}/${cfg.database}`;
+// Options-object constructor, not a URL string: Bun's SQL parses string URLs via
+// url.parse(), which emits the DEP0169 DeprecationWarning at plugin load under opencode.
+function makeSql(cfg: DbConfig): SQL {
+  return new SQL({
+    hostname: cfg.host,
+    port: cfg.port,
+    username: cfg.user,
+    password,
+    database: cfg.database,
+    max: 2,
+  });
 }
 
-let sql = new SQL(connectUrl(defaultConfig), { max: 2 });
+let sql = makeSql(defaultConfig);
 
 // Swap the pool when the plugin loads with config options (["pentago/ocpg", {...}] in opencode.json).
 // No-op without options so the module-level env/default config stands. Pools are lazy — a never-connected pool closes cleanly.
 function reconfigure(options?: DbOptions): void {
   if (!options) return;
   void sql.close().catch(() => {});
-  sql = new SQL(connectUrl({ ...defaultConfig, ...options }), { max: 2 });
+  sql = makeSql({ ...defaultConfig, ...options });
 }
 
 export interface MemoryRow {
@@ -61,6 +70,10 @@ function rateLimitOk(kind: string): boolean {
 }
 
 let pluginClient: { app: { log: (entry: unknown) => void } } | null = null;
+
+function setClient(client: { app: { log: (entry: unknown) => void } }): void {
+  pluginClient = client;
+}
 
 function logError(
   client: { app: { log: (entry: unknown) => void } } | null,
@@ -235,7 +248,7 @@ function invalidateInjection(sessionID: string): void {
   injectionCache.delete(sessionID);
 }
 
-export const __internals = {
+const __internals = {
   get sql() {
     return sql;
   },
@@ -249,13 +262,11 @@ export const __internals = {
   invalidateInjection,
   logError,
   rateLimitOk,
-  setClient: (client: { app: { log: (entry: unknown) => void } }) => {
-    pluginClient = client;
-  },
+  setClient,
   dispose,
 };
 
-export default (async (client, options) => {
+const plugin = (async (client, options) => {
   setClient(client);
   reconfigure(options as DbOptions | undefined);
   return {
@@ -290,3 +301,9 @@ export default (async (client, options) => {
     dispose,
   };
 }) satisfies Plugin;
+
+// Attach internals to the default export instead of as a named export: opencode's
+// plugin loader rejects modules whose exports aren't all plugin entry functions.
+export default Object.assign(plugin, { __internals }) as typeof plugin & {
+  __internals: typeof __internals;
+};

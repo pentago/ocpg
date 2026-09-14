@@ -1,7 +1,7 @@
 # ocpg
 
 
-Postgres-backed persistent memory plugin for [OpenCode](https://opencode.ai). Replaces the previous Postgres MCP memory server — same database, same schema, no MCP process to run.
+Postgres-backed persistent memory plugin for [OpenCode](https://opencode.ai).
 
 Uses the existing `memories` table (`content`, `tags`, `session_id`, `project`, `created_at`, `search_vector`). Injects recent project memories into the system prompt and exposes `memory_recall` / `memory_remember` tools.
 
@@ -46,7 +46,7 @@ Precedence: plugin options > env vars > defaults.
 | `user`     | `OCPG_USER`        | `pguser`       |
 | `database` | `OCPG_DB`          | `agent-memory` |
 
-**Password is never set via params** — it resolves from `OCPG_PASSWORD`, falling back to `pass show postgres-workstation-password`.
+**Password is never set via params** — it resolves from `OCPG_PASSWORD`.
 
 ## Tools
 

@@ -1,6 +1,6 @@
 # AGENTS.md
 
-ocpg is a single-file OpenCode plugin (`ocpg.ts`): a Postgres-backed persistent memory layer. It replaces the previous Postgres MCP memory server (same database, same schema). It registers a `experimental.chat.system.transform` hook (injects project memories into system context) plus `memory_recall` / `memory_remember` tools. Everything lives in `ocpg.ts`; `__internals` exports the internals for testing.
+ocpg is a single-file OpenCode plugin (`ocpg.ts`): a Postgres-backed persistent memory layer. It replaces the previous Postgres MCP memory server (same database, same schema). It registers an `experimental.chat.system.transform` hook (injects project memories into system context) plus `memory_recall` / `memory_remember` tools. Everything lives in `ocpg.ts`. The module exports **only `default`**; test internals are attached to it as `Object.assign(plugin, { __internals })` — tests do `import ocpg from "../ocpg"; const { __internals } = ocpg;`.
 
 ## Run
 
@@ -10,14 +10,17 @@ ocpg is a single-file OpenCode plugin (`ocpg.ts`): a Postgres-backed persistent 
 ## Test prerequisites (integration tests hit a real DB)
 
 - Live Postgres on `localhost:5432`, database `agent-memory`, table `memories` (columns: `content`, `tags`, `session_id`, `project`, `created_at`, `search_vector`).
-- DB config resolution: plugin options (from `["pentago/ocpg", {...}]` config tuple) > env > defaults. Env vars: `OCPG_HOST` (default `localhost`), `OCPG_PORT` (5432), `OCPG_USER` (pguser), `OCPG_DB` (agent-memory), `OCPG_PASSWORD`. The password is **env-only**, never via plugin options. Missing env password falls back to `Bun.spawnSync(["pass", "show", "postgres-workstation-password"])` at module init — importing `ocpg.ts` (or the tests) requires the local pass store (may need GPG/Yubikey).
+- DB config resolution: plugin options (from `["@dzhi/ocpg", {...}]` config tuple) > env > defaults. Env vars: `OCPG_HOST` (default `localhost`), `OCPG_PORT` (5432), `OCPG_USER` (pguser), `OCPG_DB` (agent-memory), `OCPG_PASSWORD`. The password is **env-only**, never via plugin options. Missing env password falls back to `Bun.spawnSync(["pass", "show", "postgres-workstation-password"])` at module init — importing `ocpg.ts` (or the tests) requires the local pass store (may need GPG/Yubikey).
 - Tests assert `count(*) >= 1` and run `recall` against a hardcoded project dir `/home/dzhi/git/origo/vedurstofan-gitops` — the DB needs at least one memory row **for that exact project** or the recall test fails.
 
 ## Gotchas
 
-- Tests run in file order; the **last test closes the shared pool** (`__internals.sql.close()`) to simulate DB failure. Any test added after it in the same process will fail — keep it last or restore the connection.
+- Tests run in file order; the **last test closes the shared pool** (`__internals.sql.close()`, inside the final rate-limit test) to simulate DB failure. Any DB-touching test added after it in the same process will fail — keep it last or restore the connection.
 - Several tests assert latency (cold <200ms, warm <5ms) — cache behavior is part of the contract, don't remove the `injectionCache` (per-session, 32-slot eviction, invalidated on `remember`).
 - The plugin must not spawn processes: only the `pass` lookup at module init (env password missing) is permitted; resolve credentials/config at init, not per-call.
 - Forget/delete tools do not exist — `remember` dedups on write instead (exact match OR FTS on first 60 chars → false positives expected, see `ponytail:` comment; upgrade path is `pg_trgm`).
 - Injected memory blocks truncate content to 600 chars.
-- Deployment: installed from GitHub (`pentago/ocpg`).
+- Deployment: published to npm as `@dzhi/ocpg` via GitHub Actions trusted publishing (`.github/workflows/publish.yml`, OIDC — tag-push or manual dispatch). opencode loads it via the npm spec; the GitHub `user/repo` spec triggers opencode's DEP0169 `url.parse()` resolver bug.
+- opencode's plugin loader rejects modules whose exports aren't all plugin entry functions (`Plugin export is not a function` → plugin silently dead). Never add a named export to `ocpg.ts`; extend `__internals` via the existing `Object.assign` on the default export.
+- Never construct `new SQL("postgres://…")` from a URL string — under opencode's runtime it emits the DEP0169 `url.parse()` warning at startup. Use the options-object constructor via `makeSql()`.
+- `deploy/` — standalone Postgres for users: `compose.yaml` (hardened, localhost-only) + `init/01-init.sh` bootstraps the exact `agent-memory.memories` schema on first boot; setup docs in `deploy/README.md`.

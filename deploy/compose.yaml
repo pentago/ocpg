@@ -1,0 +1,46 @@
+services:
+  pg:
+    container_name: pg
+    hostname: pg
+    image: postgres:18-alpine3.24
+    user: ${PUID}:${PGID}
+    restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp
+      - /var/run/postgresql
+    environment:
+      POSTGRES_USER: ${PG_USER}
+      POSTGRES_PASSWORD: ${PG_PASSWORD}
+      POSTGRES_DB: ${PG_DB}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - ./data:/var/lib/postgresql/data
+      - ./init:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "127.0.0.1:5432:5432"
+    networks:
+      - db
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 512M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${PG_USER}", "-d", "${PG_DB}"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+networks:
+  db:
+    driver: bridge

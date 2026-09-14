@@ -12,7 +12,7 @@ In `opencode.json`:
 ```json
 {
   "plugin": [
-    ["pentago/ocpg", {}]
+    ["@dzhi/ocpg", {}]
   ]
 }
 ```
@@ -25,7 +25,7 @@ Pass connection params as the plugin options tuple (all optional):
 {
   "plugin": [
     [
-      "pentago/ocpg",
+      "@dzhi/ocpg",
       {
         "host": "localhost",
         "port": 5432,

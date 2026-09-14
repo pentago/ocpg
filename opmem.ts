@@ -1,6 +1,4 @@
 // opmem - DB access layer for OpenCode persistent memory plugin.
-// Canonical source: /home/dzhi/git/personal/opmem/opmem.ts
-// OpenCode loads it via a symlink at ~/.config/opencode/plugins/opmem.ts (created at cutover).
 import { SQL } from "bun";
 import type { Plugin } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";

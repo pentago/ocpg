@@ -89,7 +89,7 @@ describe("DB access layer", () => {
         // Insert via remember logic (manual insert + dedup check)
         const inserted = await tx`
           INSERT INTO memories (content, tags, session_id, project)
-          VALUES (${content}, ${['__internals-test']}, ${ctx.sessionID}, ${ctx.directory})
+          VALUES (${content}, ${__internals.sql.array(['__internals-test'])}, ${ctx.sessionID}, ${ctx.directory})
           RETURNING id
         ` as { id: number }[];
         const insertedId = inserted[0].id;
@@ -118,6 +118,76 @@ describe("DB access layer", () => {
       console.log(`recall output:\n${result}`);
       expect(result).toContain("#"); // id lines start with #
       expect(result).toContain("---"); // separator between rows
+    });
+  });
+
+  describe("recall: relevance ranking + websearch query syntax", () => {
+    const ctx = { directory: "/tmp/ocpg-test-recall-ranking" };
+
+    test("QA happy: relevance-ranked above recency for a matching query", async () => {
+      const marker = `zzztestrank${Date.now()}`;
+      const relevantOld = `${marker} ${marker} ${marker} is the important note here`;
+      const barelyRelevantNew = `filler text that only mentions ${marker} once at the very end`;
+
+      const [oldRow] = await __internals.sql`
+        INSERT INTO memories (content, tags, session_id, project, created_at)
+        VALUES (${relevantOld}, ${__internals.sql.array(['__internals-test'])}, 'test-rank', ${ctx.directory}, now() - interval '10 days')
+        RETURNING id
+      ` as { id: number }[];
+      const [newRow] = await __internals.sql`
+        INSERT INTO memories (content, tags, session_id, project, created_at)
+        VALUES (${barelyRelevantNew}, ${__internals.sql.array(['__internals-test'])}, 'test-rank', ${ctx.directory}, now())
+        RETURNING id
+      ` as { id: number }[];
+
+      try {
+        const result = await __internals.recall({ query: marker, limit: 2 }, ctx);
+        console.log(`ranked recall output:\n${result}`);
+        // The far-more-relevant OLDER row must rank first, ahead of the barely-relevant NEWER row.
+        expect(result.indexOf(`#${oldRow.id}`)).toBeLessThan(result.indexOf(`#${newRow.id}`));
+      } finally {
+        await __internals.sql`DELETE FROM memories WHERE id IN (${oldRow.id}, ${newRow.id})`;
+      }
+    });
+
+    test("QA happy: recency ordering preserved when no query given", async () => {
+      const marker = `zzztestrecency${Date.now()}`;
+      const [olderRow] = await __internals.sql`
+        INSERT INTO memories (content, tags, session_id, project, created_at)
+        VALUES (${`older ${marker}`}, ${__internals.sql.array(['__internals-test'])}, 'test-recency', ${ctx.directory}, now() - interval '1 day')
+        RETURNING id
+      ` as { id: number }[];
+      const [newerRow] = await __internals.sql`
+        INSERT INTO memories (content, tags, session_id, project, created_at)
+        VALUES (${`newer ${marker}`}, ${__internals.sql.array(['__internals-test'])}, 'test-recency', ${ctx.directory}, now())
+        RETURNING id
+      ` as { id: number }[];
+
+      try {
+        const result = await __internals.recall({ limit: 2 }, ctx);
+        expect(result.indexOf(`#${newerRow.id}`)).toBeLessThan(result.indexOf(`#${olderRow.id}`));
+      } finally {
+        await __internals.sql`DELETE FROM memories WHERE id IN (${olderRow.id}, ${newerRow.id})`;
+      }
+    });
+
+    test("QA happy: websearch_to_tsquery OR syntax matches (plainto_tsquery would AND and miss)", async () => {
+      const marker = `zzzwsalpha${Date.now()}`;
+      const [row] = await __internals.sql`
+        INSERT INTO memories (content, tags, session_id, project)
+        VALUES (${`content mentioning only ${marker} and nothing else relevant`}, ${__internals.sql.array(['__internals-test'])}, 'test-ws', ${ctx.directory})
+        RETURNING id
+      ` as { id: number }[];
+
+      try {
+        // "a or b" is OR syntax under websearch_to_tsquery; plainto_tsquery would AND
+        // both terms and never match since the nonexistent term never occurs.
+        const result = await __internals.recall({ query: `${marker} or zzznonexistenttermxyz`, limit: 5 }, ctx);
+        console.log(`OR-query recall output:\n${result}`);
+        expect(result).toContain(`#${row.id}`);
+      } finally {
+        await __internals.sql`DELETE FROM memories WHERE id = ${row.id}`;
+      }
     });
   });
 });

@@ -171,8 +171,12 @@ async function recall(
       ? sql``
       : sql`AND project = ${ctx.directory}`;
     const queryCond = args.query
-      ? sql`AND search_vector @@ plainto_tsquery('english', ${args.query})`
+      ? sql`AND search_vector @@ websearch_to_tsquery('english', ${args.query})`
       : sql``;
+    // Relevance-ranked when searching; recency-ordered for a plain project browse.
+    const orderBy = args.query
+      ? sql`ORDER BY ts_rank(search_vector, websearch_to_tsquery('english', ${args.query})) DESC`
+      : sql`ORDER BY created_at DESC`;
 
     const rows = await sql`
       SELECT id, content, coalesce(tags, '{}') AS tags,
@@ -180,7 +184,7 @@ async function recall(
              project
       FROM memories
       WHERE 1=1 ${projectCond} ${queryCond}
-      ORDER BY created_at DESC
+      ${orderBy}
       LIMIT ${limit}
     ` as MemoryRow[];
 

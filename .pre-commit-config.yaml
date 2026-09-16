@@ -1,0 +1,20 @@
+repos:
+  - repo: local
+    hooks:
+      - id: biome-check
+        name: biome check
+        entry: bunx biome check .
+        language: system
+        files: \.ts$
+        pass_filenames: false
+
+      - id: tsc
+        name: tsc --noEmit
+        entry: bunx tsc --noEmit
+        language: system
+        files: \.ts$
+        pass_filenames: false
+
+# `bun test` is deliberately not a hook: it is an integration suite that needs a
+# live Postgres with pg_trgm and writes to a real database, so it would break
+# commits on any machine without one.

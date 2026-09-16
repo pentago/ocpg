@@ -4,6 +4,12 @@
   "type": "module",
   "description": "Postgres-backed persistent memory plugin for OpenCode",
   "main": "ocpg.ts",
+  "scripts": {
+    "check": "biome check .",
+    "format": "biome format --write .",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test"
+  },
   "exports": {
     ".": "./ocpg.ts"
   },
@@ -23,5 +29,10 @@
   "repository": {
     "type": "git",
     "url": "https://github.com/pentago/ocpg.git"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.5.14",
+    "@types/bun": "^1.4.2",
+    "typescript": "^7.0.2"
   }
 }

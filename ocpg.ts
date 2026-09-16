@@ -137,12 +137,6 @@ async function dispose(): Promise<void> {
 
 // --- Agent tools: recall + remember with dedup-on-write ---
 
-function normalizeTags(tags: string[] | undefined, projectDir: string): string[] {
-  const input = tags ?? [];
-  const base = projectDir.split('/').pop() ?? projectDir;
-  return [...input, `project:${base}`];
-}
-
 async function recall(
   args: RecallArgs,
   ctx: { directory: string },
@@ -194,7 +188,8 @@ async function remember(
       return 'ERROR: content must be at least 10 characters.';
     }
 
-    const normalizedTags = normalizeTags(args.tags, ctx.directory);
+    // Tags are stored verbatim — project scoping lives in the project column, not tags.
+    const tags = args.tags ?? [];
     const basename = ctx.directory.split('/').pop() ?? ctx.directory;
 
     // Dedup: project-scoped, common-opening-words AND-match via FTS
@@ -220,7 +215,7 @@ async function remember(
     // the element type hint is required for clean array storage.
     const inserted = await sql`
       INSERT INTO memories (content, tags, session_id, project)
-      VALUES (${args.content}, ${sql.array(normalizedTags, "text")}, ${ctx.sessionID}, ${ctx.directory})
+      VALUES (${args.content}, ${sql.array(tags, "text")}, ${ctx.sessionID}, ${ctx.directory})
       RETURNING id
     ` as { id: number }[];
 
@@ -309,7 +304,6 @@ const __internals = {
   truncateMemory,
   formatBlock,
   handleTransform,
-  normalizeTags,
   recall,
   remember,
   invalidateInjection,

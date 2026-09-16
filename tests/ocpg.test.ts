@@ -119,8 +119,8 @@ describe("DB access layer", () => {
         const id = Number(result.match(/#(\d+)/)?.[1]);
         expect(id).toBeGreaterThan(0);
         const rows = await __internals.sql`SELECT tags FROM memories WHERE id = ${id}` as { tags: string[] | null }[];
-        expect(rows[0]?.tags).toContain("__internals-test");
-        expect(rows[0]?.tags).toContain("project:ocpg-test-insert");
+        // Tags must be stored verbatim — no auto-appended project tag (project scoping is the project column's job).
+        expect(rows[0]?.tags).toEqual(["__internals-test"]);
       } finally {
         await __internals.sql`DELETE FROM memories WHERE project = ${project}`;
       }

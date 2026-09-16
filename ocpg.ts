@@ -229,9 +229,11 @@ async function remember(
       return `Similar memory already stored as #${dedup[0].id} for this project; skipping insert.`;
     }
 
+    // sql.array(tags) alone encodes text[] with quoted elements under bun 1.4.2;
+    // the element type hint is required for clean array storage.
     const inserted = await sql`
       INSERT INTO memories (content, tags, session_id, project)
-      VALUES (${args.content}, ${sql.array(normalizedTags)}, ${ctx.sessionID}, ${ctx.directory})
+      VALUES (${args.content}, ${sql.array(normalizedTags, "text")}, ${ctx.sessionID}, ${ctx.directory})
       RETURNING id
     ` as { id: number }[];
 

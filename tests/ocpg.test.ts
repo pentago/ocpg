@@ -106,6 +106,26 @@ describe("DB access layer", () => {
       }
     });
 
+    test("QA happy: remember inserts a row with a proper tags array and returns its id", async () => {
+      // Covers the INSERT path (sql.array tags) — the dedup test returns early and never inserts.
+      const marker = `test-insert-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      const content = `Insert path test: ${marker}`;
+      const project = "/tmp/ocpg-test-insert";
+
+      try {
+        const result = await __internals.remember({ content, tags: ["__internals-test"] }, { directory: project, sessionID: "test-insert" });
+        console.log(`insert result: ${result}`);
+        expect(result).toContain("Stored memory #");
+        const id = Number(result.match(/#(\d+)/)?.[1]);
+        expect(id).toBeGreaterThan(0);
+        const rows = await __internals.sql`SELECT tags FROM memories WHERE id = ${id}` as { tags: string[] | null }[];
+        expect(rows[0]?.tags).toContain("__internals-test");
+        expect(rows[0]?.tags).toContain("project:ocpg-test-insert");
+      } finally {
+        await __internals.sql`DELETE FROM memories WHERE project = ${project}`;
+      }
+    });
+
     test("QA failure: 5-char content returns validation error", async () => {
       const result = await __internals.remember({ content: 'hello' }, ctx);
       console.log(`validation result: ${result}`);

@@ -19,6 +19,8 @@ In `opencode.json`:
 
 ## Connecting to the database
 
+Need a Postgres instance? The [`deploy/`](./deploy) directory ships a hardened Docker Compose setup (localhost-only, `memories` schema auto-created on first boot) — see [`deploy/README.md`](./deploy/README.md).
+
 Configure the connection via environment variables, e.g. in `~/.zshenv`. Any Postgres user and database name will do — use whatever names fit your setup and mirror them here:
 
 ```bash

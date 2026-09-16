@@ -12,41 +12,31 @@ In `opencode.json`:
 ```json
 {
   "plugin": [
-    ["@dzhi/ocpg", {}]
+    "@dzhi/ocpg"
   ]
 }
 ```
 
 ## Connecting to the database
 
-Pass connection params as the plugin options tuple (all optional):
+Configure the connection via environment variables, e.g. in `~/.zshenv`. Any Postgres user and database name will do — use whatever names fit your setup and mirror them here:
 
-```json
-{
-  "plugin": [
-    [
-      "@dzhi/ocpg",
-      {
-        "host": "localhost",
-        "port": 5432,
-        "user": "pguser",
-        "database": "agent-memory"
-      }
-    ]
-  ]
-}
+```bash
+export OCPG_HOST="localhost"
+export OCPG_PORT="5432"
+export OCPG_USER="ocpguser"
+export OCPG_PASSWORD="your-postgres-password"
+export OCPG_DB="ocpg"
 ```
 
-Precedence: plugin options > env vars > defaults.
+| Env var         | Default      |
+| --------------- | ------------ |
+| `OCPG_HOST`     | `localhost`  |
+| `OCPG_PORT`     | `5432`       |
+| `OCPG_USER`     | `ocpguser`   |
+| `OCPG_DB`       | `ocpg`       |
 
-| Param      | Env var (fallback) | Default        |
-| ---------- | ------------------ | -------------- |
-| `host`     | `OCPG_HOST`        | `localhost`    |
-| `port`     | `OCPG_PORT`        | `5432`         |
-| `user`     | `OCPG_USER`        | `pguser`       |
-| `database` | `OCPG_DB`          | `agent-memory` |
-
-**Password is never set via params** — it resolves from `OCPG_PASSWORD`.
+**Password is env-only.** If `OCPG_PASSWORD` is unset, the plugin falls back to `pass show postgres-workstation-password` at startup.
 
 ## Tools
 

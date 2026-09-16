@@ -2,14 +2,13 @@
 import { SQL } from "bun";
 import { Plugin } from "@opencode/plugin";
 
-// --- DB config: plugin options > env > defaults. Password is deliberately env-only (never in config).
-type DbOptions = {
-  host?: string;
-  port?: number;
-  user?: string;
-  database?: string;
+// --- DB config: env > defaults. Plugin options are not read; password is deliberately env-only (never in config).
+type DbConfig = {
+  host: string;
+  port: number;
+  user: string;
+  database: string;
 };
-type DbConfig = Required<DbOptions>;
 type RecallArgs = { query?: string; global?: boolean; limit?: number };
 type RememberArgs = { content: string; tags?: string[] };
 
@@ -17,8 +16,8 @@ type RememberArgs = { content: string; tags?: string[] };
 const defaultConfig: DbConfig = {
   host: process.env.OCPG_HOST || "localhost",
   port: Number(process.env.OCPG_PORT) || 5432,
-  user: process.env.OCPG_USER || "pguser",
-  database: process.env.OCPG_DB || "agent-memory",
+  user: process.env.OCPG_USER || "ocpguser",
+  database: process.env.OCPG_DB || "ocpg",
 };
 const password =
   process.env.OCPG_PASSWORD ||
@@ -40,14 +39,6 @@ function makeSql(cfg: DbConfig): SQL {
 }
 
 let sql = makeSql(defaultConfig);
-
-// Swap the pool when the plugin loads with config options ({ "package": "@dzhi/ocpg", "options": {...} } in opencode.jsonc).
-// No-op without options so the module-level env/default config stands. Pools are lazy — a never-connected pool closes cleanly.
-function reconfigure(options?: DbOptions): void {
-  if (!options) return;
-  void sql.close().catch(() => {});
-  sql = makeSql({ ...defaultConfig, ...options });
-}
 
 export interface MemoryRow {
   id: number;
@@ -256,7 +247,6 @@ function invalidateInjection(sessionID: string): void {
 const ocpg = Plugin.define({
   id: "ocpg",
   async setup(ctx) {
-    reconfigure(ctx.options as DbOptions | undefined);
     const directory = ctx.location.directory;
 
     // Inject project memories into every model request's system context.
@@ -320,7 +310,6 @@ const __internals = {
   get sql() {
     return sql;
   },
-  reconfigure,
   truncateMemory,
   formatBlock,
   handleTransform,

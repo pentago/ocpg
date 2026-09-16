@@ -1,19 +1,17 @@
 {
   "name": "@dzhi/ocpg",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "type": "module",
   "description": "Postgres-backed persistent memory plugin for OpenCode",
   "main": "ocpg.ts",
   "exports": {
-    ".": "./ocpg.ts",
-    "./server": "./ocpg.ts"
+    ".": "./ocpg.ts"
   },
   "files": [
     "ocpg.ts"
   ],
   "dependencies": {
-    "@opencode-ai/plugin": "^1.18.29",
-    "zod": "^4.1.8"
+    "@opencode/plugin": "^2.0.4"
   },
   "keywords": [
     "opencode-plugin",

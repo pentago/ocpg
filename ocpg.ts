@@ -1,8 +1,6 @@
 // ocpg - DB access layer for OpenCode persistent memory plugin.
 import { SQL } from "bun";
-import type { Plugin } from "@opencode-ai/plugin";
-import { tool } from "@opencode-ai/plugin";
-import { z } from "zod";
+import { Plugin } from "@opencode/plugin";
 
 // --- DB config: plugin options > env > defaults. Password is deliberately env-only (never in config).
 type DbOptions = {
@@ -12,6 +10,8 @@ type DbOptions = {
   database?: string;
 };
 type DbConfig = Required<DbOptions>;
+type RecallArgs = { query?: string; global?: boolean; limit?: number };
+type RememberArgs = { content: string; tags?: string[] };
 
 // Defaults resolved ONCE at module init — the pass lookup here is the only permitted spawn in this file.
 const defaultConfig: DbConfig = {
@@ -41,7 +41,7 @@ function makeSql(cfg: DbConfig): SQL {
 
 let sql = makeSql(defaultConfig);
 
-// Swap the pool when the plugin loads with config options (["pentago/ocpg", {...}] in opencode.json).
+// Swap the pool when the plugin loads with config options ({ "package": "@dzhi/ocpg", "options": {...} } in opencode.jsonc).
 // No-op without options so the module-level env/default config stands. Pools are lazy — a never-connected pool closes cleanly.
 function reconfigure(options?: DbOptions): void {
   if (!options) return;
@@ -69,20 +69,15 @@ function rateLimitOk(kind: string): boolean {
   return true;
 }
 
-let pluginClient: { app: { log: (entry: unknown) => void } } | null = null;
-
-function setClient(client: { app: { log: (entry: unknown) => void } }): void {
-  pluginClient = client;
+// Test hook: the 60s rate-limit window is module state; tests clear it for determinism.
+function resetRateLimit(): void {
+  lastLogTime.clear();
 }
 
-function logError(
-  client: { app: { log: (entry: unknown) => void } } | null,
-  message: string,
-): void {
-  const c = client ?? pluginClient;
-  if (!c?.app?.log) return;
+// V2 plugins have no client.app.log; console.error from plugin code lands in the server log.
+function logError(message: string): void {
   if (!rateLimitOk("db-error")) return;
-  c.app.log({ body: { service: "ocpg", level: "error", message } });
+  console.error(`[ocpg] ${message}`);
 }
 
 // --- Injection pipeline ---
@@ -114,7 +109,7 @@ function formatBlock(rows: MemoryRow[], projectDir: string): string {
 const injectionCache = new Map<string, string>();
 
 async function handleTransform(
-  input: { sessionID?: string; model: Record<string, unknown> },
+  input: { sessionID?: string; model?: unknown },
   output: { system: string[] },
   directory: string,
 ): Promise<void> {
@@ -143,7 +138,7 @@ async function handleTransform(
     injectionCache.set(sid, block);
     output.system.push(block);
   } catch (e: unknown) {
-    logError(null, `ocpg injection failed: ${e instanceof Error ? e.message : String(e)}`);
+    logError(`ocpg injection failed: ${e instanceof Error ? e.message : String(e)}`);
   }
 }
 
@@ -162,7 +157,7 @@ function normalizeTags(tags: string[] | undefined, projectDir: string): string[]
 }
 
 async function recall(
-  args: { query?: string; global?: boolean; limit?: number },
+  args: RecallArgs,
   ctx: { directory: string },
 ): Promise<string> {
   try {
@@ -198,13 +193,13 @@ async function recall(
       })
       .join('\n---\n');
   } catch (e: unknown) {
-    logError(null, `ocpg recall failed: ${e instanceof Error ? e.message : String(e)}`);
+    logError(`ocpg recall failed: ${e instanceof Error ? e.message : String(e)}`);
     return `ERROR: ${e instanceof Error ? e.message : String(e)}`;
   }
 }
 
 async function remember(
-  args: { content: string; tags?: string[] },
+  args: RememberArgs,
   ctx: { directory: string; sessionID: string },
 ): Promise<string> {
   try {
@@ -236,14 +231,14 @@ async function remember(
 
     const inserted = await sql`
       INSERT INTO memories (content, tags, session_id, project)
-      VALUES (${args.content}, ${normalizedTags}, ${ctx.sessionID}, ${ctx.directory})
+      VALUES (${args.content}, ${sql.array(normalizedTags)}, ${ctx.sessionID}, ${ctx.directory})
       RETURNING id
     ` as { id: number }[];
 
     invalidateInjection(ctx.sessionID);
     return `Stored memory #${inserted[0].id} for project ${basename}.`;
   } catch (e: unknown) {
-    logError(null, `ocpg remember failed: ${e instanceof Error ? e.message : String(e)}`);
+    logError(`ocpg remember failed: ${e instanceof Error ? e.message : String(e)}`);
     return `ERROR: ${e instanceof Error ? e.message : String(e)}`;
   }
 }
@@ -251,6 +246,73 @@ async function remember(
 function invalidateInjection(sessionID: string): void {
   injectionCache.delete(sessionID);
 }
+
+// V2 entrypoint: registers the system-context injection hook and the agent tools
+// through the plugin context. Directory comes from the plugin's load location
+// (per-project instance, same semantics as V1's client.directory); sessionID
+// comes from the tool execution context.
+const ocpg = Plugin.define({
+  id: "ocpg",
+  async setup(ctx) {
+    reconfigure(ctx.options as DbOptions | undefined);
+    const directory = ctx.location.directory;
+
+    // Inject project memories into every model request's system context.
+    // handleTransform owns the per-session cache (32-slot, invalidated on remember).
+    await ctx.session.hook("context", async (event) => {
+      const output: { system: string[] } = { system: [] };
+      await handleTransform({ sessionID: event.sessionID, model: event.model }, output, directory);
+      for (const text of output.system) event.system.push({ type: "text", text });
+    });
+
+    // Agent tools: recall + remember with dedup-on-write. Input schemas are raw
+    // JSON Schema (V2 contract); content length is enforced in remember().
+    await ctx.tool.transform((editor) => {
+      editor.add({
+        name: "memory_recall",
+        description:
+          "Search past memories stored for this project. Use before non-trivial work to check for relevant lessons, fixes, and decisions.",
+        input: {
+          type: "object",
+          properties: {
+            query: { type: "string", description: "Full-text search string; omit for the latest memories" },
+            global: { type: "boolean", description: "Search across all projects (default: current project only)" },
+            limit: { type: "number", description: "1-20, default 5" },
+          },
+          additionalProperties: false,
+        },
+        execute: async (input) => {
+          return { content: await recall(input as RecallArgs, { directory }) };
+        },
+      });
+      editor.add({
+        name: "memory_remember",
+        description:
+          "Store a memory for this project. Use after user corrections, architecture decisions, or non-trivial fixes.",
+        input: {
+          type: "object",
+          properties: {
+            content: { type: "string", description: "1-3 self-contained sentences capturing the why" },
+            tags: {
+              type: "array",
+              items: { type: "string" },
+              description:
+                "Category prefixes: preference, decision, debug, env, architecture, workaround, language:<x>, framework:<x>, tool:<x>",
+            },
+          },
+          required: ["content"],
+          additionalProperties: false,
+        },
+        execute: async (input, tool) => {
+          return { content: await remember(input as RememberArgs, { directory, sessionID: tool.sessionID }) };
+        },
+      });
+    });
+
+    // Close the SQL pool when the plugin unloads.
+    return dispose;
+  },
+});
 
 const __internals = {
   get sql() {
@@ -266,48 +328,12 @@ const __internals = {
   invalidateInjection,
   logError,
   rateLimitOk,
-  setClient,
+  resetRateLimit,
   dispose,
 };
 
-const plugin = (async (client, options) => {
-  setClient(client);
-  reconfigure(options as DbOptions | undefined);
-  return {
-    "experimental.chat.system.transform": async (input, output) => {
-      await handleTransform(input, output, client.directory);
-    },
-    tool: {
-      memory_recall: tool({
-        description:
-          "Search past memories stored for this project. Use before non-trivial work to check for relevant lessons, fixes, and decisions.",
-        args: {
-          query: z.string().optional(),
-          global: z.boolean().optional(),
-          limit: z.number().optional(),
-        },
-        execute: async (args, ctx) => {
-          return await recall(args, ctx);
-        },
-      }),
-      memory_remember: tool({
-        description:
-          "Store a memory for this project. Use after user corrections, architecture decisions, or non-trivial fixes.",
-        args: {
-          content: z.string().min(10),
-          tags: z.array(z.string()).optional(),
-        },
-        execute: async (args, ctx) => {
-          return await remember(args, ctx);
-        },
-      }),
-    },
-    dispose,
-  };
-}) satisfies Plugin;
-
-// Attach internals to the default export instead of as a named export: opencode's
-// plugin loader rejects modules whose exports aren't all plugin entry functions.
-export default Object.assign(plugin, { __internals }) as typeof plugin & {
+// Attach test internals to the default export instead of as a named export
+// (established contract; module exports stay limited to default).
+export default Object.assign(ocpg, { __internals }) as typeof ocpg & {
   __internals: typeof __internals;
 };

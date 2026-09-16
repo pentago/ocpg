@@ -1,4 +1,4 @@
-import { describe, test, expect } from "bun:test";
+import { describe, test, expect, spyOn } from "bun:test";
 import ocpg from "../ocpg";
 
 const { __internals } = ocpg;
@@ -81,29 +81,29 @@ describe("DB access layer", () => {
       sessionID: "test-todo3-1",
     };
 
-    test("QA happy: remember dedup via rolled-back tx", async () => {
+    test("QA happy: remember dedups on exact content (committed row, deterministic)", async () => {
       const marker = `test-dedup-${Date.now()}-${Math.random().toString(36).slice(2)}`;
       const content = `Unique marker for dedup test: ${marker}`;
 
-      await __internals.sql.begin(async (tx) => {
-        // Insert via remember logic (manual insert + dedup check)
-        const inserted = await tx`
-          INSERT INTO memories (content, tags, session_id, project)
-          VALUES (${content}, ${__internals.sql.array(['__internals-test'])}, ${ctx.sessionID}, ${ctx.directory})
-          RETURNING id
-        ` as { id: number }[];
-        const insertedId = inserted[0].id;
-        console.log(`inserted test memory #${insertedId}`);
+      // Seed via autocommit on the module pool so remember's dedup SELECT sees the
+      // row regardless of pool connection. (The old begin-tx version only passed
+      // when the pool reused the transaction connection, and its .catch swallowed
+      // assertion failures, so it could false-pass while masking a broken tags INSERT.)
+      const [seeded] = await __internals.sql`
+        INSERT INTO memories (content, tags, session_id, project)
+        VALUES (${content}, ${__internals.sql.array(['__internals-test'])}, ${ctx.sessionID}, ${ctx.directory})
+        RETURNING id
+      ` as { id: number }[];
+      console.log(`seeded test memory #${seeded.id}`);
 
-        // Second call: dedup should find it
+      try {
         const result = await __internals.remember({ content, tags: ['__internals-test'] }, ctx);
         console.log(`dedup result: ${result}`);
         expect(result).toContain("Similar memory already stored as #");
-        expect(result).toContain(String(insertedId));
-
-        // Throw to roll back the tx
-        throw new Error('rollback-intentional');
-      }).catch(() => {}); // swallow rollback error
+        expect(result).toContain(String(seeded.id));
+      } finally {
+        await __internals.sql`DELETE FROM memories WHERE id = ${seeded.id}`;
+      }
     });
 
     test("QA failure: 5-char content returns validation error", async () => {
@@ -208,9 +208,10 @@ test("QA: reconfigure swaps pool; options override defaults", async () => {
 
 test("QA: rate-limited error logging on DB failure", async () => {
   const captured: unknown[] = [];
-  const stubClient = { app: { log: (i: unknown) => captured.push(i) } };
-
-  __internals.setClient(stubClient);
+  __internals.resetRateLimit();
+  const spy = spyOn(console, "error").mockImplementation((msg: unknown) => {
+    captured.push(msg);
+  });
 
   // Close SQL to force DB errors
   await __internals.sql.close();
@@ -235,15 +236,11 @@ test("QA: rate-limited error logging on DB failure", async () => {
 
   // Exactly 1 error log captured; second suppressed by rate limit
   expect(captured.length).toBe(1);
-  expect(captured[0]).toEqual({
-    body: {
-      service: "ocpg",
-      level: "error",
-      message: expect.stringContaining("ocpg injection failed"),
-    },
-  });
+  expect(String(captured[0])).toContain("ocpg injection failed");
 
-  // logError with null client no-ops without crashing
-  __internals.logError(null, "should not log - no client");
+  // logError beyond the rate window no-ops without crashing
+  __internals.logError("should not log - rate limited");
   expect(captured.length).toBe(1);
+
+  spy.mockRestore();
 });

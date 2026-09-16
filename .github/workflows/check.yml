@@ -11,8 +11,26 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        # Pinned to the same image deploy/compose.yaml runs, so CI exercises the
+        # Postgres the plugin is actually deployed against.
+        image: postgres:18-alpine3.24
+        env:
+          POSTGRES_USER: ocpguser
+          POSTGRES_PASSWORD: ocpgpass
+          POSTGRES_DB: ocpg
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ocpguser -d ocpg"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: oven-sh/setup-bun@v2
         with:
@@ -26,5 +44,24 @@ jobs:
       - name: Typecheck
         run: bunx tsc --noEmit
 
-      # `bun test` is intentionally not run here: it is an integration suite
-      # that needs a live Postgres with pg_trgm and writes to a real database.
+      # Runs the real deploy bootstrap rather than a copy of it, so schema drift
+      # between CI and deploy/ fails here. psql comes from the Postgres image,
+      # which avoids depending on whatever client the runner happens to ship.
+      - name: Bootstrap schema
+        run: |
+          docker run --rm --network=host \
+            -e PGPASSWORD=ocpgpass \
+            -e PGHOST=localhost \
+            -e POSTGRES_USER=ocpguser \
+            -e POSTGRES_DB=ocpg \
+            -v "$PWD/deploy/init:/init:ro" \
+            postgres:18-alpine3.24 /init/01-init.sh
+
+      - name: Test
+        env:
+          OCPG_HOST: localhost
+          OCPG_PORT: "5432"
+          OCPG_USER: ocpguser
+          OCPG_PASSWORD: ocpgpass
+          OCPG_DB: ocpg
+        run: bun test

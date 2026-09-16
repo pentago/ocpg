@@ -10,14 +10,14 @@ ocpg is a single-file OpenCode plugin (`ocpg.ts`): a Postgres-backed persistent 
 ## Test prerequisites (integration tests hit a real DB)
 
 - Live Postgres on `localhost:5432`, database `agent-memory`, table `memories` (columns: `content`, `tags`, `session_id`, `project`, `created_at`, `search_vector`).
-- DB config resolution: env > defaults; **plugin options are not read** (anything under `"options"` in `opencode.jsonc` is ignored). Env vars: `OCPG_HOST` (default `localhost`), `OCPG_PORT` (5432), `OCPG_USER` (ocpguser), `OCPG_DB` (ocpg), `OCPG_PASSWORD`. Names are deliberately generic — any Postgres user/db works. The password is **env-only**, never via plugin options. Missing env password falls back to `Bun.spawnSync(["pass", "show", "postgres-workstation-password"])` at module init — importing `ocpg.ts` (or the tests) requires the local pass store (may need GPG/Yubikey).
+- DB config resolution: env > defaults; **plugin options are not read** (anything under `"options"` in `opencode.jsonc` is ignored). Env vars: `OCPG_HOST` (default `localhost`), `OCPG_PORT` (5432), `OCPG_USER` (ocpguser), `OCPG_DB` (ocpg), `OCPG_PASSWORD`. Names are deliberately generic — any Postgres user/db works. The password is **env-only**, never via plugin options or secret-manager CLI fallbacks — the plugin is environment-agnostic and spawns no processes.
 - Tests assert `count(*) >= 1` and run `recall` against a hardcoded project dir `/home/dzhi/git/origo/vedurstofan-gitops` — the DB needs at least one memory row **for that exact project** or the recall test fails.
 
 ## Gotchas
 
 - Tests run in file order; the **last test closes the shared pool** (`__internals.sql.close()`, inside the final rate-limit test) to simulate DB failure. Any DB-touching test added after it in the same process will fail — keep it last or restore the connection.
 - Several tests assert latency (cold <200ms, warm <5ms) — cache behavior is part of the contract, don't remove the `injectionCache` (per-session, 32-slot eviction, invalidated on `remember`).
-- The plugin must not spawn processes: only the `pass` lookup at module init (env password missing) is permitted; resolve credentials/config at init, not per-call.
+- The plugin must not spawn processes: resolve credentials/config from env only at init, not per-call.
 - Forget/delete tools do not exist — `remember` dedups on write instead (exact match OR FTS on first 60 chars → false positives expected, see `ponytail:` comment; upgrade path is `pg_trgm`).
 - Injected memory blocks truncate content to 600 chars.
 - Deployment: published to npm as `@dzhi/ocpg` via GitHub Actions trusted publishing (`.github/workflows/publish.yml`, OIDC — tag-push `v*` or manual dispatch); the workflow fails unless the tag equals the `package.json` version, so bump the version before tagging.

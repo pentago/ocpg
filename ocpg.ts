@@ -12,18 +12,14 @@ type DbConfig = {
 type RecallArgs = { query?: string; global?: boolean; limit?: number };
 type RememberArgs = { content: string; tags?: string[] };
 
-// Defaults resolved ONCE at module init — the pass lookup here is the only permitted spawn in this file.
+// Defaults resolved ONCE at module init — env-only, no process spawning.
 const defaultConfig: DbConfig = {
   host: process.env.OCPG_HOST || "localhost",
   port: Number(process.env.OCPG_PORT) || 5432,
   user: process.env.OCPG_USER || "ocpguser",
   database: process.env.OCPG_DB || "ocpg",
 };
-const password =
-  process.env.OCPG_PASSWORD ||
-  Bun.spawnSync(["pass", "show", "postgres-workstation-password"])
-    .stdout.toString()
-    .trim();
+const password = process.env.OCPG_PASSWORD || "";
 
 // Options-object constructor, not a URL string: Bun's SQL parses string URLs via
 // url.parse(), which emits the DEP0169 DeprecationWarning at plugin load under opencode.

@@ -38,7 +38,7 @@ export OCPG_DB="ocpg"
 | `OCPG_USER`     | `ocpguser`   |
 | `OCPG_DB`       | `ocpg`       |
 
-**Password is env-only.** If `OCPG_PASSWORD` is unset, the plugin falls back to `pass show postgres-workstation-password` at startup.
+**Password is env-only.** The plugin never reads config files, options, or external secret managers — set `OCPG_PASSWORD` in your shell environment (e.g. via direnv/.envrc, however you source your secrets).
 
 ## Tools
 

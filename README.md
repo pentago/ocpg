@@ -85,4 +85,4 @@ Enable the commit hooks once per clone ([pre-commit](https://pre-commit.com)):
 pre-commit install
 ```
 
-It runs lint and typecheck on commits that touch `.ts` files. `bun test` is deliberately excluded from both the hook and CI, because it writes to a real database.
+It runs lint and typecheck on commits that touch `.ts` files. `bun test` is left out of the hook because it writes to a real database — CI runs it against a throwaway Postgres service container instead.

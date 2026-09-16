@@ -15,6 +15,6 @@ repos:
         files: \.ts$
         pass_filenames: false
 
-# `bun test` is deliberately not a hook: it is an integration suite that needs a
-# live Postgres with pg_trgm and writes to a real database, so it would break
-# commits on any machine without one.
+# `bun test` is not a hook: it is an integration suite that needs a live
+# Postgres with pg_trgm and writes to a real database, so it would break
+# commits on any machine without one. CI runs it against a service container.

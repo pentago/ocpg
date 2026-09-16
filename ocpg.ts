@@ -3,21 +3,36 @@ import { SQL } from "bun";
 import { Plugin } from "@opencode/plugin";
 
 // --- DB config: env > defaults. Plugin options are not read; password is deliberately env-only (never in config).
+const SSL_MODES = ["disable", "prefer", "require", "verify-ca", "verify-full"] as const;
+type SslMode = (typeof SSL_MODES)[number];
+
 type DbConfig = {
   host: string;
   port: number;
   user: string;
   database: string;
+  ssl: SslMode;
 };
-type RecallArgs = { query?: string; global?: boolean; limit?: number };
-type RememberArgs = { content: string; tags?: string[] };
+type RecallArgs = { query?: string; global?: boolean; limit?: number; tags?: string[] };
+type RememberArgs = { content: string; tags?: string[]; force?: boolean };
+type ForgetArgs = { id: number };
 
-// Defaults resolved ONCE at module init — env-only, no process spawning.
+// Defaults to "disable" so the common localhost setup is unchanged; set OCPG_SSL
+// when the database is remote, otherwise the SCRAM handshake crosses the network
+// in plaintext.
+function resolveSslMode(raw: string | undefined): SslMode {
+  if (!raw) return "disable";
+  const mode = raw.toLowerCase() as SslMode;
+  return SSL_MODES.includes(mode) ? mode : "disable";
+}
+
+// Defaults resolved ONCE at module init - env-only, no process spawning.
 const defaultConfig: DbConfig = {
   host: process.env.OCPG_HOST || "localhost",
   port: Number(process.env.OCPG_PORT) || 5432,
   user: process.env.OCPG_USER || "ocpguser",
   database: process.env.OCPG_DB || "ocpg",
+  ssl: resolveSslMode(process.env.OCPG_SSL),
 };
 const password = process.env.OCPG_PASSWORD || "";
 
@@ -30,11 +45,16 @@ function makeSql(cfg: DbConfig): SQL {
     username: cfg.user,
     password,
     database: cfg.database,
+    ssl: cfg.ssl,
     max: 2,
+    // A dead database must fail fast: this pool is queried from the session
+    // context hook, which sits in front of every model request.
+    connectionTimeout: 3,
+    idleTimeout: 30,
   });
 }
 
-let sql = makeSql(defaultConfig);
+const sql = makeSql(defaultConfig);
 
 export interface MemoryRow {
   id: number;
@@ -43,6 +63,9 @@ export interface MemoryRow {
   project: string;
   date: string;
 }
+
+// The injection query selects neither id nor project - they are never rendered.
+type InjectionRow = Pick<MemoryRow, "content" | "tags" | "date">;
 
 // --- Rate-limited error logging ---
 
@@ -62,19 +85,60 @@ function resetRateLimit(): void {
 }
 
 // V2 plugins have no client.app.log; console.error from plugin code lands in the server log.
-function logError(message: string): void {
-  if (!rateLimitOk("db-error")) return;
+// Rate limiting is per kind so a failing recall does not mute injection errors.
+function logError(kind: string, message: string): void {
+  if (!rateLimitOk(kind)) return;
   console.error(`[ocpg] ${message}`);
+}
+
+// --- Query deadline ---
+
+class DeadlineError extends Error {
+  constructor(ms: number) {
+    super(`query exceeded ${ms}ms deadline`);
+    this.name = "DeadlineError";
+  }
+}
+
+// Guards the injection query, which runs in front of every model request: a
+// hung database must degrade to "no memories" rather than stall the turn.
+//
+// This races instead of cancelling. Bun documents query.cancel(), but on bun
+// 1.4.2 it is a no-op for an in-flight Postgres query - verified against
+// SELECT pg_sleep(5), which ran the full 5s under both .execute()+.cancel()
+// and bare .cancel(). So the query is abandoned, not aborted: the caller is
+// freed on time while the connection stays busy until the server finishes.
+async function withDeadline<T>(query: PromiseLike<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new DeadlineError(ms)), ms);
+  });
+  // An abandoned query that later rejects would otherwise surface as an
+  // unhandled rejection and take the process down.
+  Promise.resolve(query).catch(() => {});
+  try {
+    return await Promise.race([query, deadline]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 // --- Injection pipeline ---
 
 function truncateMemory(content: string): string {
   if (content.length <= 600) return content;
-  return content.slice(0, 600) + "…[truncated]";
+  return `${content.slice(0, 600)}…[truncated]`;
 }
 
-function formatBlock(rows: MemoryRow[], projectDir: string): string {
+// Memory content is interpolated verbatim into the system prompt; a stored
+// memory containing the closing tag would otherwise end the block early and
+// have its remainder read as top-level instructions.
+function sanitizeMemory(content: string): string {
+  return content.replaceAll("</persistent-project-memory>", "");
+}
+
+function formatBlock(rows: InjectionRow[], projectDir: string): string {
+  if (rows.length === 0) return "";
   const lines: string[] = [
     "<persistent-project-memory>",
     `Project: ${projectDir}`,
@@ -83,7 +147,7 @@ function formatBlock(rows: MemoryRow[], projectDir: string): string {
   for (const row of rows) {
     const tags = row.tags ?? [];
     const tagStr = tags.length ? ` [${tags.join(", ")}]` : "";
-    lines.push(`- [${row.date}]${tagStr} ${truncateMemory(row.content)}`);
+    lines.push(`- [${row.date}]${tagStr} ${sanitizeMemory(truncateMemory(row.content))}`);
   }
   lines.push("");
   lines.push(
@@ -93,61 +157,118 @@ function formatBlock(rows: MemoryRow[], projectDir: string): string {
   return lines.join("\n");
 }
 
+// Keyed by project directory, not session: the query depends only on the
+// directory, so every session in a project shares one entry and a remember in
+// any session invalidates it for all of them. An empty string is cached for
+// projects with no memories so they stop re-querying, and nothing is injected.
 const injectionCache = new Map<string, string>();
 
+// Session-independent by design: the block depends only on the project
+// directory, so the hook passes nothing else.
 async function handleTransform(
-  input: { sessionID?: string; model?: unknown },
   output: { system: string[] },
   directory: string,
 ): Promise<void> {
-  if (!input.sessionID) return;
-  const sid = input.sessionID;
-  const cached = injectionCache.get(sid);
+  if (!directory) return;
+  const cached = injectionCache.get(directory);
   if (cached !== undefined) {
-    output.system.push(cached);
+    if (cached) output.system.push(cached);
     return;
   }
   try {
-    const rows = await sql`
+    const rows = await withDeadline(
+      sql`
       SELECT content, coalesce(tags, '{}') AS tags,
              to_char(created_at, 'YYYY-MM-DD') AS date
       FROM memories
       WHERE project = ${directory}
       ORDER BY created_at DESC
       LIMIT 5
-    ` as MemoryRow[];
+    ` as unknown as PromiseLike<InjectionRow[]>,
+      1000,
+    );
     const block = formatBlock(rows, directory);
     // Evict oldest entry when cache exceeds 32
     if (injectionCache.size >= 32) {
-      const firstKey = injectionCache.keys().next().value!;
-      injectionCache.delete(firstKey);
+      const firstKey = injectionCache.keys().next().value;
+      if (firstKey !== undefined) injectionCache.delete(firstKey);
     }
-    injectionCache.set(sid, block);
-    output.system.push(block);
+    injectionCache.set(directory, block);
+    if (block) output.system.push(block);
   } catch (e: unknown) {
-    logError(`ocpg injection failed: ${e instanceof Error ? e.message : String(e)}`);
+    logError("inject", `ocpg injection failed: ${e instanceof Error ? e.message : String(e)}`);
   }
 }
 
 // --- Dispose ---
 
+// One opencode process evaluates this module once but runs setup() once per
+// project location, so instances share the pool. Verified against opencode
+// v2.0.3: four locations were live in a single pid with one module instance.
+// Without the refcount, a config change in one project disposes that instance
+// and closes the pool out from under every other live project.
+let instances = 0;
+
+function retain(): void {
+  instances++;
+}
+
 async function dispose(): Promise<void> {
+  if (instances > 0) instances--;
+  if (instances > 0) return;
   await sql.close().catch(() => {});
 }
 
 // --- Agent tools: recall + remember with dedup-on-write ---
+
+// Write caps: these are abuse guards, not style rules. Measured against a real
+// 485-memory corpus (p95 content 517 chars, p95 5 tags, longest tag 26 chars),
+// so ordinary memories never come close.
+const MAX_CONTENT = 4000;
+const MIN_CONTENT = 10;
+const MAX_TAGS = 10;
+const MAX_TAG_LENGTH = 64;
+
+// Raw JSON Schema input is not coerced for us: a model sending "3" or null for
+// limit would otherwise reach Postgres as LIMIT NaN.
+function resolveLimit(raw: unknown): number {
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return 5;
+  return Math.min(Math.max(Math.trunc(n), 1), 20);
+}
+
+// The model sees a generic failure; the operator sees the real message in the
+// server log. Raw driver errors carry host, user and schema details that should
+// not end up in a transcript sent to the provider.
+function toolError(kind: string, action: string, e: unknown): string {
+  logError(kind, `ocpg ${action} failed: ${e instanceof Error ? e.message : String(e)}`);
+  // 42883 = undefined_function. The only way to hit it here is a database
+  // without pg_trgm, which is worth naming: the fix is one statement and the
+  // generic message would send the operator hunting.
+  if (String((e as { errno?: unknown })?.errno) === "42883") {
+    return "ERROR: this database is missing the pg_trgm extension, which memory_remember needs for duplicate detection. Run: CREATE EXTENSION pg_trgm;";
+  }
+  return `ERROR: memory store unavailable (${action} failed; see opencode server log).`;
+}
 
 async function recall(
   args: RecallArgs,
   ctx: { directory: string },
 ): Promise<string> {
   try {
-    const limit = Math.min(Math.max(args.limit ?? 5, 1), 20);
+    const limit = resolveLimit(args.limit);
     const projectCond = args.global
       ? sql``
       : sql`AND project = ${ctx.directory}`;
     const queryCond = args.query
       ? sql`AND search_vector @@ websearch_to_tsquery('english', ${args.query})`
+      : sql``;
+    // Tags are not part of search_vector (it covers content only), so they are
+    // unreachable by query alone. Matches rows carrying ALL the given tags,
+    // served by idx_memories_tags.
+    const tagList = Array.isArray(args.tags) ? args.tags.filter((t) => typeof t === "string" && t) : [];
+    const tagCond = tagList.length
+      ? sql`AND tags @> ${sql.array(tagList, "text")}`
       : sql``;
     // Relevance-ranked when searching; recency-ordered for a plain project browse.
     const orderBy = args.query
@@ -159,7 +280,7 @@ async function recall(
              to_char(created_at, 'YYYY-MM-DD') AS date,
              project
       FROM memories
-      WHERE 1=1 ${projectCond} ${queryCond}
+      WHERE 1=1 ${projectCond} ${queryCond} ${tagCond}
       ${orderBy}
       LIMIT ${limit}
     ` as MemoryRow[];
@@ -174,41 +295,67 @@ async function recall(
       })
       .join('\n---\n');
   } catch (e: unknown) {
-    logError(`ocpg recall failed: ${e instanceof Error ? e.message : String(e)}`);
-    return `ERROR: ${e instanceof Error ? e.message : String(e)}`;
+    return toolError("recall", "recall", e);
   }
 }
+
+// Rejects rather than truncates: a clipped memory loses its tail silently,
+// while an error reports the actual size and lets the agent retry shorter.
+function validateWrite(args: RememberArgs): string | null {
+  const content = typeof args.content === "string" ? args.content : "";
+  if (content.length < MIN_CONTENT) {
+    return `ERROR: content must be at least ${MIN_CONTENT} characters.`;
+  }
+  if (content.length > MAX_CONTENT) {
+    return `ERROR: content is ${content.length} characters, max ${MAX_CONTENT}; store the essentials in 1-3 sentences and retry.`;
+  }
+  const tags = args.tags ?? [];
+  if (!Array.isArray(tags)) return "ERROR: tags must be an array of strings.";
+  if (tags.length > MAX_TAGS) {
+    return `ERROR: ${tags.length} tags given, max ${MAX_TAGS}.`;
+  }
+  const oversized = tags.find((t) => typeof t !== "string" || t.length > MAX_TAG_LENGTH);
+  if (oversized !== undefined) {
+    return `ERROR: each tag must be a string of at most ${MAX_TAG_LENGTH} characters.`;
+  }
+  return null;
+}
+
+// Trigram similarity threshold for dedup-on-write. Measured on a real
+// 485-memory corpus: the previous rule (FTS on the first 60 characters) let 28
+// pairs at >=0.8 similarity through because they differed in their opening
+// words, while wrongly rejecting ~1% of genuinely distinct memories. 0.8 is
+// strict enough that only restatements collide.
+const DEDUP_SIMILARITY = 0.8;
 
 async function remember(
   args: RememberArgs,
   ctx: { directory: string; sessionID: string },
 ): Promise<string> {
   try {
-    if (args.content.length < 10) {
-      return 'ERROR: content must be at least 10 characters.';
-    }
+    const invalid = validateWrite(args);
+    if (invalid) return invalid;
 
-    // Tags are stored verbatim — project scoping lives in the project column, not tags.
+    // Tags are stored verbatim - project scoping lives in the project column, not tags.
     const tags = args.tags ?? [];
     const basename = ctx.directory.split('/').pop() ?? ctx.directory;
 
-    // Dedup: project-scoped, common-opening-words AND-match via FTS
-    const dedup = await sql`
-      SELECT id FROM memories
-      WHERE project = ${ctx.directory}
-        AND (
-          content = ${args.content}
-          OR search_vector @@ plainto_tsquery('english', ${args.content.slice(0, 60)})
-        )
-      ORDER BY created_at DESC
-      LIMIT 1
-    ` as { id: number }[];
+    if (!args.force) {
+      // Dedup: project-scoped trigram similarity over the whole content. No
+      // trigram index - the project filter narrows to a few hundred rows, which
+      // similarity() scans in single-digit milliseconds.
+      const dedup = await sql`
+        SELECT id, round(similarity(content, ${args.content})::numeric, 2) AS score
+        FROM memories
+        WHERE project = ${ctx.directory}
+          AND (content = ${args.content} OR similarity(content, ${args.content}) >= ${DEDUP_SIMILARITY})
+        ORDER BY similarity(content, ${args.content}) DESC
+        LIMIT 1
+      ` as { id: number; score: string }[];
 
-    if (dedup.length > 0) {
-      // ponytail: dedup uses common-opening-words AND-match across rows via FTS
-      // so false positives are expected; upgrade path = pg_trgm similarity or
-      // wider dedup scope.
-      return `Similar memory already stored as #${dedup[0].id} for this project; skipping insert.`;
+      if (dedup.length > 0) {
+        return `Similar memory already stored as #${dedup[0].id} (similarity ${dedup[0].score}) for this project; skipping insert. Pass force: true to store it anyway.`;
+      }
     }
 
     // sql.array(tags) alone encodes text[] with quoted elements under bun 1.4.2;
@@ -219,16 +366,42 @@ async function remember(
       RETURNING id
     ` as { id: number }[];
 
-    invalidateInjection(ctx.sessionID);
+    invalidateInjection(ctx.directory);
     return `Stored memory #${inserted[0].id} for project ${basename}.`;
   } catch (e: unknown) {
-    logError(`ocpg remember failed: ${e instanceof Error ? e.message : String(e)}`);
-    return `ERROR: ${e instanceof Error ? e.message : String(e)}`;
+    return toolError("remember", "remember", e);
   }
 }
 
-function invalidateInjection(sessionID: string): void {
-  injectionCache.delete(sessionID);
+// Project-scoped by construction: an agent can only delete what its own project
+// can recall, so a poisoned id from another project silently matches nothing.
+async function forget(
+  args: ForgetArgs,
+  ctx: { directory: string },
+): Promise<string> {
+  try {
+    const id = Number(args.id);
+    if (!Number.isInteger(id) || id <= 0) {
+      return "ERROR: id must be a positive integer (the #id shown by memory_recall).";
+    }
+    const deleted = await sql`
+      DELETE FROM memories
+      WHERE id = ${id} AND project = ${ctx.directory}
+      RETURNING id
+    ` as { id: number }[];
+
+    if (deleted.length === 0) {
+      return `No memory #${id} in this project; nothing deleted.`;
+    }
+    invalidateInjection(ctx.directory);
+    return `Deleted memory #${id}.`;
+  } catch (e: unknown) {
+    return toolError("forget", "forget", e);
+  }
+}
+
+function invalidateInjection(directory: string): void {
+  injectionCache.delete(directory);
 }
 
 // V2 entrypoint: registers the system-context injection hook and the agent tools
@@ -239,17 +412,22 @@ const ocpg = Plugin.define({
   id: "ocpg",
   async setup(ctx) {
     const directory = ctx.location.directory;
+    retain();
+
+    // Open the pool before the first turn needs it: Bun connects lazily, so
+    // otherwise the TCP + SCRAM handshake is paid inside the first context hook.
+    void sql`SELECT 1`.catch(() => {});
 
     // Inject project memories into every model request's system context.
-    // handleTransform owns the per-session cache (32-slot, invalidated on remember).
+    // handleTransform owns the per-directory cache (32-slot, invalidated on remember).
     await ctx.session.hook("context", async (event) => {
       const output: { system: string[] } = { system: [] };
-      await handleTransform({ sessionID: event.sessionID, model: event.model }, output, directory);
+      await handleTransform(output, directory);
       for (const text of output.system) event.system.push({ type: "text", text });
     });
 
     // Agent tools: recall + remember with dedup-on-write. Input schemas are raw
-    // JSON Schema (V2 contract); content length is enforced in remember().
+    // JSON Schema (V2 contract); sizes are enforced in remember().
     await ctx.tool.transform((editor) => {
       editor.add({
         name: "memory_recall",
@@ -259,6 +437,11 @@ const ocpg = Plugin.define({
           type: "object",
           properties: {
             query: { type: "string", description: "Full-text search string; omit for the latest memories" },
+            tags: {
+              type: "array",
+              items: { type: "string" },
+              description: "Only return memories carrying all of these tags",
+            },
             global: { type: "boolean", description: "Search across all projects (default: current project only)" },
             limit: { type: "number", description: "1-20, default 5" },
           },
@@ -275,12 +458,21 @@ const ocpg = Plugin.define({
         input: {
           type: "object",
           properties: {
-            content: { type: "string", description: "1-3 self-contained sentences capturing the why" },
+            content: {
+              type: "string",
+              description: `1-3 self-contained sentences capturing the why (${MIN_CONTENT}-${MAX_CONTENT} characters)`,
+            },
             tags: {
               type: "array",
-              items: { type: "string" },
+              items: { type: "string", maxLength: MAX_TAG_LENGTH },
+              maxItems: MAX_TAGS,
               description:
                 "Category prefixes: preference, decision, debug, env, architecture, workaround, language:<x>, framework:<x>, tool:<x>",
+            },
+            force: {
+              type: "boolean",
+              description:
+                "Store even if a similar memory exists (use only after a dedup rejection you judge to be wrong)",
             },
           },
           required: ["content"],
@@ -290,9 +482,25 @@ const ocpg = Plugin.define({
           return { content: await remember(input as RememberArgs, { directory, sessionID: tool.sessionID }) };
         },
       });
+      editor.add({
+        name: "memory_forget",
+        description:
+          "Delete a memory of this project by id (get ids from memory_recall). Use for memories that are wrong or obsolete; prefer storing a corrected memory when the old one is still useful history.",
+        input: {
+          type: "object",
+          properties: {
+            id: { type: "number", description: "The #id shown by memory_recall" },
+          },
+          required: ["id"],
+          additionalProperties: false,
+        },
+        execute: async (input) => {
+          return { content: await forget(input as ForgetArgs, { directory }) };
+        },
+      });
     });
 
-    // Close the SQL pool when the plugin unloads.
+    // Close the SQL pool when the last plugin instance unloads.
     return dispose;
   },
 });
@@ -302,14 +510,22 @@ const __internals = {
     return sql;
   },
   truncateMemory,
+  sanitizeMemory,
+  withDeadline,
   formatBlock,
   handleTransform,
   recall,
   remember,
+  forget,
   invalidateInjection,
+  resolveSslMode,
+  resolveLimit,
+  validateWrite,
   logError,
+  toolError,
   rateLimitOk,
   resetRateLimit,
+  retain,
   dispose,
 };
 

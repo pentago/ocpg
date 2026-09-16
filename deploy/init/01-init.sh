@@ -1,10 +1,14 @@
 #!/bin/bash
-# Runs once on first boot (docker-entrypoint-initdb.d) — the postgres image
+# Runs once on first boot (docker-entrypoint-initdb.d) - the postgres image
 # already created the database named by POSTGRES_DB (from .env); this adds the
 # `memories` table the ocpg plugin expects. Fresh data dir only.
 set -e
 
 psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" <<-'EOSQL'
+	-- Trigram similarity backs memory_remember's dedup-on-write. Without it the
+	-- plugin falls back to a weaker full-text rule that misses near-duplicates.
+	CREATE EXTENSION IF NOT EXISTS pg_trgm;
+
 	CREATE TABLE memories (
 	  id            serial PRIMARY KEY,
 	  content       text        NOT NULL,

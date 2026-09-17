@@ -1108,6 +1108,29 @@ describe("DB access layer", () => {
         await __internals.sql`DELETE FROM memories WHERE id = ${row.id}`;
       }
     });
+    test("QA happy: multi-word queries match partially-containing memories (OR, not AND)", async () => {
+      // The bench showed websearch_to_tsquery's AND semantics collapsing to
+      // recall 0.00-0.02 on multi-word queries: one word the memory never
+      // uses killed the whole match. recall now uses the same OR-of-stemmed
+      // words as injection; ts_rank still favors memories matching more terms.
+      const marker = `zzzorsyntax${Date.now()}`;
+      const [row] = await __internals.sql`
+        INSERT INTO memories (content, tags, session_id, project)
+        VALUES (${`${marker} only talks about drain procedures here`}, ${__internals.sql.array(['__internals-test'])}, 't', ${ctx.directory})
+        RETURNING id
+      ` as { id: number }[];
+
+      try {
+        // AND would require BOTH words in the content; "vacuum" is absent.
+        const result = await __internals.recall({ query: `${marker} vacuum`, limit: 5 }, ctx);
+        expect(result).toContain(`#${row.id}`);
+        // A gibberish AND-partner still finds nothing - OR is not fuzz.
+        const none = await __internals.recall({ query: `xqzzyblorpn qwintavex`, limit: 5 }, ctx);
+        expect(none).not.toContain(`#${row.id}`);
+      } finally {
+        await __internals.sql`DELETE FROM memories WHERE id = ${row.id}`;
+      }
+    });
   });
 });
 

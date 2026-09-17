@@ -68,8 +68,8 @@ Readings:
    wide margin; the whole ranking gap vs the recency baseline (0.67 vs 0.04
    recall) is the value of relevance injection.
 2. **AND semantics collapse on multi-word queries** (recall 0.00-0.02): one
-   word the memory never uses kills the match. This also hits
-   `memory_recall`'s directed search - consider OR there too.
+   word the memory never uses kills the match. Acted on: `memory_recall` now
+   uses the same OR-of-stemmed-words query as injection.
 3. **ts_rank_cd and trgm-blend are dead ends**: same or negligible accuracy
    for 10x-150x the latency at 50k rows.
 4. **Recency prior adds nothing** to relevance ranking (fts-or-recency ≈

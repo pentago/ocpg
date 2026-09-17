@@ -258,6 +258,16 @@ function buildRelevanceQuery(client: SQL, tsQuery: string, directory: string) {
   `;
 }
 
+// The prompt as an OR of stemmed words: websearch_to_tsquery ANDs the terms,
+// so one word the memory never uses would zero out the whole query (bench:
+// recall 0.00-0.02 on multi-word queries). OR ranks by how many (and how
+// rare) the matched terms are, and sanitizing to [a-z0-9]+ tokens keeps
+// to_tsquery syntax-safe. Capped at 24 words to bound the query.
+function orTsQuery(text: string): string {
+  const words = text.toLowerCase().match(/[a-z0-9]+/g) ?? [];
+  return words.slice(0, 24).join(" | ");
+}
+
 // The block depends on the directory plus (in relevance mode) the prompt,
 // passed explicitly by the caller.
 async function handleTransform(
@@ -275,13 +285,7 @@ async function handleTransform(
   }
   try {
     let rows: InjectionRow[];
-    // The prompt as an OR of stemmed words: websearch_to_tsquery ANDs the
-    // terms, so one word the memory never uses would zero out the whole
-    // query. OR ranks by how many (and how rare) the matched terms are, and
-    // sanitizing to [a-z0-9]+ tokens keeps to_tsquery syntax-safe. Capped at
-    // 24 words to bound the query.
-    const words = query.toLowerCase().match(/[a-z0-9]+/g) ?? [];
-    const tsQuery = words.slice(0, 24).join(" | ");
+    const tsQuery = orTsQuery(query);
     if (tsQuery) {
       rows = await withDeadline(
         buildRelevanceQuery(sql, tsQuery, directory) as unknown as PromiseLike<InjectionRow[]>,
@@ -388,7 +392,7 @@ async function recall(
         ? sql`AND project = ${userScope}`
         : sql`AND project = ${ctx.directory}`;
     const queryCond = args.query
-      ? sql`AND search_vector @@ websearch_to_tsquery('english', ${args.query})`
+      ? sql`AND search_vector @@ to_tsquery('english', ${orTsQuery(args.query)})`
       : sql``;
     // Tags are not part of search_vector (it covers content only), so they are
     // unreachable by query alone. Matches rows carrying ALL the given tags,
@@ -403,7 +407,7 @@ async function recall(
     // bumps resurface used memories without letting a single old favorite pin
     // the top slot forever.
     const orderBy = args.query
-      ? sql`ORDER BY ts_rank(search_vector, websearch_to_tsquery('english', ${args.query})) DESC`
+      ? sql`ORDER BY ts_rank(search_vector, to_tsquery('english', ${orTsQuery(args.query)})) DESC`
       : sql`ORDER BY (1 + access_count) / (GREATEST(EXTRACT(EPOCH FROM (now() - created_at)) / 86400, 0) + 2) DESC, created_at DESC`;
 
     const rows = await sql`
@@ -878,6 +882,7 @@ const __internals = {
   },
   extractPromptQuery,
   hashQuery,
+  orTsQuery,
   buildRecencyQuery,
   buildRelevanceQuery,
   get userScope() {

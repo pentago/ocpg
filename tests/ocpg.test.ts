@@ -454,6 +454,131 @@ describe("DB access layer", () => {
     });
   });
 
+  describe("user scope (plan 1.2 revised: sentinel project value, no migration)", () => {
+    const ctxA = { directory: "/tmp/ocpg-test-scope-a", sessionID: "scope-a" };
+    const ctxB = { directory: "/tmp/ocpg-test-scope-b", sessionID: "scope-b" };
+    const USER_ROW = "User preference: the operator reviews every PR personally.";
+    const PROJ_ROW = "Project fact: the deploy scripts live under scripts/deploy.";
+
+    beforeAll(async () => {
+      // Pre-clean anything left over from an aborted earlier run - the
+      // sentinel rows would otherwise trip dedup before afterAll ever runs.
+      await __internals.sql`DELETE FROM memories WHERE project = ${"user:tester"}`;
+      __internals.setUserScope("tester");
+    });
+
+    afterAll(async () => {
+      __internals.setUserScope(undefined);
+      // User-scope rows live under the user:<id> sentinel, not /tmp/ocpg-test%,
+      // so they need their own cleanup (the outer afterAll won't reach them).
+      await __internals.sql`DELETE FROM memories WHERE project = ${"user:tester"}`;
+    });
+
+    test("remember with scope user writes the user:<id> sentinel", async () => {
+      const result = await __internals.remember({ content: USER_ROW, scope: "user" }, ctxA);
+      expect(result).toContain("Stored memory #");
+      expect(result).toContain("user scope");
+      const id = Number(result.match(/#(\d+)/)?.[1]);
+      const rows = await __internals.sql`SELECT project FROM memories WHERE id = ${id}` as { project: string }[];
+      expect(rows[0].project).toBe("user:tester");
+      await __internals.forget({ id }, ctxB);
+    });
+
+    test("recall with scope user reaches rows from any project; project scope stays project-only", async () => {
+      await __internals.remember({ content: USER_ROW, scope: "user" }, ctxA);
+      await __internals.remember({ content: PROJ_ROW }, ctxA);
+
+      const userHits = await __internals.recall({ scope: "user" }, ctxB);
+      expect(userHits).toContain("reviews every PR personally");
+      expect(userHits).not.toContain(PROJ_ROW);
+
+      const projHits = await __internals.recall({}, ctxA);
+      expect(projHits).toContain("scripts/deploy");
+      expect(projHits).not.toContain("reviews every PR personally");
+
+      // global covers user rows (plain project filter dropped entirely).
+      const globalHits = await __internals.recall({ global: true, query: "reviews every PR personally" }, ctxB);
+      expect(globalHits).toContain("reviews every PR personally");
+    });
+
+    test("injection includes user rows in every project's block; cache key stays the directory", async () => {
+      await __internals.remember({ content: USER_ROW, scope: "user" }, ctxA);
+      const output: { system: string[] } = { system: [] };
+      await __internals.handleTransform(output, ctxB.directory);
+      expect(output.system[0]).toContain("reviews every PR personally");
+      // A user-scope write invalidates the calling project's cache entry, which
+      // is keyed by directory (all sessions of that project share one entry).
+      await __internals.remember({ content: "User preference: stale marker row for cache invalidation." , scope: "user" }, ctxB);
+      const output2: { system: string[] } = { system: [] };
+      await __internals.handleTransform(output2, ctxA.directory);
+      expect(output2.system[0]).toContain("stale marker row");
+    });
+
+    test("user rows are deduped in user scope, independently of project rows", async () => {
+      await __internals.remember({ content: USER_ROW, scope: "user" }, ctxA);
+      // Same text in user scope from another project → dedup hit in user scope.
+      const again = await __internals.remember({ content: USER_ROW, scope: "user" }, ctxB);
+      expect(again).toContain("Similar memory already stored as #");
+      expect(again).toContain("in user scope");
+      // Same text in project scope → stored (dedup does not cross scopes).
+      const proj = await __internals.remember({ content: USER_ROW }, ctxA);
+      expect(proj).toContain("Stored memory #");
+    });
+
+    test("forget reaches the shared user sentinel from any project, but still not other projects", async () => {
+      const stored = await __internals.remember({ content: "User memory doomed to be forgotten soon." , scope: "user" }, ctxA);
+      const id = Number(stored.match(/#(\d+)/)?.[1]);
+      // Widened on purpose: user memories are visible to all the user's
+      // projects, so any of them can delete them.
+      expect(await __internals.forget({ id }, ctxB)).toBe(`Deleted memory #${id}.`);
+
+      // A foreign project row remains out of reach.
+      const other = "/tmp/ocpg-test-scope-other";
+      try {
+        const stored2 = await __internals.remember({ content: "Untouchable foreign project memory." }, { directory: other, sessionID: "x" });
+        const id2 = Number(stored2.match(/#(\d+)/)?.[1]);
+        expect(await __internals.forget({ id: id2 }, ctxA)).toContain("nothing deleted");
+        const [n] = await __internals.sql`SELECT count(*) AS n FROM memories WHERE id = ${id2}` as { n: string }[];
+        expect(Number(n.n)).toBe(1);
+      } finally {
+        await __internals.sql`DELETE FROM memories WHERE project = ${other}`;
+      }
+    });
+
+    test("user scope disabled (no OCPG_USER_ID) degrades to the old behavior everywhere", async () => {
+      __internals.setUserScope(undefined);
+      try {
+        const remembered = await __internals.remember({ content: USER_ROW, scope: "user" }, ctxA);
+        expect(remembered).toContain("ERROR");
+        expect(remembered).toContain("OCPG_USER_ID");
+        const recalled = await __internals.recall({ scope: "user" }, ctxA);
+        expect(recalled).toContain("ERROR");
+
+        // A user-sentinel row from another install must be invisible AND
+        // undeletable when the feature is off.
+        await __internals.sql`
+          INSERT INTO memories (content, tags, session_id, project)
+          VALUES ('orphaned user row', ${__internals.sql.array([], "text")}, 't', 'user:tester')
+        `;
+        const hits = await __internals.recall({ scope: "user" }, ctxA);
+        expect(hits).toContain("ERROR");
+        const injected: { system: string[] } = { system: [] };
+        await __internals.handleTransform(injected, ctxA.directory);
+        expect(injected.system.join("")).not.toContain("orphaned user row");
+      } finally {
+        __internals.setUserScope("tester");
+      }
+    });
+
+    test("resolveUserScope trims and rejects empty", () => {
+      expect(__internals.resolveUserScope("tester")).toBe("user:tester");
+      expect(__internals.resolveUserScope("  tester  ")).toBe("user:tester");
+      expect(__internals.resolveUserScope(undefined)).toBe(null);
+      expect(__internals.resolveUserScope("   ")).toBe(null);
+      expect(__internals.resolveUserScope("")).toBe(null);
+    });
+  });
+
   describe("keyword capture (plan 1.1 revised: verbatim, no LLM)", () => {
     test("extracts the text after the trigger, verbatim and minus the trigger", () => {
       expect(__internals.extractMemoryRequest("remember that the build uses bun, not npm")).toBe(

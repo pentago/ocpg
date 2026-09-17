@@ -13,8 +13,8 @@ type DbConfig = {
   database: string;
   ssl: SslMode;
 };
-type RecallArgs = { query?: string; global?: boolean; limit?: number; tags?: string[] };
-type RememberArgs = { content: string; tags?: string[]; force?: boolean };
+type RecallArgs = { query?: string; global?: boolean; limit?: number; tags?: string[]; scope?: "project" | "user" };
+type RememberArgs = { content: string; tags?: string[]; force?: boolean; scope?: "project" | "user" };
 type ForgetArgs = { id: number };
 
 // Defaults to "disable" so the common localhost setup is unchanged; set OCPG_SSL
@@ -35,6 +35,22 @@ const defaultConfig: DbConfig = {
   ssl: resolveSslMode(process.env.OCPG_SSL),
 };
 const password = process.env.OCPG_PASSWORD || "";
+
+// --- User scope (plan 1.2, revised: sentinel value, no migration) ---
+
+// User memories are ordinary rows with the sentinel project value `user:<id>`,
+// written into the existing project column - identical semantics to a scope
+// column with zero migration. OCPG_USER_ID is read once at init (env-only, no
+// process spawning); unset means user scope is disabled entirely and every
+// query degrades to exactly the pre-feature behavior.
+//
+// Mutable module state + a reset hook so tests can toggle it deterministically.
+let userScope = resolveUserScope(process.env.OCPG_USER_ID);
+
+function resolveUserScope(raw: string | undefined): string | null {
+  const id = raw?.trim();
+  return id ? `user:${id}` : null;
+}
 
 // Options-object constructor, not a URL string: Bun's SQL parses string URLs via
 // url.parse(), which emits the DEP0169 DeprecationWarning at plugin load under opencode.
@@ -176,12 +192,18 @@ async function handleTransform(
     return;
   }
   try {
+    // Injection stays keyed by the directory alone: when user scope is enabled
+    // the block additionally includes the shared user rows, but that still
+    // depends only on the directory (the user scope is process-wide env config).
+    const projectCond = userScope
+      ? sql`WHERE (project = ${directory} OR project = ${userScope})`
+      : sql`WHERE project = ${directory}`;
     const rows = await withDeadline(
       sql`
       SELECT content, coalesce(tags, '{}') AS tags,
              to_char(created_at, 'YYYY-MM-DD') AS date
       FROM memories
-      WHERE project = ${directory}
+      ${projectCond}
       ORDER BY created_at DESC
       LIMIT 5
     ` as unknown as PromiseLike<InjectionRow[]>,
@@ -257,9 +279,16 @@ async function recall(
 ): Promise<string> {
   try {
     const limit = resolveLimit(args.limit);
+    // scope: "user" addresses the shared user scope; global: true already
+    // covers user rows since it drops the project filter entirely.
+    if (args.scope === "user" && !userScope) {
+      return "ERROR: user scope is disabled (set OCPG_USER_ID to enable it).";
+    }
     const projectCond = args.global
       ? sql``
-      : sql`AND project = ${ctx.directory}`;
+      : args.scope === "user"
+        ? sql`AND project = ${userScope}`
+        : sql`AND project = ${ctx.directory}`;
     const queryCond = args.query
       ? sql`AND search_vector @@ websearch_to_tsquery('english', ${args.query})`
       : sql``;
@@ -338,23 +367,32 @@ async function remember(
 
     // Tags are stored verbatim - project scoping lives in the project column, not tags.
     const tags = args.tags ?? [];
+    const scope = args.scope === "user" ? "user" : "project";
+    if (scope === "user" && !userScope) {
+      return "ERROR: user scope is disabled (set OCPG_USER_ID to enable it).";
+    }
+    // The write target: the calling project's directory, or the shared user
+    // sentinel. Dedup is scoped to the target so a user write never collides
+    // with a project row (or vice versa).
+    const target = scope === "user" ? (userScope as string) : ctx.directory;
     const basename = ctx.directory.split('/').pop() ?? ctx.directory;
 
     if (!args.force) {
-      // Dedup: project-scoped trigram similarity over the whole content. No
+      // Dedup: target-scoped trigram similarity over the whole content. No
       // trigram index - the project filter narrows to a few hundred rows, which
       // similarity() scans in single-digit milliseconds.
       const dedup = await sql`
         SELECT id, round(similarity(content, ${args.content})::numeric, 2) AS score
         FROM memories
-        WHERE project = ${ctx.directory}
+        WHERE project = ${target}
           AND (content = ${args.content} OR similarity(content, ${args.content}) >= ${DEDUP_SIMILARITY})
         ORDER BY similarity(content, ${args.content}) DESC
         LIMIT 1
       ` as { id: number; score: string }[];
 
       if (dedup.length > 0) {
-        return `Similar memory already stored as #${dedup[0].id} (similarity ${dedup[0].score}) for this project; skipping insert. Pass force: true to store it anyway.`;
+        const where = scope === "user" ? " in user scope" : "";
+        return `Similar memory already stored as #${dedup[0].id} (similarity ${dedup[0].score})${where}; skipping insert. Pass force: true to store it anyway.`;
       }
     }
 
@@ -362,12 +400,16 @@ async function remember(
     // the element type hint is required for clean array storage.
     const inserted = await sql`
       INSERT INTO memories (content, tags, session_id, project)
-      VALUES (${args.content}, ${sql.array(tags, "text")}, ${ctx.sessionID}, ${ctx.directory})
+      VALUES (${args.content}, ${sql.array(tags, "text")}, ${ctx.sessionID}, ${target})
       RETURNING id
     ` as { id: number }[];
 
+    // The injection cache is keyed by directory and user rows are injected into
+    // it, so a user-scope write invalidates the calling project's entry too.
     invalidateInjection(ctx.directory);
-    return `Stored memory #${inserted[0].id} for project ${basename}.`;
+    return scope === "user"
+      ? `Stored memory #${inserted[0].id} for user scope (shared across projects).`
+      : `Stored memory #${inserted[0].id} for project ${basename}.`;
   } catch (e: unknown) {
     return toolError("remember", "remember", e);
   }
@@ -419,6 +461,9 @@ async function captureFromPrompt(
 
 // Project-scoped by construction: an agent can only delete what its own project
 // can recall, so a poisoned id from another project silently matches nothing.
+// When user scope is enabled the boundary deliberately widens to include the
+// shared user sentinel - user memories are visible to every project of the
+// user, so any of them can delete them. Documented in the tool description.
 async function forget(
   args: ForgetArgs,
   ctx: { directory: string },
@@ -428,9 +473,12 @@ async function forget(
     if (!Number.isInteger(id) || id <= 0) {
       return "ERROR: id must be a positive integer (the #id shown by memory_recall).";
     }
+    const projectCond = userScope
+      ? sql`project IN (${ctx.directory}, ${userScope})`
+      : sql`project = ${ctx.directory}`;
     const deleted = await sql`
       DELETE FROM memories
-      WHERE id = ${id} AND project = ${ctx.directory}
+      WHERE id = ${id} AND ${projectCond}
       RETURNING id
     ` as { id: number }[];
 
@@ -501,6 +549,11 @@ const ocpg = Plugin.define({
                 "searchable (search covers content only), so this filter is the only way to reach them.",
             },
             global: { type: "boolean", description: "Search across all projects (default: current project only)" },
+            scope: {
+              type: "string",
+              enum: ["project", "user"],
+              description: '"user" searches your shared cross-project memories instead of this project\'s (requires user scope to be enabled)',
+            },
             limit: { type: "number", description: "1-20, default 5" },
           },
           additionalProperties: false,
@@ -541,6 +594,12 @@ const ocpg = Plugin.define({
               description:
                 "Store even if a similar memory exists (use only after a dedup rejection you judge to be wrong)",
             },
+            scope: {
+              type: "string",
+              enum: ["project", "user"],
+              description:
+                '"user" stores for you across all projects (requires user scope to be enabled); default "project" stores for this project only',
+            },
           },
           required: ["content"],
           additionalProperties: false,
@@ -553,7 +612,8 @@ const ocpg = Plugin.define({
         name: "memory_forget",
         options: { codemode: false },
         description:
-          "Delete a memory of this project by id (get ids from memory_recall). Use for memories that are wrong or obsolete; prefer storing a corrected memory when the old one is still useful history.",
+          "Delete a memory by id (get ids from memory_recall). Use for memories that are wrong or obsolete; prefer storing a corrected memory when the old one is still useful history. " +
+          "Deletes match this project's memories and, when user scope is enabled, your shared user memories too - those are visible to all your projects by design, so any of them can delete them.",
         input: {
           type: "object",
           properties: {
@@ -592,9 +652,16 @@ const __internals = {
   resolveLimit,
   validateWrite,
   logError,
+  resolveUserScope,
   toolError,
   rateLimitOk,
   resetRateLimit,
+  get userScope() {
+    return userScope;
+  },
+  setUserScope(raw: string | undefined | null) {
+    userScope = resolveUserScope(raw ?? undefined);
+  },
   retain,
   dispose,
 };

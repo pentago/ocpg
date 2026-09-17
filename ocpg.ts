@@ -319,10 +319,14 @@ async function recall(
     const tagCond = tagList.length
       ? sql`AND tags @> ${sql.array(tagList, "text")}`
       : sql``;
-    // Relevance-ranked when searching; recency-ordered for a plain project browse.
+    // Relevance-ranked when searching; undirected browse uses a recency×
+    // frequency blend. The gravity form keeps zero-access rows ordered by pure
+    // recency (fresh installs have access_count = 0 everywhere) and lets access
+    // bumps resurface used memories without letting a single old favorite pin
+    // the top slot forever.
     const orderBy = args.query
       ? sql`ORDER BY ts_rank(search_vector, websearch_to_tsquery('english', ${args.query})) DESC`
-      : sql`ORDER BY created_at DESC`;
+      : sql`ORDER BY (1 + access_count) / (GREATEST(EXTRACT(EPOCH FROM (now() - created_at)) / 86400, 0) + 2) DESC, created_at DESC`;
 
     const rows = await sql`
       SELECT id, content, coalesce(tags, '{}') AS tags,
@@ -333,6 +337,16 @@ async function recall(
       ${orderBy}
       LIMIT ${limit}
     ` as (MemoryRow & { memory_type: string })[];
+
+    // Access ranking is recall-only (plan 2.2): the injection path stays
+    // read-only because its per-directory cache would make increments biased.
+    // Fire-and-forget so the UPDATE never sits on the read path's latency.
+    const ids = rows.map((r) => r.id);
+    if (ids.length > 0) {
+      void sql`UPDATE memories SET access_count = access_count + 1, last_accessed_at = now() WHERE id = ANY(${sql.array(ids, "int8")})`.catch(
+        (e: unknown) => logError("access", `ocpg access bump failed: ${e instanceof Error ? e.message : String(e)}`),
+      );
+    }
 
     if (rows.length === 0) return "No memories found.";
 

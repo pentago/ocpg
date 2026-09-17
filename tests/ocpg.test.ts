@@ -770,6 +770,65 @@ describe("DB access layer", () => {
     });
   });
 
+  describe("access ranking (plan 2.2 narrowed: recall-only)", () => {
+    const ctx = { directory: "/tmp/ocpg-test-access", sessionID: "access-t" };
+
+    test("recall bumps access_count + last_accessed_at of returned rows", async () => {
+      try {
+        const stored = await __internals.remember({ content: "Access tracking probe for the recall bump." }, ctx);
+        const id = Number(stored.match(/#(\d+)/)?.[1]);
+        await __internals.recall({}, ctx);
+        await __internals.recall({}, ctx);
+        // Fire-and-forget: give the abandoned UPDATE a beat to land.
+        await new Promise((r) => setTimeout(r, 50));
+        const [row] = await __internals.sql`
+          SELECT access_count, last_accessed_at FROM memories WHERE id = ${id}
+        ` as { access_count: number; last_accessed_at: Date | null }[];
+        expect(row.access_count).toBe(2);
+        expect(row.last_accessed_at).not.toBe(null);
+      } finally {
+        await __internals.sql`DELETE FROM memories WHERE project = ${ctx.directory}`;
+      }
+    });
+
+    test("the injection path stays read-only", async () => {
+      try {
+        const stored = await __internals.remember({ content: "Injection must not touch access stats." }, ctx);
+        const id = Number(stored.match(/#(\d+)/)?.[1]);
+        __internals.invalidateInjection(ctx.directory);
+        const output: { system: string[] } = { system: [] };
+        await __internals.handleTransform(output, ctx.directory);
+        expect(output.system.length).toBe(1);
+        await new Promise((r) => setTimeout(r, 50));
+        const [row] = await __internals.sql`SELECT access_count FROM memories WHERE id = ${id}` as { access_count: number }[];
+        expect(row.access_count).toBe(0);
+      } finally {
+        await __internals.sql`DELETE FROM memories WHERE project = ${ctx.directory}`;
+        __internals.invalidateInjection(ctx.directory);
+      }
+    });
+
+    test("undirected recall blends frequency with recency", async () => {
+      try {
+        // Old memory with several accesses outranks a slightly newer zero-access one.
+        const [oldRow] = await __internals.sql`
+          INSERT INTO memories (content, tags, session_id, project, created_at, access_count)
+          VALUES ('blend: often-accessed older memory', ${__internals.sql.array(['__internals-test'], "text")}, 'a', ${ctx.directory}, now() - interval '5 days', 3)
+          RETURNING id
+        ` as { id: number }[];
+        const [newRow] = await __internals.sql`
+          INSERT INTO memories (content, tags, session_id, project, created_at, access_count)
+          VALUES ('blend: never-accessed newer memory', ${__internals.sql.array(['__internals-test'], "text")}, 'a', ${ctx.directory}, now(), 0)
+          RETURNING id
+        ` as { id: number }[];
+        const result = await __internals.recall({}, ctx);
+        expect(result.indexOf(`#${oldRow.id}`)).toBeLessThan(result.indexOf(`#${newRow.id}`));
+      } finally {
+        await __internals.sql`DELETE FROM memories WHERE project = ${ctx.directory}`;
+      }
+    });
+  });
+
   describe("keyword capture (plan 1.1 revised: verbatim, no LLM)", () => {
     test("extracts the text after the trigger, verbatim and minus the trigger", () => {
       expect(__internals.extractMemoryRequest("remember that the build uses bun, not npm")).toBe(

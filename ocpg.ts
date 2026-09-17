@@ -453,8 +453,14 @@ const ocpg = Plugin.define({
       });
       editor.add({
         name: "memory_remember",
+        // This description is the only place the write policy is guaranteed to
+        // reach the model: it is in the tool schema every session, whereas the
+        // injected block is skipped entirely for projects with no memories and
+        // the user may have no project instructions at all.
         description:
-          "Store a memory for this project. Use after user corrections, architecture decisions, or non-trivial fixes.",
+          "Store a durable memory for this project. Use after user corrections (immediately), " +
+          "architecture decisions, non-trivial fixes, environment facts, and stated preferences. " +
+          "Do not store session progress, secrets, or anything the code itself already states.",
         input: {
           type: "object",
           properties: {

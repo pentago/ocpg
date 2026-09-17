@@ -440,7 +440,9 @@ const ocpg = Plugin.define({
             tags: {
               type: "array",
               items: { type: "string" },
-              description: "Only return memories carrying all of these tags",
+              description:
+                "Only return memories carrying all of these tags. Tags are not full-text " +
+                "searchable (search covers content only), so this filter is the only way to reach them.",
             },
             global: { type: "boolean", description: "Search across all projects (default: current project only)" },
             limit: { type: "number", description: "1-20, default 5" },

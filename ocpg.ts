@@ -14,7 +14,13 @@ type DbConfig = {
   ssl: SslMode;
 };
 type RecallArgs = { query?: string; global?: boolean; limit?: number; tags?: string[]; scope?: "project" | "user" };
-type RememberArgs = { content: string; tags?: string[]; force?: boolean; scope?: "project" | "user" };
+type RememberArgs = {
+  content: string;
+  tags?: string[];
+  force?: boolean;
+  scope?: "project" | "user";
+  type?: MemoryType;
+};
 type ForgetArgs = { id: number };
 
 // Defaults to "disable" so the common localhost setup is unchanged; set OCPG_SSL
@@ -204,7 +210,7 @@ async function handleTransform(
              to_char(created_at, 'YYYY-MM-DD') AS date
       FROM memories
       ${projectCond}
-      ORDER BY created_at DESC
+      ORDER BY (memory_type = 'preference') DESC, created_at DESC
       LIMIT 5
     ` as unknown as PromiseLike<InjectionRow[]>,
       1000,
@@ -250,6 +256,19 @@ const MAX_CONTENT = 4000;
 const MIN_CONTENT = 10;
 const MAX_TAGS = 10;
 const MAX_TAG_LENGTH = 64;
+
+// --- Memory types (plan 2.1: defaulted, never required) ---
+
+// The stored vocabulary mirrors the DB CHECK constraint (memories_type_check);
+// rows predate the column, so "required" would break every existing caller -
+// type is always defaulted. episodic is reserved for the (cut, opt-in) 1.3
+// feature; remember accepts it so the vocabulary stays in one place.
+const MEMORY_TYPES = ["preference", "project_fact", "episodic"] as const;
+type MemoryType = (typeof MEMORY_TYPES)[number];
+
+function resolveMemoryType(raw: unknown): MemoryType {
+  return MEMORY_TYPES.includes(raw as MemoryType) ? (raw as MemoryType) : "project_fact";
+}
 
 // Raw JSON Schema input is not coerced for us: a model sending "3" or null for
 // limit would otherwise reach Postgres as LIMIT NaN.
@@ -307,12 +326,12 @@ async function recall(
     const rows = await sql`
       SELECT id, content, coalesce(tags, '{}') AS tags,
              to_char(created_at, 'YYYY-MM-DD') AS date,
-             project
+             project, memory_type
       FROM memories
       WHERE 1=1 ${projectCond} ${queryCond} ${tagCond}
       ${orderBy}
       LIMIT ${limit}
-    ` as MemoryRow[];
+    ` as (MemoryRow & { memory_type: string })[];
 
     if (rows.length === 0) return "No memories found.";
 
@@ -320,7 +339,10 @@ async function recall(
       .map((r) => {
         const tags = r.tags ?? [];
         const tagStr = tags.length ? ` (${tags.join(', ')})` : '';
-        return `[${r.date}] [${r.project}]${tagStr}\n#${r.id}\n${r.content}`;
+        // preference/episodic are worth surfacing; project_fact is the default
+        // every pre-column row carries, so printing it is pure noise.
+        const typeStr = r.memory_type === "project_fact" ? "" : ` [${r.memory_type}]`;
+        return `[${r.date}] [${r.project}]${typeStr}${tagStr}\n#${r.id}\n${r.content}`;
       })
       .join('\n---\n');
   } catch (e: unknown) {
@@ -346,6 +368,9 @@ function validateWrite(args: RememberArgs): string | null {
   const oversized = tags.find((t) => typeof t !== "string" || t.length > MAX_TAG_LENGTH);
   if (oversized !== undefined) {
     return `ERROR: each tag must be a string of at most ${MAX_TAG_LENGTH} characters.`;
+  }
+  if (args.type !== undefined && !MEMORY_TYPES.includes(args.type)) {
+    return `ERROR: type must be one of ${MEMORY_TYPES.join(", ")}.`;
   }
   return null;
 }
@@ -399,8 +424,8 @@ async function remember(
     // sql.array(tags) alone encodes text[] with quoted elements under bun 1.4.2;
     // the element type hint is required for clean array storage.
     const inserted = await sql`
-      INSERT INTO memories (content, tags, session_id, project)
-      VALUES (${args.content}, ${sql.array(tags, "text")}, ${ctx.sessionID}, ${target})
+      INSERT INTO memories (content, tags, session_id, project, memory_type)
+      VALUES (${args.content}, ${sql.array(tags, "text")}, ${ctx.sessionID}, ${target}, ${resolveMemoryType(args.type)})
       RETURNING id
     ` as { id: number }[];
 
@@ -580,12 +605,19 @@ const ocpg = Plugin.define({
               type: "string",
               description: `1-3 self-contained sentences capturing the why (${MIN_CONTENT}-${MAX_CONTENT} characters)`,
             },
+            type: {
+              type: "string",
+              enum: [...MEMORY_TYPES],
+              description:
+                "preference = a standing user preference (these are injected first); " +
+                "project_fact (default) = decisions, fixes, env facts. Omit unless the memory is a preference.",
+            },
             tags: {
               type: "array",
               items: { type: "string", maxLength: MAX_TAG_LENGTH },
               maxItems: MAX_TAGS,
               description:
-                "Category prefixes: preference, decision, debug, env, architecture, workaround, " +
+                "Fine-grained facets: decision, debug, env, architecture, workaround, " +
                 "language:<x>, framework:<x>, tool:<x>. Project scoping is automatic (a project " +
                 "column, not a tag) - never add project:<name>.",
             },
@@ -650,6 +682,7 @@ const __internals = {
   invalidateInjection,
   resolveSslMode,
   resolveLimit,
+  resolveMemoryType,
   validateWrite,
   logError,
   resolveUserScope,

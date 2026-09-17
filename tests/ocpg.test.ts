@@ -579,6 +579,83 @@ describe("DB access layer", () => {
     });
   });
 
+  describe("memory_type (plan 2.1: defaulted, never required)", () => {
+    const ctx = { directory: "/tmp/ocpg-test-type", sessionID: "type-t" };
+
+    test("remember defaults to project_fact and accepts an explicit preference", async () => {
+      try {
+        const fact = await __internals.remember({ content: "The make target is make verify, not make test." }, ctx);
+        expect(fact).toContain("Stored memory #");
+        const pref = await __internals.remember(
+          { content: "The operator prefers short commit subjects.", type: "preference" },
+          ctx,
+        );
+        expect(pref).toContain("Stored memory #");
+
+        const rows = await __internals.sql`
+          SELECT content, memory_type FROM memories WHERE project = ${ctx.directory}
+        ` as { content: string; memory_type: string }[];
+        expect(rows.find((r) => r.content.startsWith("The make target"))?.memory_type).toBe("project_fact");
+        expect(rows.find((r) => r.content.startsWith("The operator prefers"))?.memory_type).toBe("preference");
+      } finally {
+        await __internals.sql`DELETE FROM memories WHERE project = ${ctx.directory}`;
+      }
+    });
+
+    test("an unknown type is rejected with the allowed set", async () => {
+      const result = await __internals.remember(
+        { content: "valid content for the type check", type: "fact" as unknown as "project_fact" },
+        ctx,
+      );
+      expect(result).toContain("ERROR");
+      expect(result).toContain("preference, project_fact, episodic");
+      const [n] = await __internals.sql`SELECT count(*) AS n FROM memories WHERE project = ${ctx.directory}` as { n: string }[];
+      expect(Number(n.n)).toBe(0);
+    });
+
+    test("injection puts preference rows first, ahead of newer facts", async () => {
+      try {
+        // Fact stored NOW, preference stored an hour ago: recency would put the
+        // fact first; type-aware ordering must not.
+        await __internals.remember({ content: "Recent project fact about the build cache." }, ctx);
+        await __internals.sql`
+          INSERT INTO memories (content, tags, session_id, project, memory_type, created_at)
+          VALUES ('Standing preference: never amend pushed commits.', ${__internals.sql.array([], "text")}, 'type-t', ${ctx.directory}, 'preference', now() - interval '1 hour')
+        `;
+        __internals.invalidateInjection(ctx.directory);
+
+        const output: { system: string[] } = { system: [] };
+        await __internals.handleTransform(output, ctx.directory);
+        const block = output.system[0];
+        expect(block).toContain("never amend pushed commits");
+        const prefIdx = block.indexOf("never amend pushed commits");
+        const factIdx = block.indexOf("Recent project fact");
+        expect(prefIdx).toBeGreaterThan(-1);
+        expect(factIdx).toBeGreaterThan(-1);
+        expect(prefIdx).toBeLessThan(factIdx);
+      } finally {
+        await __internals.sql`DELETE FROM memories WHERE project = ${ctx.directory}`;
+        __internals.invalidateInjection(ctx.directory);
+      }
+    });
+
+    test("resolveMemoryType coerces unknown/undefined to the default", () => {
+      expect(__internals.resolveMemoryType(undefined)).toBe("project_fact");
+      expect(__internals.resolveMemoryType("preference")).toBe("preference");
+      expect(__internals.resolveMemoryType("nope")).toBe("project_fact");
+    });
+
+    test("recall surfaces non-default types in its output", async () => {
+      try {
+        await __internals.remember({ content: "Preference surfaced in recall output.", type: "preference" }, ctx);
+        const result = await __internals.recall({ query: "surfaced in recall", limit: 2 }, ctx);
+        expect(result).toContain("[preference]");
+      } finally {
+        await __internals.sql`DELETE FROM memories WHERE project = ${ctx.directory}`;
+      }
+    });
+  });
+
   describe("keyword capture (plan 1.1 revised: verbatim, no LLM)", () => {
     test("extracts the text after the trigger, verbatim and minus the trigger", () => {
       expect(__internals.extractMemoryRequest("remember that the build uses bun, not npm")).toBe(

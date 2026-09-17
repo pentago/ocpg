@@ -16,7 +16,13 @@ psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" <<-'EOSQL'
 	  session_id    text,
 	  project       text,
 	  created_at    timestamptz DEFAULT now(),
-	  search_vector tsvector GENERATED ALWAYS AS (to_tsvector('english', content)) STORED
+	  memory_type   text        NOT NULL DEFAULT 'project_fact',
+	  access_count  integer     NOT NULL DEFAULT 0,
+	  last_accessed_at timestamptz,
+	  updated_at    timestamptz,
+	  search_vector tsvector GENERATED ALWAYS AS (to_tsvector('english', content)) STORED,
+	  CONSTRAINT memories_type_check
+	    CHECK (memory_type IN ('preference', 'project_fact', 'episodic'))
 	);
 	CREATE INDEX idx_memories_search ON memories USING gin (search_vector);
 	CREATE INDEX idx_memories_tags   ON memories USING gin (tags);

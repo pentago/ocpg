@@ -13,9 +13,16 @@ type DbConfig = {
   database: string;
   ssl: SslMode;
 };
-type RecallArgs = { query?: string; global?: boolean; limit?: number; tags?: string[] };
-type RememberArgs = { content: string; tags?: string[]; force?: boolean };
+type RecallArgs = { query?: string; global?: boolean; limit?: number; tags?: string[]; scope?: "project" | "user" };
+type RememberArgs = {
+  content: string;
+  tags?: string[];
+  force?: boolean;
+  scope?: "project" | "user";
+  type?: MemoryType;
+};
 type ForgetArgs = { id: number };
+type UpdateArgs = { id: number; content: string; tags?: string[]; type?: MemoryType };
 
 // Defaults to "disable" so the common localhost setup is unchanged; set OCPG_SSL
 // when the database is remote, otherwise the SCRAM handshake crosses the network
@@ -35,6 +42,22 @@ const defaultConfig: DbConfig = {
   ssl: resolveSslMode(process.env.OCPG_SSL),
 };
 const password = process.env.OCPG_PASSWORD || "";
+
+// --- User scope (plan 1.2, revised: sentinel value, no migration) ---
+
+// User memories are ordinary rows with the sentinel project value `user:<id>`,
+// written into the existing project column - identical semantics to a scope
+// column with zero migration. OCPG_USER_ID is read once at init (env-only, no
+// process spawning); unset means user scope is disabled entirely and every
+// query degrades to exactly the pre-feature behavior.
+//
+// Mutable module state + a reset hook so tests can toggle it deterministically.
+let userScope = resolveUserScope(process.env.OCPG_USER_ID);
+
+function resolveUserScope(raw: string | undefined): string | null {
+  const id = raw?.trim();
+  return id ? `user:${id}` : null;
+}
 
 // Options-object constructor, not a URL string: Bun's SQL parses string URLs via
 // url.parse(), which emits the DEP0169 DeprecationWarning at plugin load under opencode.
@@ -125,6 +148,14 @@ async function withDeadline<T>(query: PromiseLike<T>, ms: number): Promise<T> {
 
 // --- Injection pipeline ---
 
+// Injection ranking mode (plan follow-up: relevance over blind recency).
+// "relevance" (default) scores all memories - every project - against the
+// user's latest prompt via full-text search, falling back to recency when the
+// prompt matches nothing; "recency" restores the old last-5 behavior via
+// OCPG_INJECTION=recency. Resolved once at init, env-only.
+let injectionMode: "relevance" | "recency" =
+  process.env.OCPG_INJECTION === "recency" ? "recency" : "relevance";
+
 function truncateMemory(content: string): string {
   if (content.length <= 600) return content;
   return `${content.slice(0, 600)}…[truncated]`;
@@ -157,43 +188,123 @@ function formatBlock(rows: InjectionRow[], projectDir: string): string {
   return lines.join("\n");
 }
 
-// Keyed by project directory, not session: the query depends only on the
-// directory, so every session in a project shares one entry and a remember in
-// any session invalidates it for all of them. An empty string is cached for
-// projects with no memories so they stop re-querying, and nothing is injected.
+// Keyed by directory + prompt hash now that the block depends on the prompt
+// (relevance mode): an identical prompt (model retries, re-requests) hits the
+// cache; a new prompt queries afresh. An empty string is cached for
+// no-match/empty prompts so they stop re-querying.
 const injectionCache = new Map<string, string>();
 
-// Session-independent by design: the block depends only on the project
-// directory, so the hook passes nothing else.
+// djb2 - just a stable key shortener; a same-hash different-prompt collision
+// would serve a stale block, which remember/forget invalidation clears.
+function hashQuery(text: string): string {
+  let h = 5381;
+  for (let i = 0; i < text.length; i++) h = ((h << 5) + h + text.charCodeAt(i)) | 0;
+  return (h >>> 0).toString(36);
+}
+
+// The latest user message is the retrieval signal: what the user is asking
+// about right now is the best proxy for which memories matter. Text parts
+// only; capped because a query is a query, not a transcript - FTS is not
+// helped by thousands of characters.
+function extractPromptQuery(
+  messages: ReadonlyArray<{ role: unknown; content: ReadonlyArray<{ type?: unknown; text?: unknown }> }>,
+): string {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i];
+    if (message?.role !== "user") continue;
+    const text = message.content
+      .filter((p) => p.type === "text" && typeof p.text === "string")
+      .map((p) => p.text as string)
+      .join(" ")
+      .trim();
+    return text.length > 512 ? text.slice(0, 512) : text;
+  }
+  return "";
+}
+
+// Recency query shared by the recency mode and the no-match fallback: latest 5
+// rows of the project (plus the user-scope sentinel when enabled), preferences
+// first.
+// Query builders are pure functions of the client so the benchmark
+// (bench/run.ts) can execute the EXACT production SQL against bench
+// databases - no drift between what is measured and what runs.
+function buildRecencyQuery(client: SQL, directory: string) {
+  const projectCond = userScope
+    ? client`WHERE (project = ${directory} OR project = ${userScope})`
+    : client`WHERE project = ${directory}`;
+  return client`
+    SELECT content, coalesce(tags, '{}') AS tags,
+           to_char(created_at, 'YYYY-MM-DD') AS date
+    FROM memories
+    ${projectCond}
+    ORDER BY (memory_type = 'preference') DESC, created_at DESC
+    LIMIT 5
+  `;
+}
+
+function buildRelevanceQuery(client: SQL, tsQuery: string, directory: string) {
+  // Relevance: full-text search across ALL projects - shared memory by
+  // design - with a small same-project boost to break rank ties toward
+  // locally stored memories.
+  return client`
+    SELECT content, coalesce(tags, '{}') AS tags,
+           to_char(created_at, 'YYYY-MM-DD') AS date
+    FROM memories
+    WHERE search_vector @@ to_tsquery('english', ${tsQuery})
+    ORDER BY ts_rank(search_vector, to_tsquery('english', ${tsQuery}))
+             + (CASE WHEN project = ${directory} THEN 0.01 ELSE 0 END) DESC,
+             created_at DESC
+    LIMIT 5
+  `;
+}
+
+// The prompt as an OR of stemmed words: websearch_to_tsquery ANDs the terms,
+// so one word the memory never uses would zero out the whole query (bench:
+// recall 0.00-0.02 on multi-word queries). OR ranks by how many (and how
+// rare) the matched terms are, and sanitizing to [a-z0-9]+ tokens keeps
+// to_tsquery syntax-safe. Capped at 24 words to bound the query.
+function orTsQuery(text: string): string {
+  const words = text.toLowerCase().match(/[a-z0-9]+/g) ?? [];
+  return words.slice(0, 24).join(" | ");
+}
+
+// The block depends on the directory plus (in relevance mode) the prompt,
+// passed explicitly by the caller.
 async function handleTransform(
   output: { system: string[] },
   directory: string,
+  prompt = "",
 ): Promise<void> {
   if (!directory) return;
-  const cached = injectionCache.get(directory);
+  const query = injectionMode === "relevance" ? prompt.trim() : "";
+  const cacheKey = `${directory}\u0001${hashQuery(query)}`;
+  const cached = injectionCache.get(cacheKey);
   if (cached !== undefined) {
     if (cached) output.system.push(cached);
     return;
   }
   try {
-    const rows = await withDeadline(
-      sql`
-      SELECT content, coalesce(tags, '{}') AS tags,
-             to_char(created_at, 'YYYY-MM-DD') AS date
-      FROM memories
-      WHERE project = ${directory}
-      ORDER BY created_at DESC
-      LIMIT 5
-    ` as unknown as PromiseLike<InjectionRow[]>,
-      1000,
-    );
+    let rows: InjectionRow[];
+    const tsQuery = orTsQuery(query);
+    if (tsQuery) {
+      rows = await withDeadline(
+        buildRelevanceQuery(sql, tsQuery, directory) as unknown as PromiseLike<InjectionRow[]>,
+        1000,
+      );
+      if (rows.length === 0) {
+        // No keyword match for this prompt - recency beats an empty block.
+        rows = await withDeadline(buildRecencyQuery(sql, directory) as unknown as PromiseLike<InjectionRow[]>, 1000);
+      }
+    } else {
+      rows = await withDeadline(buildRecencyQuery(sql, directory) as unknown as PromiseLike<InjectionRow[]>, 1000);
+    }
     const block = formatBlock(rows, directory);
     // Evict oldest entry when cache exceeds 32
     if (injectionCache.size >= 32) {
       const firstKey = injectionCache.keys().next().value;
       if (firstKey !== undefined) injectionCache.delete(firstKey);
     }
-    injectionCache.set(directory, block);
+    injectionCache.set(cacheKey, block);
     if (block) output.system.push(block);
   } catch (e: unknown) {
     logError("inject", `ocpg injection failed: ${e instanceof Error ? e.message : String(e)}`);
@@ -229,6 +340,19 @@ const MIN_CONTENT = 10;
 const MAX_TAGS = 10;
 const MAX_TAG_LENGTH = 64;
 
+// --- Memory types (plan 2.1: defaulted, never required) ---
+
+// The stored vocabulary mirrors the DB CHECK constraint (memories_type_check);
+// rows predate the column, so "required" would break every existing caller -
+// type is always defaulted. episodic is reserved for the (cut, opt-in) 1.3
+// feature; remember accepts it so the vocabulary stays in one place.
+const MEMORY_TYPES = ["preference", "project_fact", "episodic"] as const;
+type MemoryType = (typeof MEMORY_TYPES)[number];
+
+function resolveMemoryType(raw: unknown): MemoryType {
+  return MEMORY_TYPES.includes(raw as MemoryType) ? (raw as MemoryType) : "project_fact";
+}
+
 // Raw JSON Schema input is not coerced for us: a model sending "3" or null for
 // limit would otherwise reach Postgres as LIMIT NaN.
 function resolveLimit(raw: unknown): number {
@@ -257,11 +381,18 @@ async function recall(
 ): Promise<string> {
   try {
     const limit = resolveLimit(args.limit);
+    // scope: "user" addresses the shared user scope; global: true already
+    // covers user rows since it drops the project filter entirely.
+    if (args.scope === "user" && !userScope) {
+      return "ERROR: user scope is disabled (set OCPG_USER_ID to enable it).";
+    }
     const projectCond = args.global
       ? sql``
-      : sql`AND project = ${ctx.directory}`;
+      : args.scope === "user"
+        ? sql`AND project = ${userScope}`
+        : sql`AND project = ${ctx.directory}`;
     const queryCond = args.query
-      ? sql`AND search_vector @@ websearch_to_tsquery('english', ${args.query})`
+      ? sql`AND search_vector @@ to_tsquery('english', ${orTsQuery(args.query)})`
       : sql``;
     // Tags are not part of search_vector (it covers content only), so they are
     // unreachable by query alone. Matches rows carrying ALL the given tags,
@@ -270,20 +401,34 @@ async function recall(
     const tagCond = tagList.length
       ? sql`AND tags @> ${sql.array(tagList, "text")}`
       : sql``;
-    // Relevance-ranked when searching; recency-ordered for a plain project browse.
+    // Relevance-ranked when searching; undirected browse uses a recency×
+    // frequency blend. The gravity form keeps zero-access rows ordered by pure
+    // recency (fresh installs have access_count = 0 everywhere) and lets access
+    // bumps resurface used memories without letting a single old favorite pin
+    // the top slot forever.
     const orderBy = args.query
-      ? sql`ORDER BY ts_rank(search_vector, websearch_to_tsquery('english', ${args.query})) DESC`
-      : sql`ORDER BY created_at DESC`;
+      ? sql`ORDER BY ts_rank(search_vector, to_tsquery('english', ${orTsQuery(args.query)})) DESC`
+      : sql`ORDER BY (1 + access_count) / (GREATEST(EXTRACT(EPOCH FROM (now() - created_at)) / 86400, 0) + 2) DESC, created_at DESC`;
 
     const rows = await sql`
       SELECT id, content, coalesce(tags, '{}') AS tags,
              to_char(created_at, 'YYYY-MM-DD') AS date,
-             project
+             project, memory_type
       FROM memories
       WHERE 1=1 ${projectCond} ${queryCond} ${tagCond}
       ${orderBy}
       LIMIT ${limit}
-    ` as MemoryRow[];
+    ` as (MemoryRow & { memory_type: string })[];
+
+    // Access ranking is recall-only (plan 2.2): the injection path stays
+    // read-only because its per-directory cache would make increments biased.
+    // Fire-and-forget so the UPDATE never sits on the read path's latency.
+    const ids = rows.map((r) => r.id);
+    if (ids.length > 0) {
+      void sql`UPDATE memories SET access_count = access_count + 1, last_accessed_at = now() WHERE id = ANY(${sql.array(ids, "int8")})`.catch(
+        (e: unknown) => logError("access", `ocpg access bump failed: ${e instanceof Error ? e.message : String(e)}`),
+      );
+    }
 
     if (rows.length === 0) return "No memories found.";
 
@@ -291,7 +436,10 @@ async function recall(
       .map((r) => {
         const tags = r.tags ?? [];
         const tagStr = tags.length ? ` (${tags.join(', ')})` : '';
-        return `[${r.date}] [${r.project}]${tagStr}\n#${r.id}\n${r.content}`;
+        // preference/episodic are worth surfacing; project_fact is the default
+        // every pre-column row carries, so printing it is pure noise.
+        const typeStr = r.memory_type === "project_fact" ? "" : ` [${r.memory_type}]`;
+        return `[${r.date}] [${r.project}]${typeStr}${tagStr}\n#${r.id}\n${r.content}`;
       })
       .join('\n---\n');
   } catch (e: unknown) {
@@ -318,6 +466,9 @@ function validateWrite(args: RememberArgs): string | null {
   if (oversized !== undefined) {
     return `ERROR: each tag must be a string of at most ${MAX_TAG_LENGTH} characters.`;
   }
+  if (args.type !== undefined && !MEMORY_TYPES.includes(args.type)) {
+    return `ERROR: type must be one of ${MEMORY_TYPES.join(", ")}.`;
+  }
   return null;
 }
 
@@ -338,43 +489,103 @@ async function remember(
 
     // Tags are stored verbatim - project scoping lives in the project column, not tags.
     const tags = args.tags ?? [];
+    const scope = args.scope === "user" ? "user" : "project";
+    if (scope === "user" && !userScope) {
+      return "ERROR: user scope is disabled (set OCPG_USER_ID to enable it).";
+    }
+    // The write target: the calling project's directory, or the shared user
+    // sentinel. Dedup is scoped to the target so a user write never collides
+    // with a project row (or vice versa).
+    const target = scope === "user" ? (userScope as string) : ctx.directory;
     const basename = ctx.directory.split('/').pop() ?? ctx.directory;
 
     if (!args.force) {
-      // Dedup: project-scoped trigram similarity over the whole content. No
+      // Dedup: target-scoped trigram similarity over the whole content. No
       // trigram index - the project filter narrows to a few hundred rows, which
       // similarity() scans in single-digit milliseconds.
       const dedup = await sql`
         SELECT id, round(similarity(content, ${args.content})::numeric, 2) AS score
         FROM memories
-        WHERE project = ${ctx.directory}
+        WHERE project = ${target}
           AND (content = ${args.content} OR similarity(content, ${args.content}) >= ${DEDUP_SIMILARITY})
         ORDER BY similarity(content, ${args.content}) DESC
         LIMIT 1
       ` as { id: number; score: string }[];
 
       if (dedup.length > 0) {
-        return `Similar memory already stored as #${dedup[0].id} (similarity ${dedup[0].score}) for this project; skipping insert. Pass force: true to store it anyway.`;
+        const where = scope === "user" ? " in user scope" : "";
+        return `Similar memory already stored as #${dedup[0].id} (similarity ${dedup[0].score})${where}; skipping insert. Pass force: true to store it anyway.`;
       }
     }
 
     // sql.array(tags) alone encodes text[] with quoted elements under bun 1.4.2;
     // the element type hint is required for clean array storage.
     const inserted = await sql`
-      INSERT INTO memories (content, tags, session_id, project)
-      VALUES (${args.content}, ${sql.array(tags, "text")}, ${ctx.sessionID}, ${ctx.directory})
+      INSERT INTO memories (content, tags, session_id, project, memory_type)
+      VALUES (${args.content}, ${sql.array(tags, "text")}, ${ctx.sessionID}, ${target}, ${resolveMemoryType(args.type)})
       RETURNING id
     ` as { id: number }[];
 
+    // The injection cache is keyed by directory and user rows are injected into
+    // it, so a user-scope write invalidates the calling project's entry too.
     invalidateInjection(ctx.directory);
-    return `Stored memory #${inserted[0].id} for project ${basename}.`;
+    return scope === "user"
+      ? `Stored memory #${inserted[0].id} for user scope (shared across projects).`
+      : `Stored memory #${inserted[0].id} for project ${basename}.`;
   } catch (e: unknown) {
     return toolError("remember", "remember", e);
   }
 }
 
+// --- Keyword capture (plan 1.1, revised) ---
+
+// Deterministic capture, no LLM: a trigger phrase in the prompt stores the text
+// following it verbatim (minus the trigger) through the normal write path.
+// Extracting "relevant content" instead would be a model judgment on the
+// prompt-admission path - nondeterministic, and it violates the project rule
+// that model judgment never becomes load-bearing (memory #1555).
+const MEMORY_TRIGGER_RE =
+  /\b(?:remember(?:\s+(?:this|that|to))?|do(?:n'?| no)t forget(?:\s+(?:this|that|to))?|keep (?:this|that )?in mind(?: that)?)\b\s*[:,]?\s*/i;
+
+// Interrogative follow-ons are questions about the past ("remember when the
+// pool broke?"), not storage requests. The list is deliberately narrow:
+// "remember that when X happens, do Y" is imperative and must be captured, so
+// "when" alone is not enough - only skip the bare question forms.
+const INTERROGATIVE_RE = /^(?:when|what|where|why|how|who|whom|whose|which|did)\b/i;
+
+function extractMemoryRequest(text: string): string | null {
+  const match = MEMORY_TRIGGER_RE.exec(text);
+  if (!match) return null;
+  const rest = text.slice(match.index + match[0].length).trim();
+  if (!rest || INTERROGATIVE_RE.test(rest)) return null;
+  return rest;
+}
+
+// Fire-and-forget by design: prompt admission must not wait on a database
+// write, and the prompt itself is never mutated on failure.
+//
+// Not exactly-once: the docs allow prompt hooks to run more than once under
+// concurrent submissions. Dedup-on-write (trigram similarity) is the guard -
+// no hook-side deduplication layer on top of it.
+async function captureFromPrompt(
+  text: string,
+  directory: string,
+  sessionID: string,
+): Promise<void> {
+  const content = extractMemoryRequest(text);
+  if (!content) return;
+  try {
+    await remember({ content, tags: ["user-requested"] }, { directory, sessionID });
+  } catch (e: unknown) {
+    logError("capture", `ocpg keyword capture failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
 // Project-scoped by construction: an agent can only delete what its own project
 // can recall, so a poisoned id from another project silently matches nothing.
+// When user scope is enabled the boundary deliberately widens to include the
+// shared user sentinel - user memories are visible to every project of the
+// user, so any of them can delete them. Documented in the tool description.
 async function forget(
   args: ForgetArgs,
   ctx: { directory: string },
@@ -384,9 +595,12 @@ async function forget(
     if (!Number.isInteger(id) || id <= 0) {
       return "ERROR: id must be a positive integer (the #id shown by memory_recall).";
     }
+    const projectCond = userScope
+      ? sql`project IN (${ctx.directory}, ${userScope})`
+      : sql`project = ${ctx.directory}`;
     const deleted = await sql`
       DELETE FROM memories
-      WHERE id = ${id} AND project = ${ctx.directory}
+      WHERE id = ${id} AND ${projectCond}
       RETURNING id
     ` as { id: number }[];
 
@@ -400,8 +614,61 @@ async function forget(
   }
 }
 
+// No dedup fall-through, by design: an update that lands close to another
+// memory is an intentional correction, not a dupe to reject. updated_at is
+// set; created_at is deliberately NOT bumped - the displayed date must keep
+// saying when the memory was learned, not when it was last edited. Omitted
+// tags/type are preserved, not reset to their defaults.
+async function updateMemory(
+  args: UpdateArgs,
+  ctx: { directory: string },
+): Promise<string> {
+  try {
+    const id = Number(args.id);
+    if (!Number.isInteger(id) || id <= 0) {
+      return "ERROR: id must be a positive integer (the #id shown by memory_recall).";
+    }
+    const invalid = validateWrite(args);
+    if (invalid) return invalid;
+
+    const projectCond = userScope
+      ? sql`project IN (${ctx.directory}, ${userScope})`
+      : sql`project = ${ctx.directory}`;
+    const tags = args.tags ?? [];
+    const tagCond = Array.isArray(args.tags)
+      ? sql`tags = ${sql.array(tags, "text")},`
+      : sql``;
+    const typeCond = args.type !== undefined
+      ? sql`memory_type = ${resolveMemoryType(args.type)},`
+      : sql``;
+    const updated = await sql`
+      UPDATE memories
+      SET content = ${args.content},
+          ${tagCond}
+          ${typeCond}
+          updated_at = now()
+      WHERE id = ${id} AND ${projectCond}
+      RETURNING id
+    ` as { id: number }[];
+
+    if (updated.length === 0) {
+      return `No memory #${id} in this project; nothing updated.`;
+    }
+    invalidateInjection(ctx.directory);
+    return `Updated memory #${id}.`;
+  } catch (e: unknown) {
+    return toolError("update", "update", e);
+  }
+}
+
+// Clears every cache entry for the directory - relevance mode keys by
+// directory + prompt hash, so a write invalidates them all.
 function invalidateInjection(directory: string): void {
-  injectionCache.delete(directory);
+  for (const key of [...injectionCache.keys()]) {
+    if (key === directory || key.startsWith(`${directory}\u0001`)) {
+      injectionCache.delete(key);
+    }
+  }
 }
 
 // V2 entrypoint: registers the system-context injection hook and the agent tools
@@ -419,11 +686,20 @@ const ocpg = Plugin.define({
     void sql`SELECT 1`.catch(() => {});
 
     // Inject project memories into every model request's system context.
-    // handleTransform owns the per-directory cache (32-slot, invalidated on remember).
+    // Relevance mode derives the retrieval query from the latest user message;
+    // handleTransform owns the cache (32-slot, keyed by directory + prompt).
     await ctx.session.hook("context", async (event) => {
       const output: { system: string[] } = { system: [] };
-      await handleTransform(output, directory);
+      await handleTransform(output, directory, extractPromptQuery(event.messages));
       for (const text of output.system) event.system.push({ type: "text", text });
+    });
+
+    // Keyword capture (plan 1.1 revised): a trigger phrase ("remember this,
+    // ...") stores the following text verbatim through the normal write path -
+    // same validateWrite, same trigram dedup. No LLM call, and the prompt
+    // itself is never mutated.
+    await ctx.session.hook("prompt", (event) => {
+      void captureFromPrompt(event.prompt.text, directory, event.sessionID);
     });
 
     // Agent tools: recall + remember with dedup-on-write. Input schemas are raw
@@ -431,6 +707,10 @@ const ocpg = Plugin.define({
     await ctx.tool.transform((editor) => {
       editor.add({
         name: "memory_recall",
+        // Direct (non-codemode) tool: memory ops are single-shot calls, not
+        // scriptable sequences - hiding them behind the execute sandbox only
+        // breaks direct invocation without adding value.
+        options: { codemode: false },
         description:
           "Search past memories stored for this project. Use before non-trivial work to check for relevant lessons, fixes, and decisions.",
         input: {
@@ -445,6 +725,11 @@ const ocpg = Plugin.define({
                 "searchable (search covers content only), so this filter is the only way to reach them.",
             },
             global: { type: "boolean", description: "Search across all projects (default: current project only)" },
+            scope: {
+              type: "string",
+              enum: ["project", "user"],
+              description: '"user" searches your shared cross-project memories instead of this project\'s (requires user scope to be enabled)',
+            },
             limit: { type: "number", description: "1-20, default 5" },
           },
           additionalProperties: false,
@@ -455,6 +740,7 @@ const ocpg = Plugin.define({
       });
       editor.add({
         name: "memory_remember",
+        options: { codemode: false },
         // This description is the only place the write policy is guaranteed to
         // reach the model: it is in the tool schema every session, whereas the
         // injected block is skipped entirely for projects with no memories and
@@ -470,12 +756,19 @@ const ocpg = Plugin.define({
               type: "string",
               description: `1-3 self-contained sentences capturing the why (${MIN_CONTENT}-${MAX_CONTENT} characters)`,
             },
+            type: {
+              type: "string",
+              enum: [...MEMORY_TYPES],
+              description:
+                "preference = a standing user preference (these are injected first); " +
+                "project_fact (default) = decisions, fixes, env facts. Omit unless the memory is a preference.",
+            },
             tags: {
               type: "array",
               items: { type: "string", maxLength: MAX_TAG_LENGTH },
               maxItems: MAX_TAGS,
               description:
-                "Category prefixes: preference, decision, debug, env, architecture, workaround, " +
+                "Fine-grained facets: decision, debug, env, architecture, workaround, " +
                 "language:<x>, framework:<x>, tool:<x>. Project scoping is automatic (a project " +
                 "column, not a tag) - never add project:<name>.",
             },
@@ -483,6 +776,12 @@ const ocpg = Plugin.define({
               type: "boolean",
               description:
                 "Store even if a similar memory exists (use only after a dedup rejection you judge to be wrong)",
+            },
+            scope: {
+              type: "string",
+              enum: ["project", "user"],
+              description:
+                '"user" stores for you across all projects (requires user scope to be enabled); default "project" stores for this project only',
             },
           },
           required: ["content"],
@@ -494,8 +793,10 @@ const ocpg = Plugin.define({
       });
       editor.add({
         name: "memory_forget",
+        options: { codemode: false },
         description:
-          "Delete a memory of this project by id (get ids from memory_recall). Use for memories that are wrong or obsolete; prefer storing a corrected memory when the old one is still useful history.",
+          "Delete a memory by id (get ids from memory_recall). Use for memories that are wrong or obsolete; prefer storing a corrected memory when the old one is still useful history. " +
+          "Deletes match this project's memories and, when user scope is enabled, your shared user memories too - those are visible to all your projects by design, so any of them can delete them.",
         input: {
           type: "object",
           properties: {
@@ -506,6 +807,39 @@ const ocpg = Plugin.define({
         },
         execute: async (input) => {
           return { content: await forget(input as ForgetArgs, { directory }) };
+        },
+      });
+      editor.add({
+        name: "memory_update",
+        options: { codemode: false },
+        description:
+          "Rewrite an existing memory by id (get ids from memory_recall). Use when a memory is outdated but still worth keeping: the corrected content replaces the old, keeping the original learned date. " +
+          "Omitted tags/type are kept as-is. For obsolete memories use memory_forget; for genuinely new memories use memory_remember.",
+        input: {
+          type: "object",
+          properties: {
+            id: { type: "number", description: "The #id shown by memory_recall" },
+            content: {
+              type: "string",
+              description: `1-3 self-contained sentences replacing the old content (${MIN_CONTENT}-${MAX_CONTENT} characters)`,
+            },
+            tags: {
+              type: "array",
+              items: { type: "string", maxLength: MAX_TAG_LENGTH },
+              maxItems: MAX_TAGS,
+              description: "Replaces the tag list; omit to keep the current tags",
+            },
+            type: {
+              type: "string",
+              enum: [...MEMORY_TYPES],
+              description: "Replaces the memory type; omit to keep the current type",
+            },
+          },
+          required: ["id", "content"],
+          additionalProperties: false,
+        },
+        execute: async (input) => {
+          return { content: await updateMemory(input as UpdateArgs, { directory }) };
         },
       });
     });
@@ -527,14 +861,36 @@ const __internals = {
   recall,
   remember,
   forget,
+  updateMemory,
+  extractMemoryRequest,
+  captureFromPrompt,
   invalidateInjection,
   resolveSslMode,
   resolveLimit,
+  resolveMemoryType,
   validateWrite,
   logError,
+  resolveUserScope,
   toolError,
   rateLimitOk,
   resetRateLimit,
+  get injectionMode() {
+    return injectionMode;
+  },
+  setInjectionMode(mode: "relevance" | "recency") {
+    injectionMode = mode;
+  },
+  extractPromptQuery,
+  hashQuery,
+  orTsQuery,
+  buildRecencyQuery,
+  buildRelevanceQuery,
+  get userScope() {
+    return userScope;
+  },
+  setUserScope(raw: string | undefined | null) {
+    userScope = resolveUserScope(raw ?? undefined);
+  },
   retain,
   dispose,
 };

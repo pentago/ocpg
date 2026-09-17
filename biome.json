@@ -1,7 +1,7 @@
 {
   "$schema": "https://biomejs.dev/schemas/2.5.14/schema.json",
   "files": {
-    "includes": ["ocpg.ts", "tests/**/*.ts"]
+    "includes": ["ocpg.ts", "tests/**/*.ts", "bench/**/*.ts"]
   },
   "formatter": {
     "enabled": false,

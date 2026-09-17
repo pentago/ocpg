@@ -39,15 +39,17 @@ export OCPG_SSL="disable"
 | `OCPG_USER`     | `ocpguser`   |
 | `OCPG_DB`       | `ocpg`       |
 | `OCPG_SSL`      | `disable`    |
-| `OCPG_USER_ID`  | _(unset)_    |
+| `OCPG_INJECTION`| `relevance`  |
 
 `OCPG_SSL` accepts `disable`, `prefer`, `require`, `verify-ca`, or `verify-full` (anything else falls back to `disable`). It defaults to `disable` for the usual localhost setup - **set it to `require` or stricter whenever `OCPG_HOST` is not local**, otherwise the password handshake crosses the network in plaintext.
 
-Set `OCPG_USER_ID` to a short identifier to enable **user scope**: memories stored with `scope: "user"` live under a `user:<id>` sentinel and are injected into every project's context (and deletable from any project, by design). Unset, user scope is disabled entirely.
+## How memory works
+
+Memories are **global**: recall, injection, dedup, deletion and updates see and touch every row. The `project` column records which project a memory came from and is shown in output - it is metadata, not a visibility boundary.
 
 ## How injection picks memories
 
-By default the block is **relevance-ranked, not recency-ranked**: the user's latest prompt is turned into a full-text query (OR of stemmed words) over **all projects**, ranked by relevance with a small same-project tiebreak, top 5 injected. Working on similar projects for different clients means a memory written anywhere can surface in any project. When nothing matches the prompt, it falls back to the latest memories (preferences first). Set `OCPG_INJECTION=recency` for the old blind-last-5 behavior.
+By default the block is **relevance-ranked, not recency-ranked**: the user's latest prompt is turned into a full-text query (OR of stemmed words) over **all memories**, ranked by relevance with a small same-project tiebreak, top 5 injected - each line labeled with its origin project. When nothing matches the prompt, it falls back to the latest memories (preferences first). Set `OCPG_INJECTION=recency` for the old blind-last-5 behavior.
 
 This is keyword relevance, not embedding-based semantic search - close phrasing wins, paraphrases may not. Note the OR ranking: common words in a prompt surface more rows; the ranking favors rows matching more distinctive terms.
 
@@ -55,16 +57,15 @@ This is keyword relevance, not embedding-based semantic search - close phrasing 
 
 Four agent tools are registered: `memory_remember` (store), `memory_recall` (search), `memory_forget` (delete by id), and `memory_update` (rewrite an existing memory, keeping its original learned date). The agent reads their usage rules from the tool schemas - as the user, the things worth knowing are:
 
-- Memories are scoped to the project directory they were stored from; recall only sees them cross-project when the agent explicitly asks for `global` search (or stores them in user scope).
-- `memory_forget` / `memory_update` only touch memories of the calling project - plus, when user scope is enabled, the shared user memories.
+- Memories are shared across all projects: `memory_forget` / `memory_update` work on any row by id, from any project.
 
-Writes are capped at 4000 characters of content, 10 tags, and 64 characters per tag; oversized writes are rejected with the actual size rather than silently truncated. Memories carry a `type` (`preference`, `project_fact` default, or `episodic`); `preference` memories are injected ahead of newer facts.
+Writes are capped at 4000 characters of content, 10 tags, and 64 characters per tag; oversized writes are rejected with the actual size rather than silently truncated. Memories carry a `type` (`preference`, `project_fact` default, or `episodic`); `preference` memories come first in recency mode.
 
 Saying "remember that ..." (or "don't forget ...", "keep in mind ...") in a prompt stores the text after the phrase verbatim, tagged `user-requested` - no model judgment involved.
 
 ### Duplicate detection
 
-`memory_remember` rejects near-duplicates of existing memories in the same project instead of storing them.
+`memory_remember` rejects near-duplicates of existing memories - in any project - instead of storing them.
 
 This needs the `pg_trgm` extension. Fresh installs from [`deploy/`](./deploy) get it automatically; on an existing database run once:
 

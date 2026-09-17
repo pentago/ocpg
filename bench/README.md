@@ -36,6 +36,35 @@ Requires the `OCPG_*` env user to hold CREATEDB. Bench DBs are
 `agent-memory-bench-<size>`; delete them anytime with plain
 `DROP DATABASE` (or regenerate - it drops first).
 
+### Thesaurus strategies (setup)
+
+`fts-or-thesaurus` / `fts-phrase-thes` query through a thesaurus text search
+config built from the bench's own `PARAPHRASES` map - the missing dimension in
+every other candidate, which differ only in ranking/scoring, not vocabulary.
+
+Setup (one-time per Postgres server; restart of the *container* loses it):
+
+```bash
+bun bench:thesaurus                                            # regenerate the .ths from PARAPHRASES
+# system install: copy into /usr/share/postgresql/<version>/tsearch_data/
+docker cp bench/thesaurus/bench_synonyms.ths <pg-container>:/usr/local/share/postgresql/tsearch_data/
+bun bench:generate --sizes 500,5000                            # CREATE TEXT SEARCH DICTIONARY ... per bench DB
+```
+
+`generate.ts` installs the dictionary into each bench DB it creates; a server
+without the `.ths` file still generates fine and `run.ts` skips the thesaurus
+strategies with a notice. The `.ths` file is generated from `PARAPHRASES` and
+checked in; `run.ts` fails the whole bench when it drifts from the map.
+Dictionary rules are query-time only - `search_vector` stays
+`to_tsvector('english')`, so the same column and GIN index serve every
+strategy.
+
+`fts-or-thesaurus` keeps the OR shape (direct queries must match
+`fts-or (prod)`) but to_tsquery OR operands are single tokens, so multi-word
+thesaurus rules cannot fire there; `fts-phrase-thes` uses `plainto_tsquery`,
+whose adjacent tokens let multi-word rules fire - at the cost of AND
+semantics on direct queries. Read the para-rec columns of both together.
+
 `fts-or (prod)` executes the **exact production injection query**, imported
 from ocpg's `__internals` - the refactor exists so the harness cannot drift
 from shipped SQL. The other strategies are candidates defined here.
@@ -69,6 +98,55 @@ strategies against each other on identical visibility.
 | trgm-blend     | 1.2ms / rec .27     | 12ms / rec .38      |
 | fts-or-recency | 0.04ms / rec .26    | 0.07ms / rec .37    |
 | recency-only   | 0.11ms / rec .20    | 0.7ms / rec .06     |
+
+### Thesaurus results (2026-09-17, ephemeral postgres:18-alpine, thesaurus from PARAPHRASES)
+
+| strategy          | 485 rows            | 5k rows             |
+| ----------------- | ------------------- | ------------------- |
+| fts-or (prod)     | rec .29 / para .000 | rec .43 / para .000 |
+| fts-or-thesaurus  | rec .29 / para .000 | rec .44 / para .05  |
+| fts-phrase-thes   | rec .11 / para .32  | rec .19 / para .60  |
+
+### Combined-shape results (2026-09-17, ephemeral postgres:18-alpine, thesaurus from PARAPHRASES)
+
+| strategy                 | 485 rows            | 5k rows             |
+| ------------------------ | ------------------- | ------------------- |
+| fts-or (prod)            | rec .29 / para .000 | rec .43 / para .000 |
+| fts-or-thesaurus         | rec .29 / para .000 | rec .44 / para .05  |
+| fts-phrase-thes          | rec .11 / para .32  | rec .19 / para .60  |
+| fts-or-plus-thesaurus    | rec .41 / para .32  | rec .62 / para .60  |
+
+`fts-or-plus-thesaurus` = `WHERE or_match OR phrase_thes_match`, ranked by
+`GREATEST(ts_rank(or), ts_rank(phrase))`. Direct-only recall (split out from
+the para mix, which the table's rec column folds in) is unchanged vs prod:
+.655 vs .658 at 485, .567 at 5k - the OR half of the WHERE is byte-identical
+to prod's and the GREATEST ranking does not displace prod's hits. Para-rec
+equals `fts-phrase-thes` at both sizes; prec@5 improves rather than collapses
+(.37/.62 vs prod's .26/.43) because the thesaurus side pulls in *relevant*
+rows. Latency p50 1.33ms / p95 1.84ms at 5k (prod 1.16/1.74) - the OR of two
+`@@` conditions costs ~15%, far inside the injection budget; bufhit stays
+100% (no seq-scan collapse). The hyphenated-paraphrase gap ("in-memory
+store") persists unchanged - it lives in the phrase half this shape unions
+in, and fixing it is out of scope. Verdict: **go** - this is the strategy
+for a follow-up production spec (dictionary shipping in `deploy/init/` +
+migration path).
+
+Readings:
+
+1. **A thesaurus from PARAPHRASES recovers most paraphrase recall**: 0.000
+   → 0.60 para-rec at 5k (`fts-phrase-thes`, `plainto_tsquery`), at roughly
+   half prod's latency (AND semantics match fewer rows; not a like-for-like
+   speed win). Vector search is not needed while the real-world paraphrase
+   drift matches a bounded synonym list.
+2. **OR-shaped queries cannot fire multi-word rules**: to_tsquery operands are
+   single tokens, so `fts-or-thesaurus` only catches single-word pairs
+   (para-rec .05 at 5k). Direct scores are identical to prod - the fallback
+   chain rewiring is safe - but the OR shape is not where the value is.
+3. **The phrase variant's direct-recall collapse is AND semantics, not the
+   thesaurus** (same shape as fts-and). A production design would need to
+   combine both shapes (OR terms + phrase-rewritten paraphrases), which is a
+   follow-up spec; hyphenated paraphrases ("in-memory store") still do not
+   fire and count against the .60.
 
 Readings:
 

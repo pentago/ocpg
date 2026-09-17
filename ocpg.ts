@@ -814,8 +814,10 @@ const ocpg = Plugin.define({
         // injected block is skipped entirely for projects with no memories and
         // the user may have no project instructions at all.
         description:
-          "Store a durable memory shared across all projects. Use after user corrections (immediately), " +
-          "architecture decisions, non-trivial fixes, environment facts, and stated preferences. " +
+          "Store a durable memory. preference and stack_fact are shared across all projects; " +
+          "project_fact (the default) is visible only in this project unless recalled with " +
+          "global: true. Use after user corrections (immediately), architecture decisions, " +
+          "non-trivial fixes, environment facts, and stated preferences. " +
           "Do not store session progress, secrets, or anything the code itself already states.",
         input: {
           type: "object",
@@ -860,7 +862,8 @@ const ocpg = Plugin.define({
         options: { codemode: false },
         description:
           "Delete a memory by id (get ids from memory_recall). Use for memories that are wrong or obsolete; prefer storing a corrected memory when the old one is still useful history. " +
-          "Memories are shared across projects, so any project can delete any of them.",
+          "preference and stack_fact can be deleted from any project; project_fact can only be " +
+          "deleted by its origin project (the delete will fail with the owning project's name).",
         input: {
           type: "object",
           properties: {
@@ -878,7 +881,9 @@ const ocpg = Plugin.define({
         options: { codemode: false },
         description:
           "Rewrite an existing memory by id (get ids from memory_recall). Use when a memory is outdated but still worth keeping: the corrected content replaces the old, keeping the original learned date. " +
-          "Omitted tags/type are kept as-is. For obsolete memories use memory_forget; for genuinely new memories use memory_remember.",
+          "Omitted tags/type are kept as-is. preference and stack_fact can be edited from any " +
+          "project; project_fact can only be edited by its origin project. " +
+          "For obsolete memories use memory_forget; for genuinely new memories use memory_remember.",
         input: {
           type: "object",
           properties: {

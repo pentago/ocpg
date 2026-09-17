@@ -473,7 +473,9 @@ const ocpg = Plugin.define({
               items: { type: "string", maxLength: MAX_TAG_LENGTH },
               maxItems: MAX_TAGS,
               description:
-                "Category prefixes: preference, decision, debug, env, architecture, workaround, language:<x>, framework:<x>, tool:<x>",
+                "Category prefixes: preference, decision, debug, env, architecture, workaround, " +
+                "language:<x>, framework:<x>, tool:<x>. Project scoping is automatic (a project " +
+                "column, not a tag) - never add project:<name>.",
             },
             force: {
               type: "boolean",

@@ -373,6 +373,50 @@ async function remember(
   }
 }
 
+// --- Keyword capture (plan 1.1, revised) ---
+
+// Deterministic capture, no LLM: a trigger phrase in the prompt stores the text
+// following it verbatim (minus the trigger) through the normal write path.
+// Extracting "relevant content" instead would be a model judgment on the
+// prompt-admission path - nondeterministic, and it violates the project rule
+// that model judgment never becomes load-bearing (memory #1555).
+const MEMORY_TRIGGER_RE =
+  /\b(?:remember(?:\s+(?:this|that|to))?|do(?:n'?| no)t forget(?:\s+(?:this|that|to))?|keep (?:this|that )?in mind(?: that)?)\b\s*[:,]?\s*/i;
+
+// Interrogative follow-ons are questions about the past ("remember when the
+// pool broke?"), not storage requests. The list is deliberately narrow:
+// "remember that when X happens, do Y" is imperative and must be captured, so
+// "when" alone is not enough - only skip the bare question forms.
+const INTERROGATIVE_RE = /^(?:when|what|where|why|how|who|whom|whose|which|did)\b/i;
+
+function extractMemoryRequest(text: string): string | null {
+  const match = MEMORY_TRIGGER_RE.exec(text);
+  if (!match) return null;
+  const rest = text.slice(match.index + match[0].length).trim();
+  if (!rest || INTERROGATIVE_RE.test(rest)) return null;
+  return rest;
+}
+
+// Fire-and-forget by design: prompt admission must not wait on a database
+// write, and the prompt itself is never mutated on failure.
+//
+// Not exactly-once: the docs allow prompt hooks to run more than once under
+// concurrent submissions. Dedup-on-write (trigram similarity) is the guard -
+// no hook-side deduplication layer on top of it.
+async function captureFromPrompt(
+  text: string,
+  directory: string,
+  sessionID: string,
+): Promise<void> {
+  const content = extractMemoryRequest(text);
+  if (!content) return;
+  try {
+    await remember({ content, tags: ["user-requested"] }, { directory, sessionID });
+  } catch (e: unknown) {
+    logError("capture", `ocpg keyword capture failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
 // Project-scoped by construction: an agent can only delete what its own project
 // can recall, so a poisoned id from another project silently matches nothing.
 async function forget(
@@ -424,6 +468,14 @@ const ocpg = Plugin.define({
       const output: { system: string[] } = { system: [] };
       await handleTransform(output, directory);
       for (const text of output.system) event.system.push({ type: "text", text });
+    });
+
+    // Keyword capture (plan 1.1 revised): a trigger phrase ("remember this,
+    // ...") stores the following text verbatim through the normal write path -
+    // same validateWrite, same trigram dedup. No LLM call, and the prompt
+    // itself is never mutated.
+    await ctx.session.hook("prompt", (event) => {
+      void captureFromPrompt(event.prompt.text, directory, event.sessionID);
     });
 
     // Agent tools: recall + remember with dedup-on-write. Input schemas are raw
@@ -533,6 +585,8 @@ const __internals = {
   recall,
   remember,
   forget,
+  extractMemoryRequest,
+  captureFromPrompt,
   invalidateInjection,
   resolveSslMode,
   resolveLimit,

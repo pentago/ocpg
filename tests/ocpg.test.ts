@@ -454,6 +454,66 @@ describe("DB access layer", () => {
     });
   });
 
+  describe("keyword capture (plan 1.1 revised: verbatim, no LLM)", () => {
+    test("extracts the text after the trigger, verbatim and minus the trigger", () => {
+      expect(__internals.extractMemoryRequest("remember that the build uses bun, not npm")).toBe(
+        "the build uses bun, not npm",
+      );
+      expect(__internals.extractMemoryRequest("Remember this: deploys are gated.")).toBe(
+        "deploys are gated.",
+      );
+      expect(__internals.extractMemoryRequest("please don't forget to drain the cluster first")).toBe(
+        "drain the cluster first",
+      );
+      expect(__internals.extractMemoryRequest("Keep in mind that staging resets nightly")).toBe(
+        "staging resets nightly",
+      );
+      // Mid-prompt triggers count too; the prefix is dropped.
+      expect(__internals.extractMemoryRequest("hey, remember that X marks the spot")).toBe(
+        "X marks the spot",
+      );
+    });
+
+    test("no trigger, or interrogative follow-on, means no capture", () => {
+      expect(__internals.extractMemoryRequest("fix the flaky test in CI")).toBe(null);
+      // Questions about the past, not storage requests.
+      expect(__internals.extractMemoryRequest("do you remember when the pool broke?")).toBe(null);
+      expect(__internals.extractMemoryRequest("remember when we fixed the race?")).toBe(null);
+      expect(__internals.extractMemoryRequest("remember what the error said?")).toBe(null);
+      // Trigger at the very end has no payload.
+      expect(__internals.extractMemoryRequest("keep this in mind:")).toBe(null);
+      // "remembered" must not trigger on the embedded stem.
+      expect(__internals.extractMemoryRequest("I remembered the staging password this time")).toBe(null);
+    });
+
+    test("capture goes through the normal write path: validation, dedup, user-requested tag", async () => {
+      const project = "/tmp/ocpg-test-capture";
+      try {
+        // The verbatim text is stored with the user-requested tag.
+        await __internals.captureFromPrompt("remember that the release checklist lives in RELEASING.md", project, "sess-capture");
+        const rows = await __internals.sql`
+          SELECT id, tags, content FROM memories WHERE project = ${project}
+        ` as { id: number; tags: string[]; content: string }[];
+        expect(rows.length).toBe(1);
+        expect(rows[0].tags).toContain("user-requested");
+        expect(rows[0].content).toBe("the release checklist lives in RELEASING.md");
+
+        // Re-firing the same phrase (the docs allow prompt hooks to run more
+        // than once under concurrent submissions) must dedup, not double-insert.
+        await __internals.captureFromPrompt("remember that the release checklist lives in RELEASING.md", project, "sess-capture");
+        const [n] = await __internals.sql`SELECT count(*) AS n FROM memories WHERE project = ${project}` as { n: string }[];
+        expect(Number(n.n)).toBe(1);
+
+        // Sub-10-char junk is rejected by validateWrite, nothing stored.
+        await __internals.captureFromPrompt("remember: ok", project, "sess-capture");
+        const [n2] = await __internals.sql`SELECT count(*) AS n FROM memories WHERE project = ${project}` as { n: string }[];
+        expect(Number(n2.n)).toBe(1);
+      } finally {
+        await __internals.sql`DELETE FROM memories WHERE project = ${project}`;
+      }
+    });
+  });
+
   describe("recall: relevance ranking + websearch query syntax", () => {
     const ctx = { directory: "/tmp/ocpg-test-recall-ranking" };
 

@@ -15,6 +15,17 @@ repos:
         files: \.ts$
         pass_filenames: false
 
+      # Fails a tag push whose version does not match package.json on the tagged
+      # commit - the same check the publish workflow applies, but locally, before
+      # a doomed GitHub Actions run is spent on it.
+      - id: tag-version-match
+        name: tag matches package.json version
+        entry: scripts/check-tag-version.sh
+        language: system
+        stages: [pre-push]
+        always_run: true
+        pass_filenames: false
+
 # `bun test` is not a hook: it is an integration suite that needs a live
 # Postgres with pg_trgm and writes to a real database, so it would break
 # commits on any machine without one. CI runs it against a service container.

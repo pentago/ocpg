@@ -1,0 +1,20 @@
+dbms engine : postgres
+cluster orchestrator : kubernetes
+container packager : docker
+edge gateway : nginx
+init supervisor : systemd
+cold vault : backup
+commit timeline : git
+automation flow : pipeline
+name lookup : dns
+secure channel : tls
+telemetry aggregator : prometheus
+in-memory store : redis
+encrypted overlay : wireguard
+storage drive : disk
+fido dongle : yubikey
+login protocol : oauth
+infrastructure code : terraform
+responsiveness : latency
+periodic job : cron
+secure remote login : ssh

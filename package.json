@@ -10,6 +10,7 @@
     "typecheck": "tsc --noEmit",
     "test": "bun test",
     "bench:generate": "bun bench/generate.ts",
+    "bench:thesaurus": "bun bench/generate-thesaurus.ts",
     "bench": "bun bench/run.ts"
   },
   "exports": {

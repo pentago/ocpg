@@ -92,9 +92,9 @@ const strategies: Strategy[] = [
   {
     name: "recency-only",
     describe: "the old blind last-5 (baseline; ignores the query)",
-    run: (c, _q, d) => __internals.buildRecencyQuery(c, d) as unknown as Promise<Array<{ content: string; project: string }>>,
-    explainSql: (_q, d) =>
-      `SELECT id, content, project FROM memories WHERE project = '${d}' ORDER BY (memory_type = 'preference') DESC, created_at DESC LIMIT 5`,
+    run: (c) => __internals.buildRecencyQuery(c) as unknown as Promise<Array<{ content: string; project: string }>>,
+    explainSql: (_q, _d) =>
+      `SELECT id, content, project FROM memories ORDER BY (memory_type = 'preference') DESC, created_at DESC LIMIT 5`,
   },
 ];
 

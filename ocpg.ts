@@ -13,12 +13,10 @@ type DbConfig = {
   database: string;
   ssl: SslMode;
 };
-type RecallArgs = { query?: string; global?: boolean; limit?: number; tags?: string[]; scope?: "project" | "user" };
+type RecallArgs = { query?: string; limit?: number; tags?: string[] };
 type RememberArgs = {
   content: string;
   tags?: string[];
-  force?: boolean;
-  scope?: "project" | "user";
   type?: MemoryType;
 };
 type ForgetArgs = { id: number };
@@ -42,22 +40,6 @@ const defaultConfig: DbConfig = {
   ssl: resolveSslMode(process.env.OCPG_SSL),
 };
 const password = process.env.OCPG_PASSWORD || "";
-
-// --- User scope (plan 1.2, revised: sentinel value, no migration) ---
-
-// User memories are ordinary rows with the sentinel project value `user:<id>`,
-// written into the existing project column - identical semantics to a scope
-// column with zero migration. OCPG_USER_ID is read once at init (env-only, no
-// process spawning); unset means user scope is disabled entirely and every
-// query degrades to exactly the pre-feature behavior.
-//
-// Mutable module state + a reset hook so tests can toggle it deterministically.
-let userScope = resolveUserScope(process.env.OCPG_USER_ID);
-
-function resolveUserScope(raw: string | undefined): string | null {
-  const id = raw?.trim();
-  return id ? `user:${id}` : null;
-}
 
 // Options-object constructor, not a URL string: Bun's SQL parses string URLs via
 // url.parse(), which emits the DEP0169 DeprecationWarning at plugin load under opencode.
@@ -87,8 +69,9 @@ export interface MemoryRow {
   date: string;
 }
 
-// The injection query selects neither id nor project - they are never rendered.
-type InjectionRow = Pick<MemoryRow, "content" | "tags" | "date">;
+// Injected lines render each memory's origin project (memories are global),
+// so the injection queries must select project; id is never rendered.
+type InjectionRow = Pick<MemoryRow, "content" | "tags" | "date" | "project">;
 
 // --- Rate-limited error logging ---
 
@@ -168,6 +151,40 @@ function sanitizeMemory(content: string): string {
   return content.replaceAll("</persistent-project-memory>", "");
 }
 
+// Approximates pg_trgm similarity in TS: character-trigram Jaccard. Used only
+// to collapse near-duplicate rows out of the injection candidates (the
+// candidate set is tiny), never for storage decisions.
+function trigrams(text: string): Set<string> {
+  const s = text.toLowerCase().replace(/\s+/g, " ");
+  const out = new Set<string>();
+  for (let i = 0; i < s.length - 2; i++) out.add(s.slice(i, i + 3));
+  return out;
+}
+
+function nearDupe(a: string, b: string): boolean {
+  return nearDupeSets(trigrams(a), trigrams(b));
+}
+
+function nearDupeSets(A: Set<string>, B: Set<string>): boolean {
+  if (A.size === 0 || B.size === 0) return false;
+  let inter = 0;
+  for (const t of A) if (B.has(t)) inter++;
+  return inter / (A.size + B.size - inter) >= DEDUP_SIMILARITY;
+}
+
+// Injection fetches a deeper candidate slice (rank-ordered) and greedily drops
+// rows that near-dupe an already-kept row, emitting the top 5. Without this,
+// duplicate writes (there is no write-time rejection) would fill the 5 slots
+// with restatements of one fact.
+function collapseDupes(rows: InjectionRow[]): InjectionRow[] {
+  const kept: InjectionRow[] = [];
+  for (const row of rows) {
+    if (kept.length >= 5) break;
+    if (!kept.some((k) => nearDupe(k.content, row.content))) kept.push(row);
+  }
+  return kept;
+}
+
 function formatBlock(rows: InjectionRow[], projectDir: string): string {
   if (rows.length === 0) return "";
   const lines: string[] = [
@@ -178,7 +195,10 @@ function formatBlock(rows: InjectionRow[], projectDir: string): string {
   for (const row of rows) {
     const tags = row.tags ?? [];
     const tagStr = tags.length ? ` [${tags.join(", ")}]` : "";
-    lines.push(`- [${row.date}]${tagStr} ${sanitizeMemory(truncateMemory(row.content))}`);
+    // Origin project matters now that memories are shared: basename keeps the
+    // injected line short.
+    const origin = row.project.split('/').pop() ?? row.project;
+    lines.push(`- [${row.date}] (${origin})${tagStr} ${sanitizeMemory(truncateMemory(row.content))}`);
   }
   lines.push("");
   lines.push(
@@ -223,38 +243,37 @@ function extractPromptQuery(
 }
 
 // Recency query shared by the recency mode and the no-match fallback: latest 5
-// rows of the project (plus the user-scope sentinel when enabled), preferences
-// first.
+// rows across ALL memories, preferences first. Global by design - the project
+// column records origin, not visibility.
 // Query builders are pure functions of the client so the benchmark
 // (bench/run.ts) can execute the EXACT production SQL against bench
 // databases - no drift between what is measured and what runs.
-function buildRecencyQuery(client: SQL, directory: string) {
-  const projectCond = userScope
-    ? client`WHERE (project = ${directory} OR project = ${userScope})`
-    : client`WHERE project = ${directory}`;
+function buildRecencyQuery(client: SQL) {
+  // LIMIT 20: a candidate slice for collapseDupes, not the final block.
   return client`
     SELECT content, coalesce(tags, '{}') AS tags,
-           to_char(created_at, 'YYYY-MM-DD') AS date
+           to_char(created_at, 'YYYY-MM-DD') AS date,
+           project
     FROM memories
-    ${projectCond}
     ORDER BY (memory_type = 'preference') DESC, created_at DESC
-    LIMIT 5
+    LIMIT 20
   `;
 }
 
 function buildRelevanceQuery(client: SQL, tsQuery: string, directory: string) {
-  // Relevance: full-text search across ALL projects - shared memory by
-  // design - with a small same-project boost to break rank ties toward
-  // locally stored memories.
+  // Relevance: full-text search across ALL memories - global by design - with
+  // a small same-project boost to break rank ties toward locally stored
+  // memories.
   return client`
     SELECT content, coalesce(tags, '{}') AS tags,
-           to_char(created_at, 'YYYY-MM-DD') AS date
+           to_char(created_at, 'YYYY-MM-DD') AS date,
+           project
     FROM memories
     WHERE search_vector @@ to_tsquery('english', ${tsQuery})
     ORDER BY ts_rank(search_vector, to_tsquery('english', ${tsQuery}))
              + (CASE WHEN project = ${directory} THEN 0.01 ELSE 0 END) DESC,
              created_at DESC
-    LIMIT 5
+    LIMIT 20
   `;
 }
 
@@ -293,12 +312,12 @@ async function handleTransform(
       );
       if (rows.length === 0) {
         // No keyword match for this prompt - recency beats an empty block.
-        rows = await withDeadline(buildRecencyQuery(sql, directory) as unknown as PromiseLike<InjectionRow[]>, 1000);
+        rows = await withDeadline(buildRecencyQuery(sql) as unknown as PromiseLike<InjectionRow[]>, 1000);
       }
     } else {
-      rows = await withDeadline(buildRecencyQuery(sql, directory) as unknown as PromiseLike<InjectionRow[]>, 1000);
+      rows = await withDeadline(buildRecencyQuery(sql) as unknown as PromiseLike<InjectionRow[]>, 1000);
     }
-    const block = formatBlock(rows, directory);
+    const block = formatBlock(collapseDupes(rows), directory);
     // Evict oldest entry when cache exceeds 32
     if (injectionCache.size >= 32) {
       const firstKey = injectionCache.keys().next().value;
@@ -377,20 +396,11 @@ function toolError(kind: string, action: string, e: unknown): string {
 
 async function recall(
   args: RecallArgs,
-  ctx: { directory: string },
 ): Promise<string> {
   try {
     const limit = resolveLimit(args.limit);
-    // scope: "user" addresses the shared user scope; global: true already
-    // covers user rows since it drops the project filter entirely.
-    if (args.scope === "user" && !userScope) {
-      return "ERROR: user scope is disabled (set OCPG_USER_ID to enable it).";
-    }
-    const projectCond = args.global
-      ? sql``
-      : args.scope === "user"
-        ? sql`AND project = ${userScope}`
-        : sql`AND project = ${ctx.directory}`;
+    // All memories are global: no project filter anywhere - the project column
+    // records origin (shown in output), not visibility.
     const queryCond = args.query
       ? sql`AND search_vector @@ to_tsquery('english', ${orTsQuery(args.query)})`
       : sql``;
@@ -401,21 +411,21 @@ async function recall(
     const tagCond = tagList.length
       ? sql`AND tags @> ${sql.array(tagList, "text")}`
       : sql``;
-    // Relevance-ranked when searching; undirected browse uses a recency×
-    // frequency blend. The gravity form keeps zero-access rows ordered by pure
-    // recency (fresh installs have access_count = 0 everywhere) and lets access
-    // bumps resurface used memories without letting a single old favorite pin
-    // the top slot forever.
+    // Relevance-ranked when searching; undirected browse is plain recency
+    // (preferences first, matching the injection fallback). A frequency blend
+    // was tried and removed: bumping exactly the returned top-5 is a
+    // rich-get-richer loop - live corpus rows pinned the top slot after a few
+    // runs. access_count stays as data collection; no ranking consumes it.
     const orderBy = args.query
       ? sql`ORDER BY ts_rank(search_vector, to_tsquery('english', ${orTsQuery(args.query)})) DESC`
-      : sql`ORDER BY (1 + access_count) / (GREATEST(EXTRACT(EPOCH FROM (now() - created_at)) / 86400, 0) + 2) DESC, created_at DESC`;
+      : sql`ORDER BY (memory_type = 'preference') DESC, created_at DESC`;
 
     const rows = await sql`
       SELECT id, content, coalesce(tags, '{}') AS tags,
              to_char(created_at, 'YYYY-MM-DD') AS date,
              project, memory_type
       FROM memories
-      WHERE 1=1 ${projectCond} ${queryCond} ${tagCond}
+      WHERE 1=1 ${queryCond} ${tagCond}
       ${orderBy}
       LIMIT ${limit}
     ` as (MemoryRow & { memory_type: string })[];
@@ -472,11 +482,11 @@ function validateWrite(args: RememberArgs): string | null {
   return null;
 }
 
-// Trigram similarity threshold for dedup-on-write. Measured on a real
-// 485-memory corpus: the previous rule (FTS on the first 60 characters) let 28
-// pairs at >=0.8 similarity through because they differed in their opening
-// words, while wrongly rejecting ~1% of genuinely distinct memories. 0.8 is
-// strict enough that only restatements collide.
+// Trigram similarity threshold for near-duplicate handling (consolidation and
+// the injection collapse pass). Measured on a real 485-memory corpus: 0.8 is
+// strict enough that only restatements collide. Writes never reject on it -
+// duplicates are cleaned up by memory_consolidate and collapsed out of the
+// injected block.
 const DEDUP_SIMILARITY = 0.8;
 
 async function remember(
@@ -487,51 +497,22 @@ async function remember(
     const invalid = validateWrite(args);
     if (invalid) return invalid;
 
-    // Tags are stored verbatim - project scoping lives in the project column, not tags.
+    // Tags are stored verbatim - the project column records origin, not visibility.
     const tags = args.tags ?? [];
-    const scope = args.scope === "user" ? "user" : "project";
-    if (scope === "user" && !userScope) {
-      return "ERROR: user scope is disabled (set OCPG_USER_ID to enable it).";
-    }
-    // The write target: the calling project's directory, or the shared user
-    // sentinel. Dedup is scoped to the target so a user write never collides
-    // with a project row (or vice versa).
-    const target = scope === "user" ? (userScope as string) : ctx.directory;
     const basename = ctx.directory.split('/').pop() ?? ctx.directory;
-
-    if (!args.force) {
-      // Dedup: target-scoped trigram similarity over the whole content. No
-      // trigram index - the project filter narrows to a few hundred rows, which
-      // similarity() scans in single-digit milliseconds.
-      const dedup = await sql`
-        SELECT id, round(similarity(content, ${args.content})::numeric, 2) AS score
-        FROM memories
-        WHERE project = ${target}
-          AND (content = ${args.content} OR similarity(content, ${args.content}) >= ${DEDUP_SIMILARITY})
-        ORDER BY similarity(content, ${args.content}) DESC
-        LIMIT 1
-      ` as { id: number; score: string }[];
-
-      if (dedup.length > 0) {
-        const where = scope === "user" ? " in user scope" : "";
-        return `Similar memory already stored as #${dedup[0].id} (similarity ${dedup[0].score})${where}; skipping insert. Pass force: true to store it anyway.`;
-      }
-    }
 
     // sql.array(tags) alone encodes text[] with quoted elements under bun 1.4.2;
     // the element type hint is required for clean array storage.
     const inserted = await sql`
       INSERT INTO memories (content, tags, session_id, project, memory_type)
-      VALUES (${args.content}, ${sql.array(tags, "text")}, ${ctx.sessionID}, ${target}, ${resolveMemoryType(args.type)})
+      VALUES (${args.content}, ${sql.array(tags, "text")}, ${ctx.sessionID}, ${ctx.directory}, ${resolveMemoryType(args.type)})
       RETURNING id
     ` as { id: number }[];
 
-    // The injection cache is keyed by directory and user rows are injected into
-    // it, so a user-scope write invalidates the calling project's entry too.
+    // The injection block is global, but its cache is keyed by the calling
+    // directory + prompt; clear the directory's keys.
     invalidateInjection(ctx.directory);
-    return scope === "user"
-      ? `Stored memory #${inserted[0].id} for user scope (shared across projects).`
-      : `Stored memory #${inserted[0].id} for project ${basename}.`;
+    return `Stored memory #${inserted[0].id} (project ${basename}).`;
   } catch (e: unknown) {
     return toolError("remember", "remember", e);
   }
@@ -581,11 +562,9 @@ async function captureFromPrompt(
   }
 }
 
-// Project-scoped by construction: an agent can only delete what its own project
-// can recall, so a poisoned id from another project silently matches nothing.
-// When user scope is enabled the boundary deliberately widens to include the
-// shared user sentinel - user memories are visible to every project of the
-// user, so any of them can delete them. Documented in the tool description.
+// Memories are global: any project can delete any row by id - recall shows
+// ids across projects, so deletability matches visibility. The project column
+// stays as origin metadata, not an authorization boundary.
 async function forget(
   args: ForgetArgs,
   ctx: { directory: string },
@@ -595,17 +574,14 @@ async function forget(
     if (!Number.isInteger(id) || id <= 0) {
       return "ERROR: id must be a positive integer (the #id shown by memory_recall).";
     }
-    const projectCond = userScope
-      ? sql`project IN (${ctx.directory}, ${userScope})`
-      : sql`project = ${ctx.directory}`;
     const deleted = await sql`
       DELETE FROM memories
-      WHERE id = ${id} AND ${projectCond}
+      WHERE id = ${id}
       RETURNING id
     ` as { id: number }[];
 
     if (deleted.length === 0) {
-      return `No memory #${id} in this project; nothing deleted.`;
+      return `No memory #${id}; nothing deleted.`;
     }
     invalidateInjection(ctx.directory);
     return `Deleted memory #${id}.`;
@@ -631,9 +607,6 @@ async function updateMemory(
     const invalid = validateWrite(args);
     if (invalid) return invalid;
 
-    const projectCond = userScope
-      ? sql`project IN (${ctx.directory}, ${userScope})`
-      : sql`project = ${ctx.directory}`;
     const tags = args.tags ?? [];
     const tagCond = Array.isArray(args.tags)
       ? sql`tags = ${sql.array(tags, "text")},`
@@ -647,17 +620,85 @@ async function updateMemory(
           ${tagCond}
           ${typeCond}
           updated_at = now()
-      WHERE id = ${id} AND ${projectCond}
+      WHERE id = ${id}
       RETURNING id
     ` as { id: number }[];
 
     if (updated.length === 0) {
-      return `No memory #${id} in this project; nothing updated.`;
+      return `No memory #${id}; nothing updated.`;
     }
     invalidateInjection(ctx.directory);
     return `Updated memory #${id}.`;
   } catch (e: unknown) {
     return toolError("update", "update", e);
+  }
+}
+
+// Deterministic consolidation, no model calls inside the plugin: find
+// near-duplicate clusters (trigram similarity >= DEDUP_SIMILARITY over the
+// whole content, global), keep the newest of each, delete the rest. The
+// deleted texts are returned verbatim so the CALLING agent - itself a model -
+// can merge any unique fact back into the survivor via memory_update. Merging
+// is language synthesis, which is the caller's job, not the plugin's.
+// Runs on demand (user-invoked), never on a schedule; capped at 25 clusters
+// per run so a wildly-duplicated corpus cannot turn into one huge report.
+async function consolidate(): Promise<string> {
+  try {
+    const rows = await sql`
+      SELECT id, content, coalesce(tags, '{}') AS tags, created_at
+      FROM memories
+      ORDER BY created_at DESC
+    ` as { id: number; content: string; tags: string[]; created_at: Date }[];
+
+    // Greedy clustering newest-first: each row joins the first cluster whose
+    // representative (the newest member) it near-dupes. Trigram sets are built
+    // once (rebuilding per comparison made consolidate O(n^2) set-constructions,
+    // seconds at 5k rows), and a size-ratio prefilter skips pairs whose Jaccard
+    // can never reach the threshold.
+    type Entry = { row: (typeof rows)[number]; set: Set<string> };
+    const entries: Entry[] = rows.map((row) => ({ row, set: trigrams(row.content) }));
+    const clusters: Array<Array<Entry>> = [];
+    for (const entry of entries) {
+      const host = clusters.find((c) => {
+        const ra = c[0].set.size;
+        const rb = entry.set.size;
+        // Jaccard >= 0.8 is impossible when one set is much smaller; the
+        // comparison itself is the expensive part, so prefilter on sizes.
+        if (ra === 0 || rb === 0 || ra > rb * 4 || rb > ra * 4) return false;
+        return nearDupeSets(c[0].set, entry.set);
+      });
+      if (host) host.push(entry);
+      else clusters.push([entry]);
+    }
+
+    const multi = clusters.filter((c) => c.length > 1).slice(0, 25);
+    if (multi.length === 0) return "No duplicates found; nothing to consolidate.";
+
+    let removed = 0;
+    const report: string[] = [];
+    for (const cluster of multi) {
+      const survivor = cluster[0].row;
+      const removedRows = cluster.slice(1).map((e) => e.row);
+      for (const r of removedRows) {
+        await sql`DELETE FROM memories WHERE id = ${r.id}`;
+      }
+      removed += removedRows.length;
+      // Show what died so the calling agent can merge unique facts back into
+      // the survivor.
+      report.push(
+        `Kept #${survivor.id}: ${truncateMemory(survivor.content)}\n` +
+          removedRows.map((r) => `  removed #${r.id}: ${truncateMemory(r.content)}`).join("\n"),
+      );
+    }
+
+    if (removed > 0) injectionCache.clear();
+    return (
+      `Removed ${removed} duplicate ${removed === 1 ? "memory" : "memories"} across ${multi.length} groups (kept the newest of each).\n` +
+      `Check the removed texts - if any carries a fact the kept memory lacks, merge it in with memory_update:\n\n` +
+      report.join("\n")
+    );
+  } catch (e: unknown) {
+    return toolError("consolidate", "consolidate", e);
   }
 }
 
@@ -712,7 +753,7 @@ const ocpg = Plugin.define({
         // breaks direct invocation without adding value.
         options: { codemode: false },
         description:
-          "Search past memories stored for this project. Use before non-trivial work to check for relevant lessons, fixes, and decisions.",
+          "Search past memories across all projects. Use before non-trivial work to check for relevant lessons, fixes, and decisions.",
         input: {
           type: "object",
           properties: {
@@ -724,18 +765,12 @@ const ocpg = Plugin.define({
                 "Only return memories carrying all of these tags. Tags are not full-text " +
                 "searchable (search covers content only), so this filter is the only way to reach them.",
             },
-            global: { type: "boolean", description: "Search across all projects (default: current project only)" },
-            scope: {
-              type: "string",
-              enum: ["project", "user"],
-              description: '"user" searches your shared cross-project memories instead of this project\'s (requires user scope to be enabled)',
-            },
             limit: { type: "number", description: "1-20, default 5" },
           },
           additionalProperties: false,
         },
         execute: async (input) => {
-          return { content: await recall(input as RecallArgs, { directory }) };
+          return { content: await recall(input as RecallArgs) };
         },
       });
       editor.add({
@@ -746,7 +781,7 @@ const ocpg = Plugin.define({
         // injected block is skipped entirely for projects with no memories and
         // the user may have no project instructions at all.
         description:
-          "Store a durable memory for this project. Use after user corrections (immediately), " +
+          "Store a durable memory shared across all projects. Use after user corrections (immediately), " +
           "architecture decisions, non-trivial fixes, environment facts, and stated preferences. " +
           "Do not store session progress, secrets, or anything the code itself already states.",
         input: {
@@ -769,19 +804,8 @@ const ocpg = Plugin.define({
               maxItems: MAX_TAGS,
               description:
                 "Fine-grained facets: decision, debug, env, architecture, workaround, " +
-                "language:<x>, framework:<x>, tool:<x>. Project scoping is automatic (a project " +
-                "column, not a tag) - never add project:<name>.",
-            },
-            force: {
-              type: "boolean",
-              description:
-                "Store even if a similar memory exists (use only after a dedup rejection you judge to be wrong)",
-            },
-            scope: {
-              type: "string",
-              enum: ["project", "user"],
-              description:
-                '"user" stores for you across all projects (requires user scope to be enabled); default "project" stores for this project only',
+                "language:<x>, framework:<x>, tool:<x>. The origin project is recorded " +
+                "automatically (a project column, not a tag) - never add project:<name>.",
             },
           },
           required: ["content"],
@@ -796,7 +820,7 @@ const ocpg = Plugin.define({
         options: { codemode: false },
         description:
           "Delete a memory by id (get ids from memory_recall). Use for memories that are wrong or obsolete; prefer storing a corrected memory when the old one is still useful history. " +
-          "Deletes match this project's memories and, when user scope is enabled, your shared user memories too - those are visible to all your projects by design, so any of them can delete them.",
+          "Memories are shared across projects, so any project can delete any of them.",
         input: {
           type: "object",
           properties: {
@@ -842,6 +866,27 @@ const ocpg = Plugin.define({
           return { content: await updateMemory(input as UpdateArgs, { directory }) };
         },
       });
+      editor.add({
+        name: "memory_consolidate",
+        options: { codemode: false },
+        // User-invoked cleanup, not a write-path gate: writes never reject on
+        // duplicates, so call this when the corpus has accumulated near-dupes.
+        // User-invoked cleanup, not a write-path gate: writes never reject on
+        // duplicates, so call this when the corpus has accumulated near-dupes.
+        // The deleted texts come back in the result so the calling agent can
+        // merge unique facts into the survivors via memory_update.
+        description:
+          "Remove near-duplicate memories: keeps the newest of each >=80%-similar content group anywhere in the store and deletes the rest, returning the removed texts. " +
+          "After running it, merge any unique fact from the removed texts into the kept memory via memory_update. Deterministic - run it when the user asks to tidy or consolidate memories.",
+        input: {
+          type: "object",
+          properties: {},
+          additionalProperties: false,
+        },
+        execute: async () => {
+          return { content: await consolidate() };
+        },
+      });
     });
 
     // Close the SQL pool when the last plugin instance unloads.
@@ -862,15 +907,14 @@ const __internals = {
   remember,
   forget,
   updateMemory,
-  extractMemoryRequest,
-  captureFromPrompt,
+  consolidate,
+  extractMemoryRequest,  captureFromPrompt,
   invalidateInjection,
   resolveSslMode,
   resolveLimit,
   resolveMemoryType,
   validateWrite,
   logError,
-  resolveUserScope,
   toolError,
   rateLimitOk,
   resetRateLimit,
@@ -885,12 +929,6 @@ const __internals = {
   orTsQuery,
   buildRecencyQuery,
   buildRelevanceQuery,
-  get userScope() {
-    return userScope;
-  },
-  setUserScope(raw: string | undefined | null) {
-    userScope = resolveUserScope(raw ?? undefined);
-  },
   retain,
   dispose,
 };

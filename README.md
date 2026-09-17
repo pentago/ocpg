@@ -55,25 +55,18 @@ This is keyword relevance, not embedding-based semantic search - close phrasing 
 
 ## Tools
 
-Four agent tools are registered: `memory_remember` (store), `memory_recall` (search), `memory_forget` (delete by id), and `memory_update` (rewrite an existing memory, keeping its original learned date). The agent reads their usage rules from the tool schemas - as the user, the things worth knowing are:
+Four agent tools are registered: `memory_remember` (store), `memory_recall` (search), `memory_forget` (delete by id), `memory_update` (rewrite an existing memory, keeping its original learned date), and `memory_consolidate` (remove near-duplicates on demand). The agent reads their usage rules from the tool schemas - as the user, the things worth knowing are:
 
 - Memories are shared across all projects: `memory_forget` / `memory_update` work on any row by id, from any project.
+- Duplicate writes are **never rejected** - they land, the injection block collapses them, and `memory_consolidate` cleans them up when you ask: it keeps the newest of each >=80%-similar group and reports the removed texts so the agent can merge any unique fact back.
 
 Writes are capped at 4000 characters of content, 10 tags, and 64 characters per tag; oversized writes are rejected with the actual size rather than silently truncated. Memories carry a `type` (`preference`, `project_fact` default, or `episodic`); `preference` memories come first in recency mode.
 
 Saying "remember that ..." (or "don't forget ...", "keep in mind ...") in a prompt stores the text after the phrase verbatim, tagged `user-requested` - no model judgment involved.
 
-### Duplicate detection
+### Duplicates
 
-`memory_remember` rejects near-duplicates of existing memories - in any project - instead of storing them.
-
-This needs the `pg_trgm` extension. Fresh installs from [`deploy/`](./deploy) get it automatically; on an existing database run once:
-
-```sql
-CREATE EXTENSION pg_trgm;
-```
-
-Without it, `memory_remember` returns an error naming this exact fix.
+Writes are never rejected for duplicates. Near-duplicates (>=80% content similarity, measured on the real corpus - the old FTS-on-first-60-chars rule missed 28 pairs) are collapsed out of the injected block automatically, and `memory_consolidate` removes them on demand (keeps the newest of each group, reports removed texts for the agent to merge back). Needs the trgm index; fresh installs from [`deploy/`](./deploy) get it automatically, existing databases run the upgrade block in [`deploy/README.md`](./deploy/README.md).
 
 If the database is unreachable, memory injection is skipped and the tools return a generic error - a slow or dead database never blocks a model request.
 

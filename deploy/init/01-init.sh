@@ -27,6 +27,11 @@ psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" <<-'EOSQL'
 	CREATE INDEX idx_memories_search ON memories USING gin (search_vector);
 	CREATE INDEX idx_memories_tags   ON memories USING gin (tags);
 	CREATE INDEX idx_memories_project_created ON memories (project, created_at DESC);
+
+	-- Trigram content index: accelerates memory_consolidate's near-duplicate
+	-- self-join (content % content). Without it the join is O(n^2) similarity
+	-- scans - fine for hundreds of rows, slow for tens of thousands.
+	CREATE INDEX idx_memories_trgm ON memories USING gin (content gin_trgm_ops);
 EOSQL
 
 echo "ocpg: created table memories in database $POSTGRES_DB"

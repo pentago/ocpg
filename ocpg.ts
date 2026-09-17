@@ -17,7 +17,6 @@ type RecallArgs = { query?: string; limit?: number; tags?: string[] };
 type RememberArgs = {
   content: string;
   tags?: string[];
-  force?: boolean;
   type?: MemoryType;
 };
 type ForgetArgs = { id: number };
@@ -152,6 +151,40 @@ function sanitizeMemory(content: string): string {
   return content.replaceAll("</persistent-project-memory>", "");
 }
 
+// Approximates pg_trgm similarity in TS: character-trigram Jaccard. Used only
+// to collapse near-duplicate rows out of the injection candidates (the
+// candidate set is tiny), never for storage decisions.
+function trigrams(text: string): Set<string> {
+  const s = text.toLowerCase().replace(/\s+/g, " ");
+  const out = new Set<string>();
+  for (let i = 0; i < s.length - 2; i++) out.add(s.slice(i, i + 3));
+  return out;
+}
+
+function nearDupe(a: string, b: string): boolean {
+  return nearDupeSets(trigrams(a), trigrams(b));
+}
+
+function nearDupeSets(A: Set<string>, B: Set<string>): boolean {
+  if (A.size === 0 || B.size === 0) return false;
+  let inter = 0;
+  for (const t of A) if (B.has(t)) inter++;
+  return inter / (A.size + B.size - inter) >= DEDUP_SIMILARITY;
+}
+
+// Injection fetches a deeper candidate slice (rank-ordered) and greedily drops
+// rows that near-dupe an already-kept row, emitting the top 5. Without this,
+// duplicate writes (there is no write-time rejection) would fill the 5 slots
+// with restatements of one fact.
+function collapseDupes(rows: InjectionRow[]): InjectionRow[] {
+  const kept: InjectionRow[] = [];
+  for (const row of rows) {
+    if (kept.length >= 5) break;
+    if (!kept.some((k) => nearDupe(k.content, row.content))) kept.push(row);
+  }
+  return kept;
+}
+
 function formatBlock(rows: InjectionRow[], projectDir: string): string {
   if (rows.length === 0) return "";
   const lines: string[] = [
@@ -216,13 +249,14 @@ function extractPromptQuery(
 // (bench/run.ts) can execute the EXACT production SQL against bench
 // databases - no drift between what is measured and what runs.
 function buildRecencyQuery(client: SQL) {
+  // LIMIT 20: a candidate slice for collapseDupes, not the final block.
   return client`
     SELECT content, coalesce(tags, '{}') AS tags,
            to_char(created_at, 'YYYY-MM-DD') AS date,
            project
     FROM memories
     ORDER BY (memory_type = 'preference') DESC, created_at DESC
-    LIMIT 5
+    LIMIT 20
   `;
 }
 
@@ -239,7 +273,7 @@ function buildRelevanceQuery(client: SQL, tsQuery: string, directory: string) {
     ORDER BY ts_rank(search_vector, to_tsquery('english', ${tsQuery}))
              + (CASE WHEN project = ${directory} THEN 0.01 ELSE 0 END) DESC,
              created_at DESC
-    LIMIT 5
+    LIMIT 20
   `;
 }
 
@@ -283,7 +317,7 @@ async function handleTransform(
     } else {
       rows = await withDeadline(buildRecencyQuery(sql) as unknown as PromiseLike<InjectionRow[]>, 1000);
     }
-    const block = formatBlock(rows, directory);
+    const block = formatBlock(collapseDupes(rows), directory);
     // Evict oldest entry when cache exceeds 32
     if (injectionCache.size >= 32) {
       const firstKey = injectionCache.keys().next().value;
@@ -448,11 +482,11 @@ function validateWrite(args: RememberArgs): string | null {
   return null;
 }
 
-// Trigram similarity threshold for dedup-on-write. Measured on a real
-// 485-memory corpus: the previous rule (FTS on the first 60 characters) let 28
-// pairs at >=0.8 similarity through because they differed in their opening
-// words, while wrongly rejecting ~1% of genuinely distinct memories. 0.8 is
-// strict enough that only restatements collide.
+// Trigram similarity threshold for near-duplicate handling (consolidation and
+// the injection collapse pass). Measured on a real 485-memory corpus: 0.8 is
+// strict enough that only restatements collide. Writes never reject on it -
+// duplicates are cleaned up by memory_consolidate and collapsed out of the
+// injected block.
 const DEDUP_SIMILARITY = 0.8;
 
 async function remember(
@@ -466,24 +500,6 @@ async function remember(
     // Tags are stored verbatim - the project column records origin, not visibility.
     const tags = args.tags ?? [];
     const basename = ctx.directory.split('/').pop() ?? ctx.directory;
-
-    if (!args.force) {
-      // Dedup: global trigram similarity over the whole content - memories are
-      // shared across projects, so a duplicate stored anywhere is still a
-      // duplicate. No trigram index: similarity() over a few thousand rows
-      // stays in single-digit milliseconds.
-      const dedup = await sql`
-        SELECT id, round(similarity(content, ${args.content})::numeric, 2) AS score
-        FROM memories
-        WHERE content = ${args.content} OR similarity(content, ${args.content}) >= ${DEDUP_SIMILARITY}
-        ORDER BY similarity(content, ${args.content}) DESC
-        LIMIT 1
-      ` as { id: number; score: string }[];
-
-      if (dedup.length > 0) {
-        return `Similar memory already stored as #${dedup[0].id} (similarity ${dedup[0].score}); skipping insert. Pass force: true to store it anyway.`;
-      }
-    }
 
     // sql.array(tags) alone encodes text[] with quoted elements under bun 1.4.2;
     // the element type hint is required for clean array storage.
@@ -618,6 +634,74 @@ async function updateMemory(
   }
 }
 
+// Deterministic consolidation, no model calls inside the plugin: find
+// near-duplicate clusters (trigram similarity >= DEDUP_SIMILARITY over the
+// whole content, global), keep the newest of each, delete the rest. The
+// deleted texts are returned verbatim so the CALLING agent - itself a model -
+// can merge any unique fact back into the survivor via memory_update. Merging
+// is language synthesis, which is the caller's job, not the plugin's.
+// Runs on demand (user-invoked), never on a schedule; capped at 25 clusters
+// per run so a wildly-duplicated corpus cannot turn into one huge report.
+async function consolidate(): Promise<string> {
+  try {
+    const rows = await sql`
+      SELECT id, content, coalesce(tags, '{}') AS tags, created_at
+      FROM memories
+      ORDER BY created_at DESC
+    ` as { id: number; content: string; tags: string[]; created_at: Date }[];
+
+    // Greedy clustering newest-first: each row joins the first cluster whose
+    // representative (the newest member) it near-dupes. Trigram sets are built
+    // once (rebuilding per comparison made consolidate O(n^2) set-constructions,
+    // seconds at 5k rows), and a size-ratio prefilter skips pairs whose Jaccard
+    // can never reach the threshold.
+    type Entry = { row: (typeof rows)[number]; set: Set<string> };
+    const entries: Entry[] = rows.map((row) => ({ row, set: trigrams(row.content) }));
+    const clusters: Array<Array<Entry>> = [];
+    for (const entry of entries) {
+      const host = clusters.find((c) => {
+        const ra = c[0].set.size;
+        const rb = entry.set.size;
+        // Jaccard >= 0.8 is impossible when one set is much smaller; the
+        // comparison itself is the expensive part, so prefilter on sizes.
+        if (ra === 0 || rb === 0 || ra > rb * 4 || rb > ra * 4) return false;
+        return nearDupeSets(c[0].set, entry.set);
+      });
+      if (host) host.push(entry);
+      else clusters.push([entry]);
+    }
+
+    const multi = clusters.filter((c) => c.length > 1).slice(0, 25);
+    if (multi.length === 0) return "No duplicates found; nothing to consolidate.";
+
+    let removed = 0;
+    const report: string[] = [];
+    for (const cluster of multi) {
+      const survivor = cluster[0].row;
+      const removedRows = cluster.slice(1).map((e) => e.row);
+      for (const r of removedRows) {
+        await sql`DELETE FROM memories WHERE id = ${r.id}`;
+      }
+      removed += removedRows.length;
+      // Show what died so the calling agent can merge unique facts back into
+      // the survivor.
+      report.push(
+        `Kept #${survivor.id}: ${truncateMemory(survivor.content)}\n` +
+          removedRows.map((r) => `  removed #${r.id}: ${truncateMemory(r.content)}`).join("\n"),
+      );
+    }
+
+    if (removed > 0) injectionCache.clear();
+    return (
+      `Removed ${removed} duplicate ${removed === 1 ? "memory" : "memories"} across ${multi.length} groups (kept the newest of each).\n` +
+      `Check the removed texts - if any carries a fact the kept memory lacks, merge it in with memory_update:\n\n` +
+      report.join("\n")
+    );
+  } catch (e: unknown) {
+    return toolError("consolidate", "consolidate", e);
+  }
+}
+
 // Clears every cache entry for the directory - relevance mode keys by
 // directory + prompt hash, so a write invalidates them all.
 function invalidateInjection(directory: string): void {
@@ -723,11 +807,6 @@ const ocpg = Plugin.define({
                 "language:<x>, framework:<x>, tool:<x>. The origin project is recorded " +
                 "automatically (a project column, not a tag) - never add project:<name>.",
             },
-            force: {
-              type: "boolean",
-              description:
-                "Store even if a similar memory exists (use only after a dedup rejection you judge to be wrong)",
-            },
           },
           required: ["content"],
           additionalProperties: false,
@@ -787,6 +866,27 @@ const ocpg = Plugin.define({
           return { content: await updateMemory(input as UpdateArgs, { directory }) };
         },
       });
+      editor.add({
+        name: "memory_consolidate",
+        options: { codemode: false },
+        // User-invoked cleanup, not a write-path gate: writes never reject on
+        // duplicates, so call this when the corpus has accumulated near-dupes.
+        // User-invoked cleanup, not a write-path gate: writes never reject on
+        // duplicates, so call this when the corpus has accumulated near-dupes.
+        // The deleted texts come back in the result so the calling agent can
+        // merge unique facts into the survivors via memory_update.
+        description:
+          "Remove near-duplicate memories: keeps the newest of each >=80%-similar content group anywhere in the store and deletes the rest, returning the removed texts. " +
+          "After running it, merge any unique fact from the removed texts into the kept memory via memory_update. Deterministic - run it when the user asks to tidy or consolidate memories.",
+        input: {
+          type: "object",
+          properties: {},
+          additionalProperties: false,
+        },
+        execute: async () => {
+          return { content: await consolidate() };
+        },
+      });
     });
 
     // Close the SQL pool when the last plugin instance unloads.
@@ -807,8 +907,8 @@ const __internals = {
   remember,
   forget,
   updateMemory,
-  extractMemoryRequest,
-  captureFromPrompt,
+  consolidate,
+  extractMemoryRequest,  captureFromPrompt,
   invalidateInjection,
   resolveSslMode,
   resolveLimit,

@@ -197,54 +197,59 @@ describe("DB access layer", () => {
       sessionID: "test-todo3-1",
     };
 
-    test("QA happy: remember dedups on exact content (committed row, deterministic)", async () => {
-      const marker = `test-dedup-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    test("QA happy: remember always stores - no write-time rejection", async () => {
+      const marker = `test-nodedup-${Date.now()}-${Math.random().toString(36).slice(2)}`;
       const content = `Unique marker for dedup test: ${marker}`;
 
-      // Seed via autocommit on the module pool so remember's dedup SELECT sees the
-      // row regardless of pool connection. (The old begin-tx version only passed
-      // when the pool reused the transaction connection, and its .catch swallowed
-      // assertion failures, so it could false-pass while masking a broken tags INSERT.)
-      const [seeded] = await __internals.sql`
-        INSERT INTO memories (content, tags, session_id, project)
-        VALUES (${content}, ${__internals.sql.array(['__internals-test'])}, ${ctx.sessionID}, ${ctx.directory})
-        RETURNING id
-      ` as { id: number }[];
-      console.log(`seeded test memory #${seeded.id}`);
-
       try {
+        // Writes never reject on duplicates: the same content stored twice
+        // lands twice; cleanup is memory_consolidate's job.
+        const [seeded] = await __internals.sql`
+          INSERT INTO memories (content, tags, session_id, project)
+          VALUES (${content}, ${__internals.sql.array(['__internals-test'])}, ${ctx.sessionID}, ${ctx.directory})
+          RETURNING id
+        ` as { id: number }[];
+
         const result = await __internals.remember({ content, tags: ['__internals-test'] }, ctx);
-        console.log(`dedup result: ${result}`);
-        expect(result).toContain("Similar memory already stored as #");
-        expect(result).toContain(String(seeded.id));
+        expect(result).toContain("Stored memory #");
+        const [n] = await __internals.sql`SELECT count(*) AS n FROM memories WHERE content = ${content}` as { n: string }[];
+        expect(Number(n.n)).toBe(2);
+        void seeded;
       } finally {
-        await __internals.sql`DELETE FROM memories WHERE id = ${seeded.id}`;
+        await __internals.sql`DELETE FROM memories WHERE content = ${content}`;
       }
     });
 
-    test("QA happy: dedup catches a near-duplicate the old FTS rule missed", async () => {
-      // The previous rule matched on the first 60 characters, so a restatement
-      // that opened differently slipped through. Trigram similarity compares
-      // the whole content, which is why 28 such pairs exist in the real corpus.
+    test("QA happy: consolidate removes a near-duplicate the old FTS rule missed, keeping the newest", async () => {
+      // The old write-time rule (FTS on the first 60 characters) missed
+      // restatements that opened differently. Consolidation compares whole
+      // content via trigram similarity.
       const project = "/tmp/ocpg-test-neardupe";
       const original = "The staging cluster must be drained before any node pool upgrade, otherwise in-flight jobs are lost.";
       const restated = "Before any node pool upgrade the staging cluster must be drained, otherwise in-flight jobs are lost.";
       try {
         const first = await __internals.remember({ content: original }, { directory: project, sessionID: "near" });
-        expect(first).toContain("Stored memory #");
-
+        const firstId = Number(first.match(/#(\d+)/)?.[1]);
         const second = await __internals.remember({ content: restated }, { directory: project, sessionID: "near" });
-        console.log(`near-dupe result: ${second}`);
-        expect(second).toContain("Similar memory already stored as #");
-        expect(second).toContain("similarity");
+        const secondId = Number(second.match(/#(\d+)/)?.[1]);
+        expect(first).toContain("Stored memory #");
+        expect(second).toContain("Stored memory #");
 
-        // The old rule keyed on the opening words, which differ here.
-        const [old] = await __internals.sql`
-          SELECT count(*) AS n FROM memories
-          WHERE project = ${project}
-            AND search_vector @@ plainto_tsquery('english', ${restated.slice(0, 60)})
-        ` as { n: string }[];
-        expect(Number(old.n)).toBe(0);
+        // Deterministic: the older row dies, the newest survives, and the
+        // removed text comes back so the calling agent can merge unique facts.
+        const result = await __internals.consolidate();
+        expect(result).toContain("Removed 1 duplicate");
+        expect(result).toContain("staging cluster must be drained");
+        const [survivor] = await __internals.sql`SELECT content FROM memories WHERE id = ${secondId}` as { content: string }[];
+        expect(survivor.content).toBe(restated);
+        // The OLDER row died; the newest survives.
+        const [a] = await __internals.sql`SELECT count(*) AS n FROM memories WHERE id = ${firstId}` as { n: string }[];
+        const [b] = await __internals.sql`SELECT count(*) AS n FROM memories WHERE id = ${secondId}` as { n: string }[];
+        expect(Number(a.n)).toBe(0);
+        expect(Number(b.n)).toBe(1);
+
+        // Idempotent: a second pass finds nothing.
+        expect(await __internals.consolidate()).toContain("No duplicates found");
       } finally {
         await __internals.sql`DELETE FROM memories WHERE project = ${project}`;
       }
@@ -264,19 +269,21 @@ describe("DB access layer", () => {
       }
     });
 
-    test("QA happy: force stores a memory the dedup rejected", async () => {
+    test("QA happy: force is gone - duplicate writes are consolidates' job", async () => {
       const project = "/tmp/ocpg-test-force";
       const content = "Renovate opens dependency PRs every Monday at 06:00 UTC against the default branch.";
       try {
         expect(await __internals.remember({ content }, { directory: project, sessionID: "f" })).toContain("Stored memory #");
-        expect(await __internals.remember({ content }, { directory: project, sessionID: "f" })).toContain("skipping insert");
-        // The rejection message must point at the escape hatch.
-        expect(await __internals.remember({ content }, { directory: project, sessionID: "f" })).toContain("force: true");
-
-        const forced = await __internals.remember({ content, force: true }, { directory: project, sessionID: "f" });
-        expect(forced).toContain("Stored memory #");
+        // Re-storing works without any force flag; consolidation cleans up.
+        expect(await __internals.remember({ content }, { directory: project, sessionID: "f" })).toContain("Stored memory #");
         const [n] = await __internals.sql`SELECT count(*) AS n FROM memories WHERE project = ${project}` as { n: string }[];
         expect(Number(n.n)).toBe(2);
+        // Consolidation removes the exact dupe; the report shows what was removed.
+        const result = await __internals.consolidate();
+        expect(result).toContain("Removed 1 duplicate");
+        expect(result).toContain("Renovate opens dependency PRs");
+        const [n2] = await __internals.sql`SELECT count(*) AS n FROM memories WHERE project = ${project}` as { n: string }[];
+        expect(Number(n2.n)).toBe(1);
       } finally {
         await __internals.sql`DELETE FROM memories WHERE project = ${project}`;
       }
@@ -903,15 +910,21 @@ describe("DB access layer", () => {
         expect(rows[0].content).toBe("the release checklist lives in RELEASING.md");
 
         // Re-firing the same phrase (the docs allow prompt hooks to run more
-        // than once under concurrent submissions) must dedup, not double-insert.
+        // than once under concurrent submissions) stores a second copy -
+        // write-time dedup is gone; the collapse pass keeps it out of the
+        // injected block.
         await __internals.captureFromPrompt("remember that the release checklist lives in RELEASING.md", project, "sess-capture");
         const [n] = await __internals.sql`SELECT count(*) AS n FROM memories WHERE project = ${project}` as { n: string }[];
-        expect(Number(n.n)).toBe(1);
+        expect(Number(n.n)).toBe(2);
+        const block: { system: string[] } = { system: [] };
+        await __internals.handleTransform(block, project);
+        const occurrences = block.system.join("").split("release checklist lives in RELEASING.md").length - 1;
+        expect(occurrences).toBe(1);
 
         // Sub-10-char junk is rejected by validateWrite, nothing stored.
         await __internals.captureFromPrompt("remember: ok", project, "sess-capture");
         const [n2] = await __internals.sql`SELECT count(*) AS n FROM memories WHERE project = ${project}` as { n: string }[];
-        expect(Number(n2.n)).toBe(1);
+        expect(Number(n2.n)).toBe(2);
       } finally {
         await __internals.sql`DELETE FROM memories WHERE project = ${project}`;
       }

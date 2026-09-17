@@ -17,6 +17,9 @@ That's it - on first boot the Postgres image creates the database named by `PG_D
 apply the newer columns by hand, once, on the database the plugin points at:
 
 ```sql
+-- pg_trgm backs near-duplicate handling (memory_consolidate, injection collapse).
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+
 -- memory_type (plugin >= 0.14): defaulted, never required. Existing rows read
 -- as project_fact, which is what they were before the column existed.
 ALTER TABLE memories ADD COLUMN IF NOT EXISTS memory_type text NOT NULL DEFAULT 'project_fact';
@@ -32,6 +35,10 @@ ALTER TABLE memories ADD COLUMN IF NOT EXISTS last_accessed_at timestamptz;
 
 -- memory_update bookkeeping (plugin >= 0.14).
 ALTER TABLE memories ADD COLUMN IF NOT EXISTS updated_at timestamptz;
+
+-- memory_consolidate (plugin >= 0.14): trigram content index for the
+-- near-duplicate self-join.
+CREATE INDEX IF NOT EXISTS idx_memories_trgm ON memories USING gin (content gin_trgm_ops);
 ```
 
 Every statement is idempotent - re-running the block is a no-op.

@@ -51,30 +51,36 @@ from shipped SQL. The other strategies are candidates defined here.
 | para-rec | recall@5 on paraphrase queries - the pgvector decision number             |
 | bufhit   | shared-buffer hit % from an EXPLAIN (ANALYZE, BUFFERS) sample             |
 
-## Results (2026-09-17, this laptop, 150+75 queries per dataset)
+Ground truth is per calling project: bench rows are all `project_fact`, and
+every strategy carries the same visibility predicate
+(`memory_type != 'project_fact' OR project = <dir>`), so only the calling
+project's rows of a topic can be returned - cross-project rows are not
+reachable answers and don't count against recall. Absolute recall is
+therefore lower than a naive global-corpus reading; the numbers compare
+strategies against each other on identical visibility.
 
-| strategy       | 485 rows            | 5k rows             | 50k rows              |
-| -------------- | ------------------- | ------------------- | --------------------- |
-| fts-or (prod)  | 0.1ms / rec .70     | 0.4ms / rec .67     | 3.8ms p95 48 / rec .67 |
-| fts-and        | 0.05ms / rec .00    | 0.07ms / rec .003   | 0.12ms / rec .017     |
-| fts-or-cd      | 0.6ms / rec .70     | 4.4ms / rec .67     | 48ms p95 643 / rec .67 |
-| trgm-blend     | 6.0ms / rec .72     | 59ms / rec .67      | 585ms / rec .67       |
-| fts-or-recency | 0.1ms / rec .70     | 0.4ms / rec .66     | 4.0ms / rec .67       |
-| recency-only   | 0.1ms / rec .07     | 0.4ms / rec .036    | 4.4ms / rec .039      |
+## Results (2026-09-17, stack_fact visibility, this laptop, 100+50 queries per dataset)
+
+| strategy       | 485 rows            | 5k rows             |
+| -------------- | ------------------- | ------------------- |
+| fts-or (prod)  | 0.07ms / rec .26    | 0.09ms p95 1.4 / rec .37 |
+| fts-and        | 0.03ms / rec .00    | 0.07ms / rec .00    |
+| fts-or-cd      | 0.05ms / rec .26    | 0.12ms p95 14 / rec .36 |
+| trgm-blend     | 1.2ms / rec .27     | 12ms / rec .38      |
+| fts-or-recency | 0.04ms / rec .26    | 0.07ms / rec .37    |
+| recency-only   | 0.11ms / rec .20    | 0.7ms / rec .06     |
 
 Readings:
 
-1. **fts-or (prod) is the right default.** Best accuracy-per-millisecond by a
-   wide margin; the whole ranking gap vs the recency baseline (0.67 vs 0.04
-   recall) is the value of relevance injection.
-2. **AND semantics collapse on multi-word queries** (recall 0.00-0.02): one
-   word the memory never uses kills the match. Acted on: `memory_recall` now
-   uses the same OR-of-stemmed-words query as injection.
-3. **ts_rank_cd and trgm-blend are dead ends**: same or negligible accuracy
-   for 10x-150x the latency at 50k rows.
-4. **Recency prior adds nothing** to relevance ranking (fts-or-recency ≈
-   fts-or) - relevance already dominates; drop that idea.
-5. **Paraphrase recall is 0.000 at every size**: lexical search finds nothing
+1. **fts-or (prod) is still the right default** - best accuracy-per-millisecond
+   by a wide margin; the relevance gap vs the recency baseline (0.37 vs 0.06
+   recall at 5k) is the value of relevance injection.
+2. **AND semantics collapse on multi-word queries** (recall 0.00): one word
+   the memory never uses kills the match. Acted on: `memory_recall` now uses
+   the same OR-of-stemmed-words query as injection.
+3. **ts_rank_cd and trgm-blend remain dead ends**: comparable accuracy for
+   2x-100x the latency.
+4. **Paraphrase recall is 0.000 at every size**: lexical search finds nothing
    under pure synonym swap. This is the standing pgvector case - revisit when
    real-world paraphrase misses show up; the prod query shape stays, only the
    scoring would change.

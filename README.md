@@ -45,11 +45,20 @@ export OCPG_SSL="disable"
 
 ## How memory works
 
-Memories are **global**: recall, injection, dedup, deletion and updates see and touch every row. The `project` column records which project a memory came from and is shown in output - it is metadata, not a visibility boundary.
+Visibility is **type-based**:
+
+| Type           | Visibility                    | What it's for                                  |
+| -------------- | ----------------------------- | ---------------------------------------------- |
+| `preference`   | Global                        | Personal to the operator, not about any codebase |
+| `stack_fact`   | Global                        | True about the tooling/stack itself - portable to any project using the same stack |
+| `project_fact` | Origin project only (default) | True about this specific project/customer; pass `global: true` on recall to reach across |
+| `episodic`     | Reserved, unused              | -                                              |
+
+`memory_forget` / `memory_update` follow the same rule: a foreign project's `project_fact` is off-limits; global types are maintainable from any project.
 
 ## How injection picks memories
 
-By default the block is **relevance-ranked, not recency-ranked**: the user's latest prompt is turned into a full-text query (OR of stemmed words) over **all memories**, ranked by relevance with a small same-project tiebreak, top 5 injected - each line labeled with its origin project. When nothing matches the prompt, it falls back to the latest memories (preferences first). Set `OCPG_INJECTION=recency` for the old blind-last-5 behavior.
+By default the block is **relevance-ranked, not recency-ranked**: the user's latest prompt is turned into a full-text query (OR of stemmed words) over every **visible** memory (global types from anywhere, `project_fact` from its origin project), ranked by relevance with a small same-project tiebreak, top 5 injected - each line labeled with its origin project. When nothing matches the prompt, it falls back to the latest visible memories (preferences first). Set `OCPG_INJECTION=recency` for the blind-last-5 behavior.
 
 This is keyword relevance, not embedding-based semantic search - close phrasing wins, paraphrases may not. Note the OR ranking: common words in a prompt surface more rows; the ranking favors rows matching more distinctive terms.
 
@@ -57,7 +66,7 @@ This is keyword relevance, not embedding-based semantic search - close phrasing 
 
 Four agent tools are registered: `memory_remember` (store), `memory_recall` (search), `memory_forget` (delete by id), `memory_update` (rewrite an existing memory, keeping its original learned date), and `memory_consolidate` (remove near-duplicates on demand). The agent reads their usage rules from the tool schemas - as the user, the things worth knowing are:
 
-- Memories are shared across all projects: `memory_forget` / `memory_update` work on any row by id, from any project.
+- Visibility follows the type (see the table above); `memory_recall` takes `global: true` to search other projects' `project_fact` memories.
 - Duplicate writes are **never rejected** - they land, the injection block collapses them, and `memory_consolidate` cleans them up when you ask: it keeps the newest of each >=80%-similar group and reports the removed texts so the agent can merge any unique fact back.
 
 Writes are capped at 4000 characters of content, 10 tags, and 64 characters per tag; oversized writes are rejected with the actual size rather than silently truncated. Memories carry a `type` (`preference`, `project_fact` default, or `episodic`); `preference` memories come first in recency mode.

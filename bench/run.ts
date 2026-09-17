@@ -60,41 +60,41 @@ const strategies: Strategy[] = [
   {
     name: "fts-and",
     describe: "websearch_to_tsquery AND semantics - what memory_recall uses",
-    run: async (c, q, _d) =>
-      (await c`SELECT content, project FROM memories WHERE search_vector @@ websearch_to_tsquery('english', ${q}) ORDER BY ts_rank(search_vector, websearch_to_tsquery('english', ${q})) DESC LIMIT 5`) as Array<{ content: string; project: string }>,
-    explainSql: (q, _d) =>
-      `SELECT id, content, project FROM memories WHERE search_vector @@ websearch_to_tsquery('english', '${sanitizeAnd(q)}') ORDER BY ts_rank(search_vector, websearch_to_tsquery('english', '${sanitizeAnd(q)}')) DESC LIMIT 5`,
+    run: async (c, q, d) =>
+      (await c`SELECT content, project FROM memories WHERE search_vector @@ websearch_to_tsquery('english', ${q}) AND (memory_type != 'project_fact' OR project = ${d}) ORDER BY ts_rank(search_vector, websearch_to_tsquery('english', ${q})) DESC LIMIT 5`) as Array<{ content: string; project: string }>,
+    explainSql: (q, d) =>
+      `SELECT id, content, project FROM memories WHERE search_vector @@ websearch_to_tsquery('english', '${sanitizeAnd(q)}') AND (memory_type != 'project_fact' OR project = '${d}') ORDER BY ts_rank(search_vector, websearch_to_tsquery('english', '${sanitizeAnd(q)}')) DESC LIMIT 5`,
   },
   {
     name: "fts-or-cd",
     describe: "OR to_tsquery + ts_rank_cd (coverage-weighted ranker)",
     run: async (c, q, d) =>
-      (await c`SELECT content, project FROM memories WHERE search_vector @@ to_tsquery('english', ${sanitizeOr(q)}) ORDER BY ts_rank_cd(search_vector, to_tsquery('english', ${sanitizeOr(q)})) + (CASE WHEN project = ${d} THEN 0.01 ELSE 0 END) DESC LIMIT 5`) as Array<{ content: string; project: string }>,
+      (await c`SELECT content, project FROM memories WHERE search_vector @@ to_tsquery('english', ${sanitizeOr(q)}) AND (memory_type != 'project_fact' OR project = ${d}) ORDER BY ts_rank_cd(search_vector, to_tsquery('english', ${sanitizeOr(q)})) + (CASE WHEN project = ${d} THEN 0.01 ELSE 0 END) DESC LIMIT 5`) as Array<{ content: string; project: string }>,
     explainSql: (q, d) =>
-      `SELECT id, content, project FROM memories WHERE search_vector @@ to_tsquery('english', '${sanitizeOr(q)}') ORDER BY ts_rank_cd(search_vector, to_tsquery('english', '${sanitizeOr(q)}')) + (CASE WHEN project = '${d}' THEN 0.01 ELSE 0 END) DESC LIMIT 5`,
+      `SELECT id, content, project FROM memories WHERE search_vector @@ to_tsquery('english', '${sanitizeOr(q)}') AND (memory_type != 'project_fact' OR project = '${d}') ORDER BY ts_rank_cd(search_vector, to_tsquery('english', '${sanitizeOr(q)}')) + (CASE WHEN project = '${d}' THEN 0.01 ELSE 0 END) DESC LIMIT 5`,
   },
   {
     name: "trgm-blend",
     describe: "fts-or rank + pg_trgm similarity (catches typos/substrings, costs a scan)",
     run: async (c, q, d) =>
-      (await c`SELECT content, project FROM memories WHERE search_vector @@ to_tsquery('english', ${sanitizeOr(q)}) OR similarity(content, ${q}) >= 0.2 ORDER BY ts_rank(search_vector, to_tsquery('english', ${sanitizeOr(q)})) + similarity(content, ${q}) * 0.3 + (CASE WHEN project = ${d} THEN 0.01 ELSE 0 END) DESC LIMIT 5`) as Array<{ content: string; project: string }>,
+      (await c`SELECT content, project FROM memories WHERE (search_vector @@ to_tsquery('english', ${sanitizeOr(q)}) OR similarity(content, ${q}) >= 0.2) AND (memory_type != 'project_fact' OR project = ${d}) ORDER BY ts_rank(search_vector, to_tsquery('english', ${sanitizeOr(q)})) + similarity(content, ${q}) * 0.3 + (CASE WHEN project = ${d} THEN 0.01 ELSE 0 END) DESC LIMIT 5`) as Array<{ content: string; project: string }>,
     explainSql: (q, d) =>
-      `SELECT id, content, project FROM memories WHERE search_vector @@ to_tsquery('english', '${sanitizeOr(q)}') OR similarity(content, '${q.replace(/'/g, "''")}') >= 0.2 ORDER BY ts_rank(search_vector, to_tsquery('english', '${sanitizeOr(q)}')) + similarity(content, '${q.replace(/'/g, "''")}') * 0.3 + (CASE WHEN project = '${d}' THEN 0.01 ELSE 0 END) DESC LIMIT 5`,
+      `SELECT id, content, project FROM memories WHERE (search_vector @@ to_tsquery('english', '${sanitizeOr(q)}') OR similarity(content, '${q.replace(/'/g, "''")}') >= 0.2) AND (memory_type != 'project_fact' OR project = '${d}') ORDER BY ts_rank(search_vector, to_tsquery('english', '${sanitizeOr(q)}')) + similarity(content, '${q.replace(/'/g, "''")}') * 0.3 + (CASE WHEN project = '${d}' THEN 0.01 ELSE 0 END) DESC LIMIT 5`,
   },
   {
     name: "fts-or-recency",
     describe: "fts-or rank blended with a small recency-decay prior",
     run: async (c, q, d) =>
-      (await c`SELECT content, project FROM memories WHERE search_vector @@ to_tsquery('english', ${sanitizeOr(q)}) ORDER BY ts_rank(search_vector, to_tsquery('english', ${sanitizeOr(q)})) + 0.05 / (extract(epoch from (now() - created_at)) / 86400 + 2) + (CASE WHEN project = ${d} THEN 0.01 ELSE 0 END) DESC LIMIT 5`) as Array<{ content: string; project: string }>,
+      (await c`SELECT content, project FROM memories WHERE search_vector @@ to_tsquery('english', ${sanitizeOr(q)}) AND (memory_type != 'project_fact' OR project = ${d}) ORDER BY ts_rank(search_vector, to_tsquery('english', ${sanitizeOr(q)})) + 0.05 / (extract(epoch from (now() - created_at)) / 86400 + 2) + (CASE WHEN project = ${d} THEN 0.01 ELSE 0 END) DESC LIMIT 5`) as Array<{ content: string; project: string }>,
     explainSql: (q, d) =>
-      `SELECT id, content, project FROM memories WHERE search_vector @@ to_tsquery('english', '${sanitizeOr(q)}') ORDER BY ts_rank(search_vector, to_tsquery('english', '${sanitizeOr(q)}')) + 0.05 / (extract(epoch from (now() - created_at)) / 86400 + 2) + (CASE WHEN project = '${d}' THEN 0.01 ELSE 0 END) DESC LIMIT 5`,
+      `SELECT id, content, project FROM memories WHERE search_vector @@ to_tsquery('english', '${sanitizeOr(q)}') AND (memory_type != 'project_fact' OR project = '${d}') ORDER BY ts_rank(search_vector, to_tsquery('english', '${sanitizeOr(q)}')) + 0.05 / (extract(epoch from (now() - created_at)) / 86400 + 2) + (CASE WHEN project = '${d}' THEN 0.01 ELSE 0 END) DESC LIMIT 5`,
   },
   {
     name: "recency-only",
     describe: "the old blind last-5 (baseline; ignores the query)",
-    run: (c) => __internals.buildRecencyQuery(c) as unknown as Promise<Array<{ content: string; project: string }>>,
-    explainSql: (_q, _d) =>
-      `SELECT id, content, project FROM memories ORDER BY (memory_type = 'preference') DESC, created_at DESC LIMIT 5`,
+    run: (c, _q, d) => __internals.buildRecencyQuery(c, d) as unknown as Promise<Array<{ content: string; project: string }>>,
+    explainSql: (_q, d) =>
+      `SELECT id, content, project FROM memories WHERE (memory_type != 'project_fact' OR project = '${d}') ORDER BY (memory_type = 'preference') DESC, created_at DESC LIMIT 5`,
   },
 ];
 
@@ -102,15 +102,17 @@ async function loadRows(db: SQL): Promise<BenchRow[]> {
   return (await db`SELECT id, content, project FROM memories`) as BenchRow[];
 }
 
-// Topic -> ids of memories containing at least one of the topic's words.
-// Single-word ILIKE hits are a generous ground truth (a memory is relevant
-// even when it shares only one term with the query), which keeps the accuracy
-// bar honest for lexical strategies.
-function buildTopicIds(rows: BenchRow[]): Map<number, Set<string>> {
+// Topic -> contents of memories containing at least one of the topic's words,
+// restricted to the CALLING project: since all bench rows are project_fact and
+// every strategy now filters to the calling project's project_fact rows, a
+// cross-project row is not a reachable answer and must not count against
+// recall.
+function buildTopicIds(rows: BenchRow[], project: string): Map<number, Set<string>> {
   const byTopic = new Map<number, Set<string>>();
   TOPICS.forEach((topic, tIdx) => {
     const set = new Set<string>();
     for (const row of rows) {
+      if (row.project !== project) continue;
       const lower = row.content.toLowerCase();
       if (topic.words.some((w) => lower.includes(w.toLowerCase()))) set.add(row.content);
     }
@@ -165,7 +167,6 @@ async function benchDataset(size: number): Promise<void> {
   try {
     const rows = await loadRows(db);
     console.log(`\n=== ${benchDbName(size)}: ${rows.length} memories, ${new Set(rows.map((r) => r.project)).size} projects ===`);
-    const topicIds = buildTopicIds(rows);
     const mix = buildMix(rng(999 + size), buildCorpusWords(rows));
     const columnHeads = `strategy          p50ms  p95ms  recall@5  mrr@5  prec@5  para-rec  bufhit`;
     console.log(columnHeads);
@@ -173,6 +174,7 @@ async function benchDataset(size: number): Promise<void> {
     for (const strategy of strategies) {
       const rand = rng(size * 31 + 7);
       const project = pick(rand, PROJECTS);
+      const topicIds = buildTopicIds(rows, project);
       const latencies: number[] = [];
       const scores: Array<{ s: NonNullable<ReturnType<typeof score>>; kind: Case["kind"] }> = [];
 

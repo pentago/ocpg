@@ -22,7 +22,7 @@ psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" <<-'EOSQL'
 	  updated_at    timestamptz,
 	  search_vector tsvector GENERATED ALWAYS AS (to_tsvector('english', content)) STORED,
 	  CONSTRAINT memories_type_check
-	    CHECK (memory_type IN ('preference', 'project_fact', 'episodic'))
+	    CHECK (memory_type IN ('preference', 'stack_fact', 'project_fact', 'episodic'))
 	);
 	CREATE INDEX idx_memories_search ON memories USING gin (search_vector);
 	CREATE INDEX idx_memories_tags   ON memories USING gin (tags);

@@ -298,12 +298,12 @@ describe("DB access layer", () => {
             ('Rollbacks are performed with helm rollback, never kubectl apply.', ${__internals.sql.array(["decision", "tool:helm"], "text")}, 't', ${project}),
             ('The CI runner image is rebuilt weekly.', ${__internals.sql.array(["env"], "text")}, 't', ${project})
         `;
-        const helm = await __internals.recall({ tags: ["tool:helm"] });
+        const helm = await __internals.recall({ tags: ["tool:helm"] }, { directory: project });
         expect(helm).toContain("helm rollback");
         expect(helm).not.toContain("CI runner image");
 
         // Multiple tags are an AND, not an OR.
-        const both = await __internals.recall({ tags: ["decision", "env"] });
+        const both = await __internals.recall({ tags: ["decision", "env"] }, ctx);
         expect(both).toBe("No memories found.");
       } finally {
         await __internals.sql`DELETE FROM memories WHERE project = ${project}`;
@@ -334,18 +334,24 @@ describe("DB access layer", () => {
       }
     });
 
-    test("QA: memories are global - any project can delete any row by id", async () => {
-      // The project column records origin, not visibility: recall shows ids
-      // across projects, so deletability matches visibility. An id that does
-      // not exist at all is the only "nothing deleted" case.
+    test("QA: project_fact deletes are origin-scoped; global types are maintainable from anywhere", async () => {
       const other = "/tmp/ocpg-test-forget-other";
       try {
+        // A project_fact from another project must not be deletable from here.
         const stored = await __internals.remember({ content: "Memory belonging to another project entirely." }, { directory: other, sessionID: "o" });
         const id = Number(stored.match(/#(\d+)/)?.[1]);
 
-        expect(await __internals.forget({ id }, { directory: "/tmp/ocpg-test-forget-attacker" })).toBe(`Deleted memory #${id}.`);
+        const result = await __internals.forget({ id }, { directory: "/tmp/ocpg-test-forget-attacker" });
+        expect(result).toContain("is a project_fact belonging to");
+        expect(result).toContain("not deleted");
         const [n] = await __internals.sql`SELECT count(*) AS n FROM memories WHERE id = ${id}` as { n: string }[];
-        expect(Number(n.n)).toBe(0);
+        expect(Number(n.n)).toBe(1);
+
+        // A stack_fact from another project IS deletable - global types are
+        // every project's to maintain.
+        const stack = await __internals.remember({ content: "Stack fact: the CI runner image is rebuilt weekly.", type: "stack_fact" }, { directory: other, sessionID: "o" });
+        const stackId = Number(stack.match(/#(\d+)/)?.[1]);
+        expect(await __internals.forget({ id: stackId }, { directory: "/tmp/ocpg-test-forget-attacker" })).toBe(`Deleted memory #${stackId}.`);
       } finally {
         await __internals.sql`DELETE FROM memories WHERE project = ${other}`;
       }
@@ -445,12 +451,12 @@ describe("DB access layer", () => {
       expect(__internals.resolveLimit(0)).toBe(1);
       expect(__internals.resolveLimit(999)).toBe(20);
 
-      const result = await __internals.recall({ limit: "abc" as unknown as number });
+      const result = await __internals.recall({ limit: "abc" as unknown as number }, ctx);
       expect(result).not.toContain("ERROR");
     });
 
     test("recall returns id field in formatted output", async () => {
-      const result = await __internals.recall({ limit: 3 });
+      const result = await __internals.recall({ limit: 3 }, ctx);
       console.log(`recall output:\n${result}`);
       expect(result).toContain("#"); // id lines start with #
       expect(result).toContain("---"); // separator between rows
@@ -486,7 +492,7 @@ describe("DB access layer", () => {
         ctx,
       );
       expect(result).toContain("ERROR");
-      expect(result).toContain("preference, project_fact, episodic");
+      expect(result).toContain("preference, stack_fact, project_fact, episodic");
       const [n] = await __internals.sql`SELECT count(*) AS n FROM memories WHERE project = ${ctx.directory}` as { n: string }[];
       expect(Number(n.n)).toBe(0);
     });
@@ -526,7 +532,7 @@ describe("DB access layer", () => {
     test("recall surfaces non-default types in its output", async () => {
       try {
         await __internals.remember({ content: "Preference surfaced in recall output.", type: "preference" }, ctx);
-        const result = await __internals.recall({ query: "surfaced in recall", limit: 2 });
+        const result = await __internals.recall({ query: "surfaced in recall", limit: 2 }, ctx);
         expect(result).toContain("[preference]");
       } finally {
         await __internals.sql`DELETE FROM memories WHERE project = ${ctx.directory}`;
@@ -606,17 +612,24 @@ describe("DB access layer", () => {
       }
     });
 
-    test("QA: global memories - a foreign id is updatable, and validation applies", async () => {
+    test("QA: project_fact updates are origin-scoped; global types are updatable from anywhere", async () => {
       const other = "/tmp/ocpg-test-update-other";
       try {
-        const stored = await __internals.remember({ content: "Foreign memory that is updatable from any project." }, { directory: other, sessionID: "o" });
+        // project_fact from another project: not updatable, distinct message.
+        const stored = await __internals.remember({ content: "Foreign project fact that stays put." }, { directory: other, sessionID: "o" });
         const id = Number(stored.match(/#(\d+)/)?.[1]);
-        expect(await __internals.updateMemory({ id, content: "Updated from another project; origin column keeps the source." }, ctx)).toBe(
-          `Updated memory #${id}.`,
-        );
-        const [row] = await __internals.sql`SELECT content, project FROM memories WHERE id = ${id}` as { content: string; project: string }[];
-        expect(row.content).toContain("Updated from another project");
-        expect(row.project).toBe(other); // origin column unchanged
+        const result = await __internals.updateMemory({ id, content: "Attacker content replacing foreign memory." }, ctx);
+        expect(result).toContain("is a project_fact belonging to");
+        expect(result).toContain("not updated");
+        const [row] = await __internals.sql`SELECT content FROM memories WHERE id = ${id}` as { content: string }[];
+        expect(row.content).toBe("Foreign project fact that stays put.");
+
+        // stack_fact from another project: updatable - global types are shared.
+        const stack = await __internals.remember({ content: "Stack fact: the module requires lifecycle ignore_changes.", type: "stack_fact" }, { directory: other, sessionID: "o" });
+        const stackId = Number(stack.match(/#(\d+)/)?.[1]);
+        expect(
+          await __internals.updateMemory({ id: stackId, content: "Stack fact, corrected from another project: module needs lifecycle ignore_changes." }, ctx),
+        ).toBe(`Updated memory #${stackId}.`);
       } finally {
         await __internals.sql`DELETE FROM memories WHERE project = ${other}`;
       }
@@ -624,7 +637,7 @@ describe("DB access layer", () => {
       expect(await __internals.updateMemory({ id: -1, content: "valid content here" }, ctx)).toContain("positive integer");
       expect(await __internals.updateMemory({ id: 1, content: "short" }, ctx)).toContain("at least 10 characters");
       expect(await __internals.updateMemory({ id: 1, content: "valid content here", type: "nope" as unknown as "preference" }, ctx)).toContain(
-        "preference, project_fact, episodic",
+        "preference, stack_fact, project_fact, episodic",
       );
     });
 
@@ -656,8 +669,8 @@ describe("DB access layer", () => {
       try {
         const stored = await __internals.remember({ content: "Access tracking probe for the recall bump." }, ctx);
         const id = Number(stored.match(/#(\d+)/)?.[1]);
-        await __internals.recall({});
-        await __internals.recall({});
+        await __internals.recall({}, ctx);
+        await __internals.recall({}, ctx);
         // Fire-and-forget: give the abandoned UPDATE a beat to land.
         await new Promise((r) => setTimeout(r, 50));
         const [row] = await __internals.sql`
@@ -702,7 +715,7 @@ describe("DB access layer", () => {
 
         // Global recency: the whole corpus competes, so use a generous limit
         // and assert the pair's relative order rather than membership.
-        const result = await __internals.recall({ limit: 20 });
+        const result = await __internals.recall({ limit: 20 }, ctx);
         const olderIdx = result.indexOf(`#${olderRow.id}`);
         const newerIdx = result.indexOf(`#${newerRow.id}`);
         expect(newerIdx).toBeGreaterThan(-1);
@@ -737,7 +750,7 @@ describe("DB access layer", () => {
           await __internals.remember({ content: `Unrelated note ${i}: the ${topic} module owns the frontend layout grid.` }, ctx);
         }
         await __internals.remember(
-          { content: "The staging cluster runs Postgres 18 with pgvector disabled." },
+          { content: "The staging cluster runs Postgres 18 with pgvector disabled.", type: "stack_fact" },
           { directory: "/tmp/ocpg-test-relevance-old", sessionID: "rel-t" },
         );
         __internals.invalidateInjection(ctx.directory);
@@ -756,11 +769,11 @@ describe("DB access layer", () => {
       }
     });
 
-    test("relevance reaches memories of other projects; equal ranks favor the local project", async () => {
+    test("relevance reaches global types from other projects; other projects' project_fact never surfaces", async () => {
       try {
         const sibling = "/tmp/ocpg-test-relevance-sibling";
         await __internals.remember(
-          { content: "Cross-project nugget: the vendor API rejects unauthenticated webhooks with a 409." },
+          { content: "Cross-project nugget: the vendor API rejects unauthenticated webhooks with a 409.", type: "stack_fact" },
           { directory: sibling, sessionID: "rel-t" },
         );
         await __internals.remember(
@@ -778,6 +791,16 @@ describe("DB access layer", () => {
         const crossIdx = block.indexOf("Cross-project nugget");
         expect(localIdx).toBeGreaterThan(-1);
         if (crossIdx > -1) expect(localIdx).toBeLessThan(crossIdx);
+
+        // The visibility rule: a project_fact from the sibling is invisible here.
+        await __internals.remember(
+          { content: "Foreign secret: customer-beta's staging DNS resolver is flaky." },
+          { directory: sibling, sessionID: "rel-t" },
+        );
+        __internals.invalidateInjection(ctx.directory);
+        const output2: { system: string[] } = { system: [] };
+        await __internals.handleTransform(output2, ctx.directory, ask("customer-beta staging DNS resolver flaky"));
+        expect(output2.system.join("")).not.toContain("customer-beta's staging DNS");
       } finally {
         await __internals.sql`DELETE FROM memories WHERE project = '/tmp/ocpg-test-relevance-sibling'`;
         __internals.invalidateInjection("/tmp/ocpg-test-relevance-sibling");
@@ -862,6 +885,78 @@ describe("DB access layer", () => {
       expect(__internals.extractPromptQuery(msgs)).toBe("the real ask");
       expect(__internals.extractPromptQuery([])).toBe("");
       expect(__internals.extractPromptQuery([{ role: "assistant", content: [{ type: "text", text: "x" }] }])).toBe("");
+    });
+  });
+
+  describe("stack_fact visibility (mem-plan.md: type-based scoping)", () => {
+    const ctxB = { directory: "/tmp/ocpg-test-sf-b", sessionID: "sf-b" };
+    const ctxA = { directory: "/tmp/ocpg-test-sf-a", sessionID: "sf-a" };
+    const marker = () => `zzzsf${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+    beforeAll(() => {
+      __internals.setInjectionMode("relevance");
+    });
+
+    afterAll(async () => {
+      await __internals.sql`DELETE FROM memories WHERE project LIKE '/tmp/ocpg-test-sf-%'`;
+      __internals.invalidateInjection("/tmp/ocpg-test-sf-a");
+      __internals.invalidateInjection("/tmp/ocpg-test-sf-b");
+      __internals.setInjectionMode("recency");
+    });
+
+    test("recall: project_fact is origin-only by default; stack_fact is global; global: true overrides", async () => {
+      const m = marker();
+      await __internals.remember({ content: `${m} customer-alpha's staging has a flaky DNS resolver.` }, ctxA);
+      await __internals.remember(
+        { content: `${m} the RDS terraform module needs lifecycle ignore_changes for Aurora.`, type: "stack_fact" },
+        ctxA,
+      );
+
+      // From project B: stack_fact visible, project_fact not.
+      const fromB = await __internals.recall({ query: m }, ctxB);
+      expect(fromB).toContain("lifecycle ignore_changes");
+      expect(fromB).not.toContain("flaky DNS resolver");
+
+      // global: true pulls the project_fact in too.
+      const fromBGlobal = await __internals.recall({ query: m, global: true }, ctxB);
+      expect(fromBGlobal).toContain("flaky DNS resolver");
+
+      // From project A (origin): both visible without global.
+      const fromA = await __internals.recall({ query: m }, ctxA);
+      expect(fromA).toContain("flaky DNS resolver");
+      expect(fromA).toContain("lifecycle ignore_changes");
+
+      // Memory_type tests: resolveMemoryType accepts stack_fact.
+      expect(__internals.resolveMemoryType("stack_fact")).toBe("stack_fact");
+    });
+
+    test("injection: another project's project_fact never surfaces; its stack_fact does", async () => {
+      const m = marker();
+      await __internals.remember({ content: `${m} secret: customer-alpha's billing S3 bucket name.` }, ctxA);
+      await __internals.remember(
+        { content: `${m} shared: our ArgoCD ApplicationSet needs a finalizer tweak.`, type: "stack_fact" },
+        ctxA,
+      );
+      __internals.invalidateInjection(ctxB.directory);
+
+      const prompt = __internals.extractPromptQuery([{ role: "user", content: [{ type: "text", text: `${m} argocd billing` }] }]);
+      const output: { system: string[] } = { system: [] };
+      await __internals.handleTransform(output, ctxB.directory, prompt);
+      const block = output.system.join("");
+      expect(block).toContain("ArgoCD ApplicationSet");
+      expect(block).not.toContain("billing S3 bucket");
+    });
+
+    test("injection fallback (recency mode): visibility predicate applies there too", async () => {
+      const m = marker();
+      await __internals.remember({ content: `${m} project-b-only: local runner quirk in customer-beta CI.` }, ctxB);
+      __internals.setInjectionMode("recency");
+      __internals.invalidateInjection(ctxA.directory);
+
+      const output: { system: string[] } = { system: [] };
+      await __internals.handleTransform(output, ctxA.directory);
+      expect(output.system.join("")).not.toContain("customer-beta CI");
+      __internals.setInjectionMode("relevance");
     });
   });
 
@@ -951,7 +1046,7 @@ describe("DB access layer", () => {
       ` as { id: number }[];
 
       try {
-        const result = await __internals.recall({ query: marker, limit: 2 });
+        const result = await __internals.recall({ query: marker, limit: 2 }, ctx);
         console.log(`ranked recall output:\n${result}`);
         // The far-more-relevant OLDER row must rank first, ahead of the barely-relevant NEWER row.
         expect(result.indexOf(`#${oldRow.id}`)).toBeLessThan(result.indexOf(`#${newRow.id}`));
@@ -976,7 +1071,7 @@ describe("DB access layer", () => {
       try {
         // Global recency: the whole corpus competes, so use a generous limit
         // and assert the pair's relative order rather than membership.
-        const result = await __internals.recall({ limit: 20 });
+        const result = await __internals.recall({ limit: 20 }, ctx);
         const newerIdx = result.indexOf(`#${newerRow.id}`);
         const olderIdx = result.indexOf(`#${olderRow.id}`);
         expect(newerIdx).toBeGreaterThan(-1);
@@ -998,7 +1093,7 @@ describe("DB access layer", () => {
       try {
         // "a or b" is OR syntax under websearch_to_tsquery; plainto_tsquery would AND
         // both terms and never match since the nonexistent term never occurs.
-        const result = await __internals.recall({ query: `${marker} or zzznonexistenttermxyz`, limit: 5 });
+        const result = await __internals.recall({ query: `${marker} or zzznonexistenttermxyz`, limit: 5 }, ctx);
         console.log(`OR-query recall output:\n${result}`);
         expect(result).toContain(`#${row.id}`);
       } finally {
@@ -1019,10 +1114,10 @@ describe("DB access layer", () => {
 
       try {
         // AND would require BOTH words in the content; "vacuum" is absent.
-        const result = await __internals.recall({ query: `${marker} vacuum`, limit: 5 });
+        const result = await __internals.recall({ query: `${marker} vacuum`, limit: 5 }, ctx);
         expect(result).toContain(`#${row.id}`);
         // A gibberish AND-partner still finds nothing - OR is not fuzz.
-        const none = await __internals.recall({ query: `xqzzyblorpn qwintavex`, limit: 5 });
+        const none = await __internals.recall({ query: `xqzzyblorpn qwintavex`, limit: 5 }, ctx);
         expect(none).not.toContain(`#${row.id}`);
       } finally {
         await __internals.sql`DELETE FROM memories WHERE id = ${row.id}`;
@@ -1093,7 +1188,7 @@ test("QA: rate-limited error logging on DB failure", async () => {
 
   // A recall failure is a different kind, so it must still log rather than be
   // muted by the injection error's window.
-  const recallResult = await __internals.recall({});
+  const recallResult = await __internals.recall({}, { directory: "/tmp/ocpg-test-fail-a" });
   expect(captured.length).toBe(2);
   expect(String(captured[1])).toContain("ocpg recall failed");
   // The model gets a generic message; host/user/schema detail stays in the log.

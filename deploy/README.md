@@ -23,10 +23,9 @@ CREATE EXTENSION IF NOT EXISTS pg_trgm;
 -- memory_type (plugin >= 0.14): defaulted, never required. Existing rows read
 -- as project_fact, which is what they were before the column existed.
 ALTER TABLE memories ADD COLUMN IF NOT EXISTS memory_type text NOT NULL DEFAULT 'project_fact';
-DO $$ BEGIN
-  ALTER TABLE memories ADD CONSTRAINT memories_type_check
-    CHECK (memory_type IN ('preference', 'project_fact', 'episodic'));
-EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+ALTER TABLE memories DROP CONSTRAINT IF EXISTS memories_type_check;
+ALTER TABLE memories ADD CONSTRAINT memories_type_check
+  CHECK (memory_type IN ('preference', 'stack_fact', 'project_fact', 'episodic'));
 
 -- recall access ranking (plugin >= 0.14): incremented by memory_recall only;
 -- the injection path stays read-only.

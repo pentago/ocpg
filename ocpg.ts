@@ -22,6 +22,7 @@ type RememberArgs = {
   type?: MemoryType;
 };
 type ForgetArgs = { id: number };
+type UpdateArgs = { id: number; content: string; tags?: string[]; type?: MemoryType };
 
 // Defaults to "disable" so the common localhost setup is unchanged; set OCPG_SSL
 // when the database is remote, otherwise the SCRAM handshake crosses the network
@@ -517,6 +518,53 @@ async function forget(
   }
 }
 
+// No dedup fall-through, by design: an update that lands close to another
+// memory is an intentional correction, not a dupe to reject. updated_at is
+// set; created_at is deliberately NOT bumped - the displayed date must keep
+// saying when the memory was learned, not when it was last edited. Omitted
+// tags/type are preserved, not reset to their defaults.
+async function updateMemory(
+  args: UpdateArgs,
+  ctx: { directory: string },
+): Promise<string> {
+  try {
+    const id = Number(args.id);
+    if (!Number.isInteger(id) || id <= 0) {
+      return "ERROR: id must be a positive integer (the #id shown by memory_recall).";
+    }
+    const invalid = validateWrite(args);
+    if (invalid) return invalid;
+
+    const projectCond = userScope
+      ? sql`project IN (${ctx.directory}, ${userScope})`
+      : sql`project = ${ctx.directory}`;
+    const tags = args.tags ?? [];
+    const tagCond = Array.isArray(args.tags)
+      ? sql`tags = ${sql.array(tags, "text")},`
+      : sql``;
+    const typeCond = args.type !== undefined
+      ? sql`memory_type = ${resolveMemoryType(args.type)},`
+      : sql``;
+    const updated = await sql`
+      UPDATE memories
+      SET content = ${args.content},
+          ${tagCond}
+          ${typeCond}
+          updated_at = now()
+      WHERE id = ${id} AND ${projectCond}
+      RETURNING id
+    ` as { id: number }[];
+
+    if (updated.length === 0) {
+      return `No memory #${id} in this project; nothing updated.`;
+    }
+    invalidateInjection(ctx.directory);
+    return `Updated memory #${id}.`;
+  } catch (e: unknown) {
+    return toolError("update", "update", e);
+  }
+}
+
 function invalidateInjection(directory: string): void {
   injectionCache.delete(directory);
 }
@@ -658,6 +706,39 @@ const ocpg = Plugin.define({
           return { content: await forget(input as ForgetArgs, { directory }) };
         },
       });
+      editor.add({
+        name: "memory_update",
+        options: { codemode: false },
+        description:
+          "Rewrite an existing memory by id (get ids from memory_recall). Use when a memory is outdated but still worth keeping: the corrected content replaces the old, keeping the original learned date. " +
+          "Omitted tags/type are kept as-is. For obsolete memories use memory_forget; for genuinely new memories use memory_remember.",
+        input: {
+          type: "object",
+          properties: {
+            id: { type: "number", description: "The #id shown by memory_recall" },
+            content: {
+              type: "string",
+              description: `1-3 self-contained sentences replacing the old content (${MIN_CONTENT}-${MAX_CONTENT} characters)`,
+            },
+            tags: {
+              type: "array",
+              items: { type: "string", maxLength: MAX_TAG_LENGTH },
+              maxItems: MAX_TAGS,
+              description: "Replaces the tag list; omit to keep the current tags",
+            },
+            type: {
+              type: "string",
+              enum: [...MEMORY_TYPES],
+              description: "Replaces the memory type; omit to keep the current type",
+            },
+          },
+          required: ["id", "content"],
+          additionalProperties: false,
+        },
+        execute: async (input) => {
+          return { content: await updateMemory(input as UpdateArgs, { directory }) };
+        },
+      });
     });
 
     // Close the SQL pool when the last plugin instance unloads.
@@ -677,6 +758,7 @@ const __internals = {
   recall,
   remember,
   forget,
+  updateMemory,
   extractMemoryRequest,
   captureFromPrompt,
   invalidateInjection,

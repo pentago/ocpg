@@ -656,6 +656,120 @@ describe("DB access layer", () => {
     });
   });
 
+  describe("memory_update (plan 2.3: no dedup fall-through, created_at untouched)", () => {
+    const ctx = { directory: "/tmp/ocpg-test-update", sessionID: "update-t" };
+
+    test("updates content, sets updated_at, keeps created_at and omitted tags/type", async () => {
+      try {
+        const stored = await __internals.remember(
+          { content: "The old stale content about the deploy gate.", tags: ["decision"] },
+          ctx,
+        );
+        const id = Number(stored.match(/#(\d+)/)?.[1]);
+        const [before] = await __internals.sql`
+          SELECT created_at, updated_at, tags, memory_type FROM memories WHERE id = ${id}
+        ` as { created_at: Date; updated_at: Date | null; tags: string[]; memory_type: string }[];
+        expect(before.updated_at).toBe(null);
+        expect(before.tags).toEqual(["decision"]);
+        expect(before.memory_type).toBe("project_fact");
+
+        const result = await __internals.updateMemory(
+          { id, content: "The corrected content: deploys are gated behind manual approval." },
+          ctx,
+        );
+        expect(result).toBe(`Updated memory #${id}.`);
+
+        const [after] = await __internals.sql`
+          SELECT created_at, updated_at, tags, memory_type, content FROM memories WHERE id = ${id}
+        ` as { created_at: Date; updated_at: Date; tags: string[]; memory_type: string; content: string }[];
+        expect(after.content).toContain("manual approval");
+        // The learned date must not lie about when the memory was created.
+        expect(after.created_at.getTime()).toBe(before.created_at.getTime());
+        expect(after.updated_at).not.toBe(null);
+        // Omitted fields are preserved, not reset.
+        expect(after.tags).toEqual(["decision"]);
+        expect(after.memory_type).toBe("project_fact");
+      } finally {
+        await __internals.sql`DELETE FROM memories WHERE project = ${ctx.directory}`;
+      }
+    });
+
+    test("explicit tags and type replace the stored ones", async () => {
+      try {
+        const stored = await __internals.remember({ content: "A memory that will be retyped as a preference." }, ctx);
+        const id = Number(stored.match(/#(\d+)/)?.[1]);
+        expect(
+          await __internals.updateMemory({ id, content: "Retyped as a standing preference.", type: "preference" }, ctx),
+        ).toBe(`Updated memory #${id}.`);
+        const [row] = await __internals.sql`SELECT memory_type, tags FROM memories WHERE id = ${id}` as {
+          memory_type: string;
+          tags: string[];
+        }[];
+        expect(row.memory_type).toBe("preference");
+        expect(row.tags).toEqual([]);
+      } finally {
+        await __internals.sql`DELETE FROM memories WHERE project = ${ctx.directory}`;
+      }
+    });
+
+    test("no dedup fall-through: an update may land near another memory", async () => {
+      try {
+        const first = await __internals.remember({ content: "Deployments run through the staging pipeline only." }, ctx);
+        const second = await __internals.remember({ content: "Deployments run through the production pipeline on Fridays." }, ctx);
+        const id = Number(second.match(/#(\d+)/)?.[1]);
+        const result = await __internals.updateMemory(
+          { id, content: "Deployments run through the staging pipeline only, never production." },
+          ctx,
+        );
+        expect(result).toBe(`Updated memory #${id}.`);
+        expect(first).toContain("Stored memory #");
+      } finally {
+        await __internals.sql`DELETE FROM memories WHERE project = ${ctx.directory}`;
+      }
+    });
+
+    test("project-scoped: a foreign id matches nothing, and validation applies", async () => {
+      const other = "/tmp/ocpg-test-update-other";
+      try {
+        const stored = await __internals.remember({ content: "Foreign memory that must not be updatable." }, { directory: other, sessionID: "o" });
+        const id = Number(stored.match(/#(\d+)/)?.[1]);
+        expect(await __internals.updateMemory({ id, content: "Attacker content replacing foreign memory." }, ctx)).toContain(
+          "nothing updated",
+        );
+        const [row] = await __internals.sql`SELECT content FROM memories WHERE id = ${id}` as { content: string }[];
+        expect(row.content).toContain("Foreign memory");
+      } finally {
+        await __internals.sql`DELETE FROM memories WHERE project = ${other}`;
+      }
+
+      expect(await __internals.updateMemory({ id: -1, content: "valid content here" }, ctx)).toContain("positive integer");
+      expect(await __internals.updateMemory({ id: 1, content: "short" }, ctx)).toContain("at least 10 characters");
+      expect(await __internals.updateMemory({ id: 1, content: "valid content here", type: "nope" as unknown as "preference" }, ctx)).toContain(
+        "preference, project_fact, episodic",
+      );
+    });
+
+    test("an update invalidates the injected block", async () => {
+      const marker = `zzzupdate${Date.now()}`;
+      try {
+        const stored = await __internals.remember({ content: `Original note ${marker}` }, ctx);
+        const id = Number(stored.match(/#(\d+)/)?.[1]);
+        const before: { system: string[] } = { system: [] };
+        await __internals.handleTransform(before, ctx.directory);
+        expect(before.system[0]).toContain(`Original note ${marker}`);
+
+        expect(await __internals.updateMemory({ id, content: `Rewritten note ${marker}` }, ctx)).toContain("Updated");
+        const after: { system: string[] } = { system: [] };
+        await __internals.handleTransform(after, ctx.directory);
+        expect(after.system[0]).toContain(`Rewritten note ${marker}`);
+        expect(after.system[0]).not.toContain("Original note");
+      } finally {
+        await __internals.sql`DELETE FROM memories WHERE project = ${ctx.directory}`;
+        __internals.invalidateInjection(ctx.directory);
+      }
+    });
+  });
+
   describe("keyword capture (plan 1.1 revised: verbatim, no LLM)", () => {
     test("extracts the text after the trigger, verbatim and minus the trigger", () => {
       expect(__internals.extractMemoryRequest("remember that the build uses bun, not npm")).toBe(

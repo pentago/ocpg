@@ -11,6 +11,31 @@ docker compose up -d
 
 That's it - on first boot the Postgres image creates the database named by `PG_DB`, and the `pg_trgm` extension plus the `memories` table (with full-text search indexes) are added by [`init/01-init.sh`](./init/01-init.sh).
 
+## Upgrading an existing install
+
+`init/01-init.sh` runs **only on first boot** (fresh data dir). Existing installs
+apply the newer columns by hand, once, on the database the plugin points at:
+
+```sql
+-- memory_type (plugin >= 0.14): defaulted, never required. Existing rows read
+-- as project_fact, which is what they were before the column existed.
+ALTER TABLE memories ADD COLUMN IF NOT EXISTS memory_type text NOT NULL DEFAULT 'project_fact';
+DO $$ BEGIN
+  ALTER TABLE memories ADD CONSTRAINT memories_type_check
+    CHECK (memory_type IN ('preference', 'project_fact', 'episodic'));
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+-- recall access ranking (plugin >= 0.14): incremented by memory_recall only;
+-- the injection path stays read-only.
+ALTER TABLE memories ADD COLUMN IF NOT EXISTS access_count integer NOT NULL DEFAULT 0;
+ALTER TABLE memories ADD COLUMN IF NOT EXISTS last_accessed_at timestamptz;
+
+-- memory_update bookkeeping (plugin >= 0.14).
+ALTER TABLE memories ADD COLUMN IF NOT EXISTS updated_at timestamptz;
+```
+
+Every statement is idempotent - re-running the block is a no-op.
+
 `.env` values:
 
 | Var           | Meaning                                          |

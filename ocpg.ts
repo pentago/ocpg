@@ -225,16 +225,35 @@ function extractPromptQuery(
 // Recency query shared by the recency mode and the no-match fallback: latest 5
 // rows of the project (plus the user-scope sentinel when enabled), preferences
 // first.
-function recencyQuery(directory: string) {
+// Query builders are pure functions of the client so the benchmark
+// (bench/run.ts) can execute the EXACT production SQL against bench
+// databases - no drift between what is measured and what runs.
+function buildRecencyQuery(client: SQL, directory: string) {
   const projectCond = userScope
-    ? sql`WHERE (project = ${directory} OR project = ${userScope})`
-    : sql`WHERE project = ${directory}`;
-  return sql`
+    ? client`WHERE (project = ${directory} OR project = ${userScope})`
+    : client`WHERE project = ${directory}`;
+  return client`
     SELECT content, coalesce(tags, '{}') AS tags,
            to_char(created_at, 'YYYY-MM-DD') AS date
     FROM memories
     ${projectCond}
     ORDER BY (memory_type = 'preference') DESC, created_at DESC
+    LIMIT 5
+  `;
+}
+
+function buildRelevanceQuery(client: SQL, tsQuery: string, directory: string) {
+  // Relevance: full-text search across ALL projects - shared memory by
+  // design - with a small same-project boost to break rank ties toward
+  // locally stored memories.
+  return client`
+    SELECT content, coalesce(tags, '{}') AS tags,
+           to_char(created_at, 'YYYY-MM-DD') AS date
+    FROM memories
+    WHERE search_vector @@ to_tsquery('english', ${tsQuery})
+    ORDER BY ts_rank(search_vector, to_tsquery('english', ${tsQuery}))
+             + (CASE WHEN project = ${directory} THEN 0.01 ELSE 0 END) DESC,
+             created_at DESC
     LIMIT 5
   `;
 }
@@ -264,28 +283,16 @@ async function handleTransform(
     const words = query.toLowerCase().match(/[a-z0-9]+/g) ?? [];
     const tsQuery = words.slice(0, 24).join(" | ");
     if (tsQuery) {
-      // Relevance: full-text search across ALL projects - shared memory by
-      // design - with a small same-project boost to break rank ties toward
-      // locally stored memories.
       rows = await withDeadline(
-        sql`
-        SELECT content, coalesce(tags, '{}') AS tags,
-               to_char(created_at, 'YYYY-MM-DD') AS date
-        FROM memories
-        WHERE search_vector @@ to_tsquery('english', ${tsQuery})
-        ORDER BY ts_rank(search_vector, to_tsquery('english', ${tsQuery}))
-                 + (CASE WHEN project = ${directory} THEN 0.01 ELSE 0 END) DESC,
-                 created_at DESC
-        LIMIT 5
-      ` as unknown as PromiseLike<InjectionRow[]>,
+        buildRelevanceQuery(sql, tsQuery, directory) as unknown as PromiseLike<InjectionRow[]>,
         1000,
       );
       if (rows.length === 0) {
         // No keyword match for this prompt - recency beats an empty block.
-        rows = await withDeadline(recencyQuery(directory) as unknown as PromiseLike<InjectionRow[]>, 1000);
+        rows = await withDeadline(buildRecencyQuery(sql, directory) as unknown as PromiseLike<InjectionRow[]>, 1000);
       }
     } else {
-      rows = await withDeadline(recencyQuery(directory) as unknown as PromiseLike<InjectionRow[]>, 1000);
+      rows = await withDeadline(buildRecencyQuery(sql, directory) as unknown as PromiseLike<InjectionRow[]>, 1000);
     }
     const block = formatBlock(rows, directory);
     // Evict oldest entry when cache exceeds 32
@@ -871,6 +878,8 @@ const __internals = {
   },
   extractPromptQuery,
   hashQuery,
+  buildRecencyQuery,
+  buildRelevanceQuery,
   get userScope() {
     return userScope;
   },

@@ -829,6 +829,157 @@ describe("DB access layer", () => {
     });
   });
 
+  describe("relevance injection (follow-up: most-relevant-N, not last-N)", () => {
+    const ctx = { directory: "/tmp/ocpg-test-relevance", sessionID: "rel-t" };
+    const ask = (text: string) => __internals.extractPromptQuery([{ role: "user", content: [{ type: "text", text }] }]);
+
+    beforeAll(() => {
+      __internals.setInjectionMode("relevance");
+    });
+
+    afterAll(async () => {
+      await __internals.sql`DELETE FROM memories WHERE project LIKE '/tmp/ocpg-test-relevance%'`;
+      __internals.invalidateInjection("/tmp/ocpg-test-relevance");
+      __internals.invalidateInjection("/tmp/ocpg-test-relevance-sibling");
+      __internals.setInjectionMode("recency");
+    });
+
+    test("an old relevant memory outranks newer irrelevant ones", async () => {
+      try {
+        // Filler memories newer than the relevant one: recency would pick these.
+        const topics = ["widgets", "gadgets", "gizmos", "doodads", "doohickeys", "contraptions"];
+        for (const [i, topic] of topics.entries()) {
+          await __internals.remember({ content: `Unrelated note ${i}: the ${topic} module owns the frontend layout grid.` }, ctx);
+        }
+        await __internals.remember(
+          { content: "The staging cluster runs Postgres 18 with pgvector disabled." },
+          { directory: "/tmp/ocpg-test-relevance-old", sessionID: "rel-t" },
+        );
+        __internals.invalidateInjection(ctx.directory);
+
+        const output: { system: string[] } = { system: [] };
+        await __internals.handleTransform(output, ctx.directory, ask("how is the staging cluster postgres set up?"));
+        expect(output.system[0]).toContain("pgvector disabled");
+        const relIdx = output.system[0].indexOf("staging cluster runs Postgres 18");
+        const fillerIdx = output.system[0].indexOf("contraptions module");
+        expect(relIdx).toBeGreaterThan(-1);
+        // The relevant old memory is listed before newer filler would be under recency.
+        if (fillerIdx > -1) expect(relIdx).toBeLessThan(fillerIdx);
+      } finally {
+        await __internals.sql`DELETE FROM memories WHERE project = '/tmp/ocpg-test-relevance-old'`;
+        __internals.invalidateInjection("/tmp/ocpg-test-relevance-old");
+      }
+    });
+
+    test("relevance reaches memories of other projects; equal ranks favor the local project", async () => {
+      try {
+        const sibling = "/tmp/ocpg-test-relevance-sibling";
+        await __internals.remember(
+          { content: "Cross-project nugget: the vendor API rejects unauthenticated webhooks with a 409." },
+          { directory: sibling, sessionID: "rel-t" },
+        );
+        await __internals.remember(
+          { content: "Local nugget: the vendor API rejects unauthenticated webhooks with a 409." },
+          ctx,
+        );
+        __internals.invalidateInjection(ctx.directory);
+
+        const output: { system: string[] } = { system: [] };
+        await __internals.handleTransform(output, ctx.directory, ask("the vendor API rejects unauthenticated webhooks"));
+        const block = output.system[0];
+        expect(block).toContain("vendor API rejects");
+        // Identical content, identical rank -> the 0.01 same-project boost decides.
+        const localIdx = block.indexOf("Local nugget");
+        const crossIdx = block.indexOf("Cross-project nugget");
+        expect(localIdx).toBeGreaterThan(-1);
+        if (crossIdx > -1) expect(localIdx).toBeLessThan(crossIdx);
+      } finally {
+        await __internals.sql`DELETE FROM memories WHERE project = '/tmp/ocpg-test-relevance-sibling'`;
+        __internals.invalidateInjection("/tmp/ocpg-test-relevance-sibling");
+      }
+    });
+
+    test("a no-match prompt falls back to recency instead of injecting nothing", async () => {
+      await __internals.remember({ content: "Sole memory of the fallback probe project." }, ctx);
+      __internals.invalidateInjection(ctx.directory);
+      const output: { system: string[] } = { system: [] };
+      await __internals.handleTransform(output, ctx.directory, ask("xqzzyblorpn kwintavex blorptonic qwertyuiopas"));
+      expect(output.system.length).toBe(1);
+      expect(output.system[0]).toContain("Sole memory of the fallback probe project");
+    });
+
+    test("cache is keyed by prompt: same prompt is a hit, a new prompt queries afresh", async () => {
+      await __internals.remember({ content: "Cached marker alpha for prompt one." }, ctx);
+      await __internals.remember({ content: "Cached marker bravo for prompt two." }, ctx);
+      __internals.invalidateInjection(ctx.directory);
+
+      const p1 = ask("cached marker alpha for prompt one");
+      const first: { system: string[] } = { system: [] };
+      await __internals.handleTransform(first, ctx.directory, p1);
+      const start = performance.now();
+      const warm: { system: string[] } = { system: [] };
+      await __internals.handleTransform(warm, ctx.directory, p1);
+      expect(performance.now() - start).toBeLessThan(5);
+      expect(warm.system[0]).toBe(first.system[0]);
+
+      const second: { system: string[] } = { system: [] };
+      await __internals.handleTransform(second, ctx.directory, ask("cached marker bravo for prompt two"));
+      // OR semantics: "cached"/"prompt" also match other rows, but the prompt's
+      // own memory must outrank them.
+      const bravoIdx = second.system[0].indexOf("Cached marker bravo");
+      const alphaIdx = second.system[0].indexOf("Cached marker alpha");
+      expect(bravoIdx).toBeGreaterThan(-1);
+      if (alphaIdx > -1) expect(bravoIdx).toBeLessThan(alphaIdx);
+    });
+
+    test("a write invalidates every prompt-keyed cache entry of the project", async () => {
+      const p1 = ask("remembered content about deploy gates");
+      const stored = await __internals.remember({ content: "Deploy gate note for cache clearing." }, ctx);
+      const marker = stored.match(/#\d+/)?.[0] ?? "#0";
+      const output: { system: string[] } = { system: [] };
+      await __internals.handleTransform(output, ctx.directory, p1);
+      expect(output.system[0]).toContain("Deploy gate note");
+
+      const id = Number(stored.match(/#(\d+)/)?.[1]);
+      await __internals.forget({ id }, ctx);
+      const after: { system: string[] } = { system: [] };
+      await __internals.handleTransform(after, ctx.directory, p1);
+      expect(after.system.join("")).not.toContain("Deploy gate note");
+      void marker;
+    });
+
+    test("injection stays read-only in relevance mode too", async () => {
+      const stored = await __internals.remember({ content: "Read-only probe for relevance injection." }, ctx);
+      const id = Number(stored.match(/#(\d+)/)?.[1]);
+      __internals.invalidateInjection(ctx.directory);
+      const output: { system: string[] } = { system: [] };
+      await __internals.handleTransform(output, ctx.directory, ask("read-only probe for relevance injection"));
+      await new Promise((r) => setTimeout(r, 50));
+      const [row] = await __internals.sql`SELECT access_count FROM memories WHERE id = ${id}` as { access_count: number }[];
+      expect(row.access_count).toBe(0);
+    });
+
+    test("OCPG_INJECTION=recency keeps the old behavior and ignores the prompt", async () => {
+      __internals.setInjectionMode("recency");
+      const output: { system: string[] } = { system: [] };
+      await __internals.handleTransform(output, ctx.directory, ask("xqzzyblorpn kwintavex blorptonic qwertyuiopas"));
+      expect(output.system.length).toBe(1);
+      expect(output.system[0]).not.toContain("read-only probe");
+      __internals.setInjectionMode("relevance");
+    });
+
+    test("extractPromptQuery takes the last user message, text parts only", () => {
+      const msgs = [
+        { role: "user", content: [{ type: "text", text: "first" }] },
+        { role: "assistant", content: [{ type: "text", text: "assistant filler" }] },
+        { role: "user", content: [{ type: "media", data: "img" }, { type: "text", text: "the real ask" }] },
+      ];
+      expect(__internals.extractPromptQuery(msgs)).toBe("the real ask");
+      expect(__internals.extractPromptQuery([])).toBe("");
+      expect(__internals.extractPromptQuery([{ role: "assistant", content: [{ type: "text", text: "x" }] }])).toBe("");
+    });
+  });
+
   describe("keyword capture (plan 1.1 revised: verbatim, no LLM)", () => {
     test("extracts the text after the trigger, verbatim and minus the trigger", () => {
       expect(__internals.extractMemoryRequest("remember that the build uses bun, not npm")).toBe(

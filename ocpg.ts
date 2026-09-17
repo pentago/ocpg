@@ -148,6 +148,14 @@ async function withDeadline<T>(query: PromiseLike<T>, ms: number): Promise<T> {
 
 // --- Injection pipeline ---
 
+// Injection ranking mode (plan follow-up: relevance over blind recency).
+// "relevance" (default) scores all memories - every project - against the
+// user's latest prompt via full-text search, falling back to recency when the
+// prompt matches nothing; "recency" restores the old last-5 behavior via
+// OCPG_INJECTION=recency. Resolved once at init, env-only.
+let injectionMode: "relevance" | "recency" =
+  process.env.OCPG_INJECTION === "recency" ? "recency" : "relevance";
+
 function truncateMemory(content: string): string {
   if (content.length <= 600) return content;
   return `${content.slice(0, 600)}…[truncated]`;
@@ -180,49 +188,112 @@ function formatBlock(rows: InjectionRow[], projectDir: string): string {
   return lines.join("\n");
 }
 
-// Keyed by project directory, not session: the query depends only on the
-// directory, so every session in a project shares one entry and a remember in
-// any session invalidates it for all of them. An empty string is cached for
-// projects with no memories so they stop re-querying, and nothing is injected.
+// Keyed by directory + prompt hash now that the block depends on the prompt
+// (relevance mode): an identical prompt (model retries, re-requests) hits the
+// cache; a new prompt queries afresh. An empty string is cached for
+// no-match/empty prompts so they stop re-querying.
 const injectionCache = new Map<string, string>();
 
-// Session-independent by design: the block depends only on the project
-// directory, so the hook passes nothing else.
+// djb2 - just a stable key shortener; a same-hash different-prompt collision
+// would serve a stale block, which remember/forget invalidation clears.
+function hashQuery(text: string): string {
+  let h = 5381;
+  for (let i = 0; i < text.length; i++) h = ((h << 5) + h + text.charCodeAt(i)) | 0;
+  return (h >>> 0).toString(36);
+}
+
+// The latest user message is the retrieval signal: what the user is asking
+// about right now is the best proxy for which memories matter. Text parts
+// only; capped because a query is a query, not a transcript - FTS is not
+// helped by thousands of characters.
+function extractPromptQuery(
+  messages: ReadonlyArray<{ role: unknown; content: ReadonlyArray<{ type?: unknown; text?: unknown }> }>,
+): string {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i];
+    if (message?.role !== "user") continue;
+    const text = message.content
+      .filter((p) => p.type === "text" && typeof p.text === "string")
+      .map((p) => p.text as string)
+      .join(" ")
+      .trim();
+    return text.length > 512 ? text.slice(0, 512) : text;
+  }
+  return "";
+}
+
+// Recency query shared by the recency mode and the no-match fallback: latest 5
+// rows of the project (plus the user-scope sentinel when enabled), preferences
+// first.
+function recencyQuery(directory: string) {
+  const projectCond = userScope
+    ? sql`WHERE (project = ${directory} OR project = ${userScope})`
+    : sql`WHERE project = ${directory}`;
+  return sql`
+    SELECT content, coalesce(tags, '{}') AS tags,
+           to_char(created_at, 'YYYY-MM-DD') AS date
+    FROM memories
+    ${projectCond}
+    ORDER BY (memory_type = 'preference') DESC, created_at DESC
+    LIMIT 5
+  `;
+}
+
+// The block depends on the directory plus (in relevance mode) the prompt,
+// passed explicitly by the caller.
 async function handleTransform(
   output: { system: string[] },
   directory: string,
+  prompt = "",
 ): Promise<void> {
   if (!directory) return;
-  const cached = injectionCache.get(directory);
+  const query = injectionMode === "relevance" ? prompt.trim() : "";
+  const cacheKey = `${directory}\u0001${hashQuery(query)}`;
+  const cached = injectionCache.get(cacheKey);
   if (cached !== undefined) {
     if (cached) output.system.push(cached);
     return;
   }
   try {
-    // Injection stays keyed by the directory alone: when user scope is enabled
-    // the block additionally includes the shared user rows, but that still
-    // depends only on the directory (the user scope is process-wide env config).
-    const projectCond = userScope
-      ? sql`WHERE (project = ${directory} OR project = ${userScope})`
-      : sql`WHERE project = ${directory}`;
-    const rows = await withDeadline(
-      sql`
-      SELECT content, coalesce(tags, '{}') AS tags,
-             to_char(created_at, 'YYYY-MM-DD') AS date
-      FROM memories
-      ${projectCond}
-      ORDER BY (memory_type = 'preference') DESC, created_at DESC
-      LIMIT 5
-    ` as unknown as PromiseLike<InjectionRow[]>,
-      1000,
-    );
+    let rows: InjectionRow[];
+    // The prompt as an OR of stemmed words: websearch_to_tsquery ANDs the
+    // terms, so one word the memory never uses would zero out the whole
+    // query. OR ranks by how many (and how rare) the matched terms are, and
+    // sanitizing to [a-z0-9]+ tokens keeps to_tsquery syntax-safe. Capped at
+    // 24 words to bound the query.
+    const words = query.toLowerCase().match(/[a-z0-9]+/g) ?? [];
+    const tsQuery = words.slice(0, 24).join(" | ");
+    if (tsQuery) {
+      // Relevance: full-text search across ALL projects - shared memory by
+      // design - with a small same-project boost to break rank ties toward
+      // locally stored memories.
+      rows = await withDeadline(
+        sql`
+        SELECT content, coalesce(tags, '{}') AS tags,
+               to_char(created_at, 'YYYY-MM-DD') AS date
+        FROM memories
+        WHERE search_vector @@ to_tsquery('english', ${tsQuery})
+        ORDER BY ts_rank(search_vector, to_tsquery('english', ${tsQuery}))
+                 + (CASE WHEN project = ${directory} THEN 0.01 ELSE 0 END) DESC,
+                 created_at DESC
+        LIMIT 5
+      ` as unknown as PromiseLike<InjectionRow[]>,
+        1000,
+      );
+      if (rows.length === 0) {
+        // No keyword match for this prompt - recency beats an empty block.
+        rows = await withDeadline(recencyQuery(directory) as unknown as PromiseLike<InjectionRow[]>, 1000);
+      }
+    } else {
+      rows = await withDeadline(recencyQuery(directory) as unknown as PromiseLike<InjectionRow[]>, 1000);
+    }
     const block = formatBlock(rows, directory);
     // Evict oldest entry when cache exceeds 32
     if (injectionCache.size >= 32) {
       const firstKey = injectionCache.keys().next().value;
       if (firstKey !== undefined) injectionCache.delete(firstKey);
     }
-    injectionCache.set(directory, block);
+    injectionCache.set(cacheKey, block);
     if (block) output.system.push(block);
   } catch (e: unknown) {
     logError("inject", `ocpg injection failed: ${e instanceof Error ? e.message : String(e)}`);
@@ -579,8 +650,14 @@ async function updateMemory(
   }
 }
 
+// Clears every cache entry for the directory - relevance mode keys by
+// directory + prompt hash, so a write invalidates them all.
 function invalidateInjection(directory: string): void {
-  injectionCache.delete(directory);
+  for (const key of [...injectionCache.keys()]) {
+    if (key === directory || key.startsWith(`${directory}\u0001`)) {
+      injectionCache.delete(key);
+    }
+  }
 }
 
 // V2 entrypoint: registers the system-context injection hook and the agent tools
@@ -598,10 +675,11 @@ const ocpg = Plugin.define({
     void sql`SELECT 1`.catch(() => {});
 
     // Inject project memories into every model request's system context.
-    // handleTransform owns the per-directory cache (32-slot, invalidated on remember).
+    // Relevance mode derives the retrieval query from the latest user message;
+    // handleTransform owns the cache (32-slot, keyed by directory + prompt).
     await ctx.session.hook("context", async (event) => {
       const output: { system: string[] } = { system: [] };
-      await handleTransform(output, directory);
+      await handleTransform(output, directory, extractPromptQuery(event.messages));
       for (const text of output.system) event.system.push({ type: "text", text });
     });
 
@@ -785,6 +863,14 @@ const __internals = {
   toolError,
   rateLimitOk,
   resetRateLimit,
+  get injectionMode() {
+    return injectionMode;
+  },
+  setInjectionMode(mode: "relevance" | "recency") {
+    injectionMode = mode;
+  },
+  extractPromptQuery,
+  hashQuery,
   get userScope() {
     return userScope;
   },

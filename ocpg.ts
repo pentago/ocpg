@@ -431,6 +431,10 @@ const ocpg = Plugin.define({
     await ctx.tool.transform((editor) => {
       editor.add({
         name: "memory_recall",
+        // Direct (non-codemode) tool: memory ops are single-shot calls, not
+        // scriptable sequences - hiding them behind the execute sandbox only
+        // breaks direct invocation without adding value.
+        options: { codemode: false },
         description:
           "Search past memories stored for this project. Use before non-trivial work to check for relevant lessons, fixes, and decisions.",
         input: {
@@ -455,6 +459,7 @@ const ocpg = Plugin.define({
       });
       editor.add({
         name: "memory_remember",
+        options: { codemode: false },
         // This description is the only place the write policy is guaranteed to
         // reach the model: it is in the tool schema every session, whereas the
         // injected block is skipped entirely for projects with no memories and
@@ -494,6 +499,7 @@ const ocpg = Plugin.define({
       });
       editor.add({
         name: "memory_forget",
+        options: { codemode: false },
         description:
           "Delete a memory of this project by id (get ids from memory_recall). Use for memories that are wrong or obsolete; prefer storing a corrected memory when the old one is still useful history.",
         input: {

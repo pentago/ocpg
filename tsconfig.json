@@ -11,5 +11,5 @@
     "allowImportingTsExtensions": true,
     "verbatimModuleSyntax": true
   },
-  "include": ["ocpg.ts", "tests/**/*.ts"]
+  "include": ["ocpg.ts", "tests/**/*.ts", "bench/**/*.ts"]
 }

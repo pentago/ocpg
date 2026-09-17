@@ -8,7 +8,9 @@
     "check": "biome check .",
     "format": "biome format --write .",
     "typecheck": "tsc --noEmit",
-    "test": "bun test"
+    "test": "bun test",
+    "bench:generate": "bun bench/generate.ts",
+    "bench": "bun bench/run.ts"
   },
   "exports": {
     ".": "./ocpg.ts"

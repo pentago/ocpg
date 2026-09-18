@@ -11,6 +11,14 @@ docker compose up -d
 
 That's it - on first boot the Postgres image creates the database named by `PG_DB`, and the `pg_trgm` extension plus the `memories` table (with full-text search indexes) are added by [`init/01-init.sh`](./init/01-init.sh).
 
+The compose file also includes an optional `ollama` service (the embedding backend for hybrid search). It starts with everything else but does nothing until you pull a model once:
+
+```bash
+docker exec ollama ollama pull bge-m3
+```
+
+CPU-only by default, which suffices - ocpg's embeds are short and rare (~95ms warm, ~1.1s cold load, measured with the shipped 4-CPU limit, vs the plugin's 750ms query budget). A GPU reservation block is commented in `compose.yaml` for hosts with nvidia-container-toolkit; it matters for bulk re-embeds at 50k+ rows, not daily use. Prefer your own host-installed Ollama instead? Just don't start the service - the plugin's defaults (`OCPG_OLLAMA_HOST=localhost`, `OCPG_OLLAMA_PORT=11434`) match either.
+
 ## Upgrading an existing install
 
 `init/01-init.sh` runs **only on first boot** (fresh data dir). Existing installs
@@ -62,9 +70,10 @@ rows (until this runs they are found by keyword search only):
 bun run backfill   # same OCPG_* env as the plugin; idempotent, re-runnable
 ```
 
-Semantic search needs Ollama on the host with the model pulled
-(`ollama pull bge-m3`). Without Ollama everything still works - search just
-stays keyword-only.
+Semantic search needs a reachable Ollama with the model pulled
+(`ollama pull bge-m3`) - host-installed or the compose `ollama` service, the
+plugin defaults match either. Without Ollama everything still works - search
+just stays keyword-only.
 
 `.env` values:
 

@@ -42,6 +42,7 @@ export OCPG_SSL="disable"
 | `OCPG_OLLAMA_HOST` | `localhost` |
 | `OCPG_OLLAMA_PORT` | `11434`    |
 | `OCPG_EMBED_MODEL` | `bge-m3`    |
+| `OCPG_JUDGE_MODEL` | `qwen3:4b`  |
 
 `OCPG_SSL` accepts `disable`, `prefer`, `require`, `verify-ca`, or `verify-full` (anything else falls back to `disable`). It defaults to `disable` for the usual localhost setup - **set it to `require` or stricter whenever `OCPG_HOST` is not local**, otherwise the password handshake crosses the network in plaintext.
 
@@ -87,7 +88,7 @@ If Ollama is unreachable - or the database predates the embedding column - searc
 Five agent tools are registered: `memory_remember` (store), `memory_recall` (search), `memory_forget` (delete by id), `memory_update` (rewrite an existing memory, keeping its original learned date), and `memory_consolidate` (remove near-duplicates on demand). The agent reads their usage rules from the tool schemas - as the user, the things worth knowing are:
 
 - Visibility follows the type (see the table above); `memory_recall` takes `global: true` to also search other projects' `project_fact` memories (global types are always searched regardless of this flag).
-- Duplicate writes are **never rejected** - they land, the injection block collapses them, and `memory_consolidate` cleans them up when you ask: it keeps the newest of each >=80%-similar group and reports the removed texts so the agent can merge any unique fact back.
+- Duplicate writes are **never rejected** - but with a judge model available they may be **skipped as duplicates** or **merged into the existing memory** (the result always says which). Whatever slips through still lands, the injection block collapses near-dupes, and `memory_consolidate` cleans them up when you ask: it keeps the newest of each >=80%-similar group and reports the removed texts so the agent can merge any unique fact back.
 
 Writes are capped at 4000 characters of content, 10 tags, and 64 characters per tag; oversized writes are rejected with the actual size rather than silently truncated. Memories carry a `type` (`preference`, `project_fact` default, `stack_fact`, or `episodic` - see the visibility table above); `preference` memories are surfaced first when browsing without a search query.
 
@@ -96,6 +97,14 @@ Writes are capped at 4000 characters of content, 10 tags, and 64 characters per 
 Saying "remember this/that", "remember to ...", "don't forget ...", or "keep in mind ..." in a prompt stores the text following the phrase verbatim, tagged `user-requested` - matched by a fixed pattern, not an LLM call, so it's deterministic and auditable. Questions using the trigger phrase ("remember when the pool broke?") are deliberately not captured, since they're asking about the past, not asking to store something new - only imperative uses ("remember that when X happens, do Y") trigger it.
 
 This runs alongside the model's own judgment to call `memory_remember` - it doesn't replace it, it's a safety net for the cases where you explicitly signal "this matters" and want it captured regardless of whether the model separately decides to store it.
+
+A third path runs at **session compaction**: when a session's context is summarized, a small judge model reads the transcript and extracts 0-3 durable facts (decisions, root causes, stated preferences, environment facts - never plans, progress, or anything the code already states), each written through the normal write path and tagged `auto`. A trivial session stores nothing, and every judge failure just skips the capture. Compaction itself never waits on this.
+
+### Smart writes (judge model)
+
+Before a `memory_remember` lands, an embedding-similarity prefilter looks for existing memories that might overlap (top 3, cosine >= 0.7 - nothing close means an instant plain insert). On a hit, a small cheap model classifies the write as **new** (insert), **update** (merged into the existing memory, which keeps its learned date), or **duplicate** (skipped). The tool result always says which happened - never a bare success for a write that didn't insert. The judge **never deletes** and never rejects outright: any failure, timeout, or malformed answer falls back to storing normally.
+
+`OCPG_JUDGE_MODEL` picks the judge: a bare name (default `qwen3:4b`) hits the same Ollama as embeddings - pull it alongside bge-m3 (`ollama pull qwen3:4b`); a `provider/model` ref routes through OpenCode's own stack against a model you configured (that spends your provider credits); `"off"` disables smart writes and compaction capture entirely. Without any reachable judge these features silently skip - writes then behave exactly as before.
 
 ### Duplicates
 

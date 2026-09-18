@@ -16,12 +16,32 @@ const vectorReady = await __internals
   .catch(() => false);
 const hybridReady = ollamaUp && vectorReady;
 
+// Judge integration tests need the judge model installed on the same Ollama
+// the embeddings use. A slash-ref (OpenCode provider/model) can't be probed
+// here, and CI has no Ollama at all - both skip.
+const JUDGE_MODEL_NAME = process.env.OCPG_JUDGE_MODEL || "qwen3:4b";
+const judgeReady =
+  hybridReady &&
+  !JUDGE_MODEL_NAME.includes("/") &&
+  (await fetch(`${__internals.ollamaBase}/api/tags`, { signal: AbortSignal.timeout(1500) })
+    .then((r) => (r.ok ? r.json() : null))
+    .then((d) =>
+      ((d as { models?: { name: string }[] } | null)?.models ?? []).some(
+        (m) => m.name === JUDGE_MODEL_NAME || m.name === `${JUDGE_MODEL_NAME}:latest`,
+      ),
+    )
+    .catch(() => false));
+
 // Self-seeded fixture. The suite used to assert against a hardcoded personal
 // project dir, so it only passed on one machine with the right rows already in
 // the DB; now it creates and removes what it needs.
 const FIXTURE_PROJECT = "/tmp/ocpg-test-fixture";
 
 beforeAll(async () => {
+  // Deterministic base state: with the judge off, remember() is exactly the
+  // old plain-insert path, which every pre-smart-write test relies on. The
+  // smart-write describe re-enables it behind its own skipIf.
+  __internals.setJudgeModel("off");
   await __internals.sql`DELETE FROM memories WHERE project = ${FIXTURE_PROJECT}`;
   for (const [i, content] of [
     "Fixture memory one: the build uses bun and has no lint step.",
@@ -1354,6 +1374,266 @@ describe("DB access layer", () => {
         __internals.invalidateInjection(ctx.directory);
       }
     });
+  });
+
+  describe("smart writes: verdict parsing (no infra)", () => {
+    test("accepts the three valid verdict forms", () => {
+      expect(__internals.parseWriteVerdict('{"verdict":"new"}', [1, 2])).toEqual({ verdict: "new" });
+      expect(__internals.parseWriteVerdict('{"verdict":"duplicate","id":2}', [1, 2])).toEqual({ verdict: "duplicate", id: 2 });
+      expect(
+        __internals.parseWriteVerdict('{"verdict":"update","id":1,"merged_content":"A merged memory with enough chars."}', [1, 2]),
+      ).toEqual({ verdict: "update", id: 1, mergedContent: "A merged memory with enough chars." });
+    });
+
+    test("extracts JSON from surrounding chatter", () => {
+      expect(__internals.parseWriteVerdict('Here is my answer: {"verdict":"duplicate","id":1} done.', [1])).toEqual({
+        verdict: "duplicate",
+        id: 1,
+      });
+    });
+
+    test("rejects hallucinated ids, malformed JSON, and unknown verdicts", () => {
+      expect(__internals.parseWriteVerdict('{"verdict":"duplicate","id":9}', [1, 2])).toBe(null);
+      expect(__internals.parseWriteVerdict("not json at all", [1])).toBe(null);
+      expect(__internals.parseWriteVerdict('{"verdict":"maybe"}', [1])).toBe(null);
+      expect(__internals.parseWriteVerdict('{"verdict":"duplicate"}', [1])).toBe(null);
+    });
+
+    test("rejects update without sane merged_content (falls back to insert)", () => {
+      expect(__internals.parseWriteVerdict('{"verdict":"update","id":1}', [1])).toBe(null);
+      expect(__internals.parseWriteVerdict('{"verdict":"update","id":1,"merged_content":"short"}', [1])).toBe(null);
+      expect(__internals.parseWriteVerdict(`{"verdict":"update","id":1,"merged_content":"${"x".repeat(4001)}"}`, [1])).toBe(null);
+    });
+  });
+
+  describe("compaction capture: fact parsing (no infra)", () => {
+    test("parses valid facts with type and tags", () => {
+      const raw = JSON.stringify({
+        facts: [
+          { content: "The staging database was moved to port 5433 after the proxy change.", type: "project_fact", tags: ["env", "db"] },
+          { content: "User prefers biome over prettier for every TS project.", type: "preference" },
+        ],
+      });
+      const facts = __internals.parseExtractedFacts(raw);
+      expect(facts.length).toBe(2);
+      expect(facts[0]).toEqual({
+        content: "The staging database was moved to port 5433 after the proxy change.",
+        type: "project_fact",
+        tags: ["env", "db"],
+      });
+      expect(facts[1].type).toBe("preference");
+      expect(facts[1].tags).toEqual([]);
+    });
+
+    test("empty facts, garbage, and wrong shapes all yield nothing", () => {
+      expect(__internals.parseExtractedFacts('{"facts":[]}')).toEqual([]);
+      expect(__internals.parseExtractedFacts("no json here")).toEqual([]);
+      expect(__internals.parseExtractedFacts('{"facts":"nope"}')).toEqual([]);
+    });
+
+    test("caps at 3 facts and drops invalid entries", () => {
+      const fact = (c: string) => ({ content: c });
+      const raw = JSON.stringify({
+        facts: [
+          fact("Fact one: the build cache lives under .cache/bazel."),
+          fact("tiny"),
+          fact(42 as unknown as string),
+          fact("Fact two: deployments need a manual approval gate."),
+          fact("Fact three: the runner image is rebuilt every Sunday."),
+          fact("Fact four must be dropped by the cap, not stored."),
+        ],
+      });
+      const facts = __internals.parseExtractedFacts(raw);
+      expect(facts.length).toBe(3);
+      expect(facts.map((f) => f.content).join(" ")).not.toContain("Fact four");
+    });
+
+    test("tags are filtered to leave room for the auto tag; unknown types default", () => {
+      const raw = JSON.stringify({
+        facts: [
+          {
+            content: "A fact with far too many tags attached to it for the cap.",
+            type: "nonsense",
+            tags: [...Array.from({ length: 12 }, (_, i) => `t${i}`), "", "7"],
+          },
+        ],
+      });
+      const facts = __internals.parseExtractedFacts(raw);
+      expect(facts.length).toBe(1);
+      expect(facts[0].type).toBe("project_fact");
+      // MAX_TAGS - 1 = 9: the caller appends "auto" as the tenth.
+      expect(facts[0].tags.length).toBe(9);
+    });
+
+    test("renderTranscript keeps text, marks tool calls, and tail-biases the cap", () => {
+      const messages = [
+        { role: "user", content: [{ type: "text", text: "x".repeat(20_000) }] },
+        { role: "assistant", content: [{ type: "tool-call", name: "edit" }, { type: "text", text: "tail text" }] },
+        { role: "assistant", content: [{ type: "tool-result", result: { type: "text", value: "huge output" } }] },
+      ];
+      const out = __internals.renderTranscript(messages);
+      expect(out.length).toBeLessThanOrEqual(16_000 + 60);
+      expect(out).toContain("[...earlier messages omitted...]");
+      expect(out).toContain("tail text");
+      expect(out).toContain("[tool: edit]");
+      // Tool results are dropped entirely.
+      expect(out).not.toContain("huge output");
+    });
+  });
+
+  describe("smart writes (judge integration)", () => {
+    const project = "/tmp/ocpg-test-judge";
+    const ctx = { directory: project, sessionID: "judge" };
+
+    // Skipped unless the judge model is actually installed (see probe above).
+    // Generous timeout: the first judge call pays the cold model load.
+    test.skipIf(!judgeReady)("a verbatim restatement is not stored twice", async () => {
+      __internals.setJudgeModel(JUDGE_MODEL_NAME);
+      try {
+        await __internals.sql`DELETE FROM memories WHERE project = ${project}`;
+        const original = "Judge fixture: the CI pipeline runs bun test against a live Postgres before any merge.";
+        const inserted = await __internals.sql`
+          INSERT INTO memories (content, tags, session_id, project)
+          VALUES (${original}, ${__internals.sql.array(["__internals-test"], "text")}, 'judge-fixture', ${project})
+          RETURNING id
+        ` as { id: number }[];
+        await __internals.embedAndStore(inserted[0].id, original);
+
+        const countBefore = (await __internals.sql`SELECT count(*) AS n FROM memories WHERE project = ${project}`)[0];
+        // Same fact, different words: an obvious duplicate the judge must catch.
+        const result = await __internals.remember(
+          { content: "Before any merge, CI runs bun test against a live Postgres database." },
+          ctx,
+        );
+        const countAfter = (await __internals.sql`SELECT count(*) AS n FROM memories WHERE project = ${project}`)[0];
+
+        // The honest-message contract: never a bare success for a write that
+        // did not insert. A merge keeps the row count flat too.
+        expect(result).not.toContain("Stored memory #");
+        expect(result.match(/Not stored: #\d+|Merged into memory #\d+/)).not.toBe(null);
+        expect(Number(countAfter.n)).toBe(Number(countBefore.n));
+      } finally {
+        await __internals.sql`DELETE FROM memories WHERE project = ${project}`;
+        __internals.invalidateInjection(project);
+        __internals.setJudgeModel("off");
+      }
+    }, 60_000);
+
+    test.skipIf(!judgeReady)("a clearly new fact still stores", async () => {
+      __internals.setJudgeModel(JUDGE_MODEL_NAME);
+      try {
+        const result = await __internals.remember(
+          { content: `Distinct probe ${Date.now()}: the label printer on the desk prints QR codes for hardware swaps.` },
+          ctx,
+        );
+        expect(result).toContain("Stored memory #");
+      } finally {
+        await __internals.sql`DELETE FROM memories WHERE project = ${project}`;
+        __internals.invalidateInjection(project);
+        __internals.setJudgeModel("off");
+      }
+    }, 30_000);
+
+    test("with the judge off, a near-duplicate stores like before (kill switch)", async () => {
+      __internals.setJudgeModel("off");
+      try {
+        const a = await __internals.remember(
+          { content: "Kill-switch fixture: the metrics endpoint is /internal/metrics, not /metrics." },
+          ctx,
+        );
+        const b = await __internals.remember(
+          { content: "The metrics endpoint is /internal/metrics rather than /metrics." },
+          ctx,
+        );
+        expect(a).toContain("Stored memory #");
+        expect(b).toContain("Stored memory #");
+      } finally {
+        await __internals.sql`DELETE FROM memories WHERE project = ${project}`;
+        __internals.invalidateInjection(project);
+      }
+    });
+
+    test("a dead judge degrades to a plain insert, never a lost write", async () => {
+      const realBase = __internals.ollamaBase;
+      __internals.setJudgeModel(JUDGE_MODEL_NAME.includes("/") ? "qwen3:4b" : JUDGE_MODEL_NAME);
+      __internals.setOllamaBase("http://127.0.0.1:9");
+      try {
+        const result = await __internals.remember(
+          { content: `Degradation probe ${Date.now()}: nothing may eat this write.` },
+          ctx,
+        );
+        expect(result).toContain("Stored memory #");
+      } finally {
+        __internals.setOllamaBase(realBase);
+        __internals.setJudgeModel("off");
+        await __internals.sql`DELETE FROM memories WHERE project = ${project}`;
+        __internals.invalidateInjection(project);
+      }
+    });
+  });
+
+  describe("compaction capture", () => {
+    const project = "/tmp/ocpg-test-capture";
+    const transcript = (userText: string) => [
+      { role: "user", content: [{ type: "text", text: userText }] },
+      {
+        role: "assistant",
+        content: [
+          { type: "tool-call", name: "edit" },
+          { type: "text", text: `Done - applied the change and verified it against the runbook. ${"Checked the surrounding config too. ".repeat(6)}` },
+        ],
+      },
+    ];
+
+    test("judge off or a stub transcript captures nothing", async () => {
+      __internals.setJudgeModel("off");
+      await __internals.sql`DELETE FROM memories WHERE project = ${project}`;
+      try {
+        // Judge disabled.
+        await __internals.captureFromCompaction(
+          transcript(`We decided the deploy window moves to Fridays 10-12 UTC because support is staffed then. ${"Padding the exchange so the floor passes. ".repeat(4)}`),
+          project,
+          "cap-1",
+        );
+        // Below the transcript floor (judge state irrelevant).
+        await __internals.captureFromCompaction(transcript("hi"), project, "cap-2");
+        const rows = await __internals.sql`SELECT count(*) AS n FROM memories WHERE project = ${project}`;
+        expect(Number(rows[0].n)).toBe(0);
+      } finally {
+        await __internals.sql`DELETE FROM memories WHERE project = ${project}`;
+      }
+    });
+
+    test.skipIf(!judgeReady)("an explicit decision is captured with the auto tag, through the write path", async () => {
+      __internals.setJudgeModel(JUDGE_MODEL_NAME);
+      try {
+        await __internals.sql`DELETE FROM memories WHERE project = ${project}`;
+        await __internals.captureFromCompaction(
+          transcript(
+            "We decided to move the deploy window to Fridays 10-12 UTC, because support is fully staffed then and the Tuesday slot collided with the ops standup. " +
+              "This settled the recurring scheduling debate after the failed Tuesday deploy. ".repeat(3),
+          ),
+          project,
+          "cap-3",
+        );
+        const rows = await __internals.sql`SELECT content, tags FROM memories WHERE project = ${project}` as {
+          content: string;
+          tags: string[];
+        }[];
+        // The judge decides how much it finds - 0 is a legitimate outcome -
+        // but anything stored MUST carry the auto tag and pass write
+        // validation (the content bounds).
+        for (const row of rows) {
+          expect(row.tags).toContain("auto");
+          expect(row.content.length).toBeGreaterThanOrEqual(10);
+        }
+        console.log(`capture stored ${rows.length} fact(s)`);
+      } finally {
+        await __internals.sql`DELETE FROM memories WHERE project = ${project}`;
+        __internals.invalidateInjection(project);
+        __internals.setJudgeModel("off");
+      }
+    }, 60_000);
   });
 });
 

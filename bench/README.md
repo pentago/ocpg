@@ -252,3 +252,22 @@ ollama call in this row; the production cost is one ~20ms warm embed
 overlapped with the keyword query plus a sub-ms merge. A cold bge-m3 load is
 ~2-3s (over the 1s injection deadline), so the plugin warms the model at
 session start and pins it with `keep_alive`.
+
+### Backend comparison (2026-09-18, `bun bench/ollama-backends.ts`, live 475-row DB)
+
+Host Ollama on the RTX 5070 vs the containerized CPU-only service
+(`deploy/compose.yaml` ollama, 4-CPU/4GB limit, ollama/ollama:0.34.2), same
+bge-m3, measured on the paths the plugin actually pays:
+
+| metric | host-gpu | container-cpu |
+| ------ | -------- | ------------- |
+| cold model load | 2877ms | 1105ms |
+| warm single embed p50 / p95 | 20.6 / 29.3ms | 92.9 / 96.7ms |
+| 32-text batch (write/backfill shape) | 263ms | 3092ms |
+| hybrid path (embed + HNSW query) p50 / p95 | 22.0 / 41.5ms | 94.4 / 98.9ms |
+
+Reading: CPU suffices for daily ocpg use - the warm ~95ms embed fits the
+750ms query budget with 7x headroom, and the cold load is actually faster on
+CPU (no VRAM transfer; both exceed 750ms, which is why the plugin warms the
+model at setup). GPU earns its place only on bulk re-embeds: ~97ms/row CPU vs
+~8ms/row GPU at batch-32, i.e. a 50k-row re-embed is ~80min vs ~7min.

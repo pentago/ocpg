@@ -13,6 +13,7 @@
     "bench:thesaurus": "bun bench/generate-thesaurus.ts",
     "bench": "bun bench/run.ts",
     "bench:embed": "OCPG_USER=ocpguser OCPG_PORT=5433 OCPG_PASSWORD=bench bun bench/embed.ts",
+    "bench:backends": "bun bench/ollama-backends.ts",
     "backfill": "bun deploy/backfill.ts"
   },
   "exports": {

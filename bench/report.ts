@@ -117,7 +117,7 @@ async function realSide(): Promise<RealSummary> {
       }>;
       if (kwRows.slice(0, 5).some((r) => r.content === content)) kw++;
       if (emRows.slice(0, 5).some((r) => r.content === content)) em++;
-      if (__internals.rrfMerge([kwRows, emRows]).slice(0, 5).some((r) => r.content === content)) hy++;
+      if (__internals.hybridMerge(kwRows, emRows).slice(0, 5).some((r) => r.content === content)) hy++;
     }
     console.log(`paraphrase hit@5 over ${run} pairs (${clean} lexically clean): keyword ${kw}/${run} | embedding ${em}/${run} | hybrid ${hy}/${run}`);
 
@@ -142,7 +142,7 @@ async function realSide(): Promise<RealSummary> {
       const kwRows = await __internals.buildRelevanceQuery(db, tsq, dir);
       const [v2] = await pending;
       const emRows = await __internals.buildVectorQuery(db, __internals.vectorLiteral(v2), dir);
-      __internals.rrfMerge([kwRows, emRows]);
+      __internals.hybridMerge(kwRows, emRows);
       lat.hybrid.push(performance.now() - t);
     }
     for (const xs of Object.values(lat)) xs.sort((a, b) => a - b);
@@ -237,9 +237,9 @@ async function benchSide(): Promise<BenchSummary> {
       { name: "fts-or (prod)", run: kwRun },
       { name: "embed-bge-m3", run: vectorRun },
       {
-        name: "hybrid-rrf",
+        name: "hybrid (prod)",
         run: async (c: SQL, q: string, d: string) =>
-          __internals.rrfMerge([await kwRun(c, q, d), await vectorRun(c, q, d)]).slice(0, 5),
+          __internals.hybridMerge(await kwRun(c, q, d), await vectorRun(c, q, d)).slice(0, 5),
       },
     ];
 
@@ -288,10 +288,10 @@ searching with a reworded version of a memory finds the original in the top 5: \
 hybrid ${real.hy}/${real.run}, embedding-only ${real.em}/${real.run}, keyword-only ${real.kw}/${real.run} \
 (${real.clean} of the ${real.run} pairs share no wording with the target, so keyword had no chance there). \
 ${real.em > real.hy
-    ? `Embedding-only beats hybrid on these reworded real queries - structural cause: unlike the synthetic bench (whose paraphrase queries are keyword-empty by construction), real paraphrases still keyword-match unrelated memories, and equal-weight RRF lets that keyword noise outrank vector-only hits, diluting the top 5. A weight sweep over the vector half (1.5x/2x/3x, bench/rrf-weights.ts) does NOT fix it: rows present in both candidate lists get boosted by both terms at any weight, so the real rate stays 8-9/20 while synthetic direct recall drops .503->.469 - equal weight stays. `
+    ? `Embedding-only beats hybrid on these reworded real queries - structural cause: unlike the synthetic bench (whose paraphrase queries are keyword-empty by construction), real paraphrases still keyword-match unrelated memories, and equal-weight RRF lets that keyword noise outrank vector-only hits, diluting the top 5. The shipped fix is 2 unconditionally reserved vector slots (hybridMerge, bench/rrf-slots.ts: zero synthetic-direct cost); weighting the vector half was swept and rejected - rows present in both lists win at any weight. `
     : ""}\
-On the synthetic 50k dataset: hybrid recall@5 ${bench["hybrid-rrf"].recall.toFixed(3)} vs \
+On the synthetic 50k dataset: hybrid recall@5 ${bench["hybrid (prod)"].recall.toFixed(3)} vs \
 keyword ${bench["fts-or (prod)"].recall.toFixed(3)} and embedding-only ${bench["embed-bge-m3"].recall.toFixed(3)}, \
-paraphrase recall ${bench["hybrid-rrf"].para.toFixed(3)} vs ${bench["fts-or (prod)"].para.toFixed(3)} for keyword. \
+paraphrase recall ${bench["hybrid (prod)"].para.toFixed(3)} vs ${bench["fts-or (prod)"].para.toFixed(3)} for keyword. \
 Latency on the live table (n=30): ${real.latency} - the warm embed call dominates and stays far inside the 1s \
 injection deadline.`);

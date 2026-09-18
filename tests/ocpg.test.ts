@@ -191,7 +191,10 @@ describe("DB access layer", () => {
         await __internals.handleTransform(cold, project);
         expect(cold.system.join("")).not.toContain(marker);
 
-        await __internals.remember({ content: `Invalidation probe ${marker}` }, { directory: project, sessionID: "sess-a" });
+        // The probe is a preference so the real corpus (7+ global preference
+        // rows, which fill the 5-slot recency-fallback block) cannot crowd it
+        // out - a fresh preference is always the newest of its type, slot 1.
+        await __internals.remember({ content: `Invalidation probe ${marker}`, type: "preference" }, { directory: project, sessionID: "sess-a" });
 
         // A write from one session must be visible to every other session in
         // the project, not just the one that wrote it.
@@ -346,7 +349,10 @@ describe("DB access layer", () => {
       const project = "/tmp/ocpg-test-forget";
       const marker = `zzzforget${Date.now()}`;
       try {
-        const stored = await __internals.remember({ content: `Obsolete note ${marker}` }, { directory: project, sessionID: "fg" });
+        // Preference type: the recency-fallback block is preferences-first and
+        // the live corpus has 7+ of them, so a project_fact probe would never
+        // reach the top 5 (corpus-dependent test rot).
+        const stored = await __internals.remember({ content: `Obsolete note ${marker}`, type: "preference" }, { directory: project, sessionID: "fg" });
         const id = Number(stored.match(/#(\d+)/)?.[1]);
 
         // Warm the injection cache so the delete has something to invalidate.
@@ -544,8 +550,12 @@ describe("DB access layer", () => {
         await __internals.handleTransform(output, ctx.directory);
         const block = output.system[0];
         expect(block).toContain("never amend pushed commits");
-        const prefIdx = block.indexOf("never amend pushed commits");
-        const factIdx = block.indexOf("Recent project fact");
+        // Ordering is asserted at the query level: the 5-slot block is full of
+        // the real corpus's global preference rows, so a fixture project_fact
+        // never renders - but the 20-row candidate slice contains both.
+        const rows = await __internals.buildRecencyQuery(__internals.sql, ctx.directory) as unknown as { content: string }[];
+        const prefIdx = rows.findIndex((r) => r.content.includes("never amend pushed commits"));
+        const factIdx = rows.findIndex((r) => r.content.includes("Recent project fact"));
         expect(prefIdx).toBeGreaterThan(-1);
         expect(factIdx).toBeGreaterThan(-1);
         expect(prefIdx).toBeLessThan(factIdx);
@@ -676,7 +686,9 @@ describe("DB access layer", () => {
     test("an update invalidates the injected block", async () => {
       const marker = `zzzupdate${Date.now()}`;
       try {
-        const stored = await __internals.remember({ content: `Original note ${marker}` }, ctx);
+        // Preference type: the recency-fallback block is preferences-first and
+        // the live corpus fills it - a project_fact marker would never render.
+        const stored = await __internals.remember({ content: `Original note ${marker}`, type: "preference" }, ctx);
         const id = Number(stored.match(/#(\d+)/)?.[1]);
         const before: { system: string[] } = { system: [] };
         await __internals.handleTransform(before, ctx.directory);
@@ -698,11 +710,15 @@ describe("DB access layer", () => {
     const ctx = { directory: "/tmp/ocpg-test-access", sessionID: "access-t" };
 
     test("recall bumps access_count + last_accessed_at of returned rows", async () => {
+      const marker = `zzzaccess${Date.now()}`;
       try {
-        const stored = await __internals.remember({ content: "Access tracking probe for the recall bump." }, ctx);
+        const stored = await __internals.remember({ content: `Access tracking probe ${marker} for the recall bump.` }, ctx);
         const id = Number(stored.match(/#(\d+)/)?.[1]);
-        await __internals.recall({}, ctx);
-        await __internals.recall({}, ctx);
+        // Queried recall, not a browse: undirected browse returns the top-5 by
+        // preference-then-recency, which the live corpus's global preferences
+        // fill entirely - the fixture would never be a returned row to bump.
+        await __internals.recall({ query: marker }, ctx);
+        await __internals.recall({ query: marker }, ctx);
         // Fire-and-forget: give the abandoned UPDATE a beat to land.
         await new Promise((r) => setTimeout(r, 50));
         const [row] = await __internals.sql`
@@ -775,6 +791,12 @@ describe("DB access layer", () => {
     });
 
     test("an old relevant memory outranks newer irrelevant ones", async () => {
+      // Vector half off (same pattern as the prompt-cache test below):
+      // hybridMerge's 2 reserved vector slots are filled by nearest-neighbor
+      // noise from the live 475-row corpus and can displace the fixture -
+      // this test's subject is keyword relevance vs recency, not the merge.
+      const savedBase = __internals.ollamaBase;
+      __internals.setOllamaBase("http://127.0.0.1:9");
       try {
         // Filler memories newer than the relevant one: recency would pick these.
         const topics = ["widgets", "gadgets", "gizmos", "doodads", "doohickeys", "contraptions"];
@@ -796,6 +818,7 @@ describe("DB access layer", () => {
         // The relevant old memory is listed before newer filler would be under recency.
         if (fillerIdx > -1) expect(relIdx).toBeLessThan(fillerIdx);
       } finally {
+        __internals.setOllamaBase(savedBase);
         await __internals.sql`DELETE FROM memories WHERE project = '/tmp/ocpg-test-relevance-old'`;
         __internals.invalidateInjection("/tmp/ocpg-test-relevance-old");
       }
@@ -852,7 +875,10 @@ describe("DB access layer", () => {
       const savedBase = __internals.ollamaBase;
       __internals.setOllamaBase("http://127.0.0.1:9");
       try {
-        await __internals.remember({ content: "Sole memory of the fallback probe project." }, ctx);
+        // Preference type: the fallback block is preferences-first and the
+        // live corpus fills it with global preference rows - a project_fact
+        // probe would never render (corpus-dependent test rot).
+        await __internals.remember({ content: "Sole memory of the fallback probe project.", type: "preference" }, ctx);
         __internals.invalidateInjection(ctx.directory);
         const output: { system: string[] } = { system: [] };
         await __internals.handleTransform(output, ctx.directory, ask("xqzzyblorpn kwintavex blorptonic qwertyuiopas"));
@@ -1067,8 +1093,19 @@ describe("DB access layer", () => {
         await __internals.captureFromPrompt("remember that the release checklist lives in RELEASING.md", project, "sess-capture");
         const [n] = await __internals.sql`SELECT count(*) AS n FROM memories WHERE project = ${project}` as { n: string }[];
         expect(Number(n.n)).toBe(2);
+        // The collapse assertion uses a relevance prompt: the no-prompt
+        // recency block is preferences-first and the live corpus's global
+        // preferences fill it, so a fixture project_fact never renders there.
+        // The mode is set explicitly because the relevance describe's afterAll
+        // flips the module default to recency (file-order state).
+        const savedMode = __internals.injectionMode;
+        __internals.setInjectionMode("relevance");
         const block: { system: string[] } = { system: [] };
-        await __internals.handleTransform(block, project);
+        try {
+          await __internals.handleTransform(block, project, "release checklist RELEASING");
+        } finally {
+          __internals.setInjectionMode(savedMode);
+        }
         const occurrences = block.system.join("").split("release checklist lives in RELEASING.md").length - 1;
         expect(occurrences).toBe(1);
 

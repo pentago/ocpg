@@ -15,6 +15,7 @@
     "bench:embed": "OCPG_USER=ocpguser OCPG_PORT=5433 OCPG_PASSWORD=bench bun bench/embed.ts",
     "bench:backends": "bun bench/ollama-backends.ts",
     "bench:report": "bun bench/report.ts",
+    "bench:rrf-weights": "bun bench/rrf-weights.ts",
     "backfill": "bun deploy/backfill.ts"
   },
   "exports": {

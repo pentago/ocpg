@@ -17,6 +17,7 @@ import { SQL } from "bun";
 import ocpg from "../ocpg.ts";
 import { PROJECTS, pick, rng } from "./config.ts";
 import { type BenchRow, type Case, buildCorpusWords, buildMix, buildTopicIds, sanitizeOr, score } from "./lib.ts";
+import { PAIRS } from "./paraphrase-pairs.ts";
 
 const { __internals } = ocpg;
 
@@ -51,32 +52,6 @@ const pct = (sorted: number[], q: number) => sorted[Math.min(sorted.length - 1, 
 
 // ---------------------------------------------------------------- real side
 
-// 20 curated real memories + a hand-written paraphrase query each (baked
-// 2026-09-18). Paraphrases avoid the target's content words; the script
-// reports how many pairs were lexically clean (keyword engine cannot match
-// the target at all) vs how many share enough wording for keyword hits.
-const PAIRS: Record<number, { q: string; content: string }> = {
-  "402": { q: "why does the machine fail to wake from hibernation when I pass the volume's unique identifier", content: "User specifies the resume kernel parameter must be set to /dev/mapper/cryptswap instead of resume=UUID, because the LUKS container UUID differs from the swap partition UUID." },
-  "407": { q: "issues when suspend-to-disk meets a fully scrambled disk", content: "Pitfalls identified for combining systemd‑boot, sd‑encrypt, encrypted swap and resume (2024‑2026): no extra resume hook needed; UEFI HibernateLocation variable may be set but explicit resume= is still required; fstab must reference /dev/mapper/cryptswap; cleanup should close cryptswap; /dev/urandom swap is incompatible with hibernation; mkinitcpio hooks are already correct." },
-  "962": { q: "the review has to use the prescribed checklist layout with item seven skipped", content: "User requires the audit output to follow the exact audit schema format, covering test cases TC‑1 through TC‑8 for each environment, with TC‑7 marked as N/A." },
-  "396": { q: "the async job finished registering the new project roster entry", content: "Background task bg_e40e7b75 successfully created the team member hyperplan-encrypted-swap/heretic." },
-  "406": { q: "how to keep the early-boot encrypted volume table synced with the declarative system-config tool", content: "aconfmgr can manage /etc/crypttab.initramfs via a CopyFile or CreateFile directive; the bootstrap script should generate the file during chroot and post‑install must copy the full two‑entry version to preserve the swap mapping across aconfmgr apply." },
-  "960": { q: "the review should diff both deployments for autoscaling, traffic routing and volume claim equivalence", content: "User wants the audit to compare environment variables, secret chains, ServiceAccount annotations, presence of HorizontalPodAutoscalers, VirtualService parity, imageUpdater parity, PersistentVolume/PersistentVolumeClaim parity, and any regression in resource‑kind definitions." },
-  "201": { q: "the remark above the systems-language install entry describes the wrong tool", content: "Surviving finding: the comment for AddPackage rust at 10‑packages‑core.sh line 105 incorrectly describes reflector; recommendation is to replace it with '# Rust programming language'." },
-  "212": { q: "the exclusion glob catching every hyphenated name under the config root is dangerous", content: "The IgnorePath rule `/etc/*-` (line 21) matches any file or directory under `/etc/` ending with a hyphen, which is risky; it should be replaced with explicit patterns for known backup files." },
-  "1000": { q: "verify none of the chart inputs set deployment labels or pin container versions", content: "User wants to confirm that across the 32 values files there are no argocd.argoproj.io/sync‑options annotations, no revisionHistoryLimit keys, imageTag values are empty strings, block ordering is correct, and workload‑identity injection is present." },
-  "210": { q: "the mkdir-style rule for the audio daemon's drop-in folder feeds the later file copy", content: "The `CreateDir /etc/wireplumber/wireplumber.conf.d` entry (line 79 of `25-config-sys.sh`) correctly creates the required directory for the subsequent CopyFile." },
-  "950": { q: "the forge's browser interface won't let you seed a merge proposal headline through address-bar arguments", content: "User clarified that GitHub’s web UI does not support pre‑filling a pull‑request title via URL query parameters in the `/compare` endpoint." },
-  "202": { q: "a terminal emulator is named as essential in the instructions doc but never actually installed", content: "Surviving finding: AGENTS.md line 274 mentions alacritty as a key tool, but the package is absent from all .sh files; recommendation is to delete alacritty from the key tools list." },
-  "984": { q: "make one branch that handles both upgrade paths", content: "User proposes creating an if/then condition that covers both migration cases." },
-  "408": { q: "keep sleep-to-disk enabled since the paging partition was sized for it", content: "Recommendation: retain hibernation support (resume=) because the existing 20 GB swap size is intended for it and encrypted swap with the correct resume target works reliably." },
-  "991": { q: "move both sites' apps off the per-namespace credential store onto the shared one", content: "User wants to drop secretStores and point to ClusterSecretStores for both landsbjorg staging/production and vedurstofan test applications." },
-  "912": { q: "which compositor settings control split widths and middle placement of the active pane", content: "Global layout options include `preset‑column‑widths`, `default‑column‑width`, `preset‑window‑heights`, `center‑focused‑column`, `always‑center‑single‑column`, and `default‑column‑display \"tabbed\"`, which apply to all workspaces unless overridden." },
-  "204": { q: "the vpn vendor's config directory exclusion may no longer match anything on disk", content: "Surviving finding: the IgnorePath '/etc/Proton' in 00‑ignores.sh may be stale because no Proton package creates this path; recommendation is to verify its existence on the system and remove it if absent." },
-  "981": { q: "when checking two environments for drift, output only the asked report shape and change nothing", content: "For parity audits in this repo, the user wants the exact requested audit schema format with facts only and no file edits." },
-  "404": { q: "the first-look writeup about suspend-to-disk cites distro documentation and manuals", content: "Researcher delivered a Round‑1 findings memo on encrypted swap and hibernation for Arch Linux, citing Arch Wiki pages and man pages accessed in July 2026." },
-  "395": { q: "an automation run claimed done but had actually spun forever calling the roster api", content: "Background task bg_20b72624 to create team member hyperplan-encrypted-swap/cryptarch was reported as completed but also cancelled because the subagent called team_task_list ten consecutive times, indicating an infinite loop." },
-};
 
 type RealSummary = {
   rows: number;
@@ -313,7 +288,7 @@ searching with a reworded version of a memory finds the original in the top 5: \
 hybrid ${real.hy}/${real.run}, embedding-only ${real.em}/${real.run}, keyword-only ${real.kw}/${real.run} \
 (${real.clean} of the ${real.run} pairs share no wording with the target, so keyword had no chance there). \
 ${real.em > real.hy
-    ? `Embedding-only beats hybrid on these reworded real queries - structural cause: unlike the synthetic bench (whose paraphrase queries are keyword-empty by construction), real paraphrases still keyword-match unrelated memories, and equal-weight RRF lets that keyword noise outrank vector-only hits, diluting the top 5. `
+    ? `Embedding-only beats hybrid on these reworded real queries - structural cause: unlike the synthetic bench (whose paraphrase queries are keyword-empty by construction), real paraphrases still keyword-match unrelated memories, and equal-weight RRF lets that keyword noise outrank vector-only hits, diluting the top 5. A weight sweep over the vector half (1.5x/2x/3x, bench/rrf-weights.ts) does NOT fix it: rows present in both candidate lists get boosted by both terms at any weight, so the real rate stays 8-9/20 while synthetic direct recall drops .503->.469 - equal weight stays. `
     : ""}\
 On the synthetic 50k dataset: hybrid recall@5 ${bench["hybrid-rrf"].recall.toFixed(3)} vs \
 keyword ${bench["fts-or (prod)"].recall.toFixed(3)} and embedding-only ${bench["embed-bge-m3"].recall.toFixed(3)}, \

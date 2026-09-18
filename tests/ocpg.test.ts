@@ -4,6 +4,18 @@ import ocpg from "../ocpg";
 const { __internals } = ocpg;
 import { SQL } from "bun";
 
+// Hybrid integration tests need both halves live: a reachable Ollama and the
+// pgvector column. Probed once at module load; without either, those tests
+// skip (CI runs without Ollama; a pre-migration database has no column).
+const ollamaUp = await fetch(`${__internals.ollamaBase}/api/tags`, { signal: AbortSignal.timeout(1500) })
+  .then((r) => r.ok)
+  .catch(() => false);
+const vectorReady = await __internals
+  .sql`SELECT 1 AS ok FROM information_schema.columns WHERE table_name = 'memories' AND column_name = 'embedding'`
+  .then((r) => r.length > 0)
+  .catch(() => false);
+const hybridReady = ollamaUp && vectorReady;
+
 // Self-seeded fixture. The suite used to assert against a hardcoded personal
 // project dir, so it only passed on one machine with the right rows already in
 // the DB; now it creates and removes what it needs.
@@ -807,13 +819,22 @@ describe("DB access layer", () => {
       }
     });
 
-    test("a no-match prompt falls back to recency instead of injecting nothing", async () => {
-      await __internals.remember({ content: "Sole memory of the fallback probe project." }, ctx);
-      __internals.invalidateInjection(ctx.directory);
-      const output: { system: string[] } = { system: [] };
-      await __internals.handleTransform(output, ctx.directory, ask("xqzzyblorpn kwintavex blorptonic qwertyuiopas"));
-      expect(output.system.length).toBe(1);
-      expect(output.system[0]).toContain("Sole memory of the fallback probe project");
+    test("a no-match prompt with no retrieval signal falls back to recency instead of injecting nothing", async () => {
+      // The vector half counts as a signal (zero-overlap paraphrases are its
+      // whole job), so the recency fallback only fires with embeddings
+      // unavailable - simulated by pointing the embed client at a dead endpoint.
+      const savedBase = __internals.ollamaBase;
+      __internals.setOllamaBase("http://127.0.0.1:9");
+      try {
+        await __internals.remember({ content: "Sole memory of the fallback probe project." }, ctx);
+        __internals.invalidateInjection(ctx.directory);
+        const output: { system: string[] } = { system: [] };
+        await __internals.handleTransform(output, ctx.directory, ask("xqzzyblorpn kwintavex blorptonic qwertyuiopas"));
+        expect(output.system.length).toBe(1);
+        expect(output.system[0]).toContain("Sole memory of the fallback probe project");
+      } finally {
+        __internals.setOllamaBase(savedBase);
+      }
     });
 
     test("cache is keyed by prompt: same prompt is a hit, a new prompt queries afresh", async () => {
@@ -1046,7 +1067,16 @@ describe("DB access layer", () => {
       ` as { id: number }[];
 
       try {
-        const result = await __internals.recall({ query: marker, limit: 2 }, ctx);
+        // Keyword ranking is asserted with the vector half off: RRF ties are
+        // decided by insertion order, and this test's contract is ts_rank.
+        const savedBase = __internals.ollamaBase;
+        __internals.setOllamaBase("http://127.0.0.1:9");
+        let result: string;
+        try {
+          result = await __internals.recall({ query: marker, limit: 2 }, ctx);
+        } finally {
+          __internals.setOllamaBase(savedBase);
+        }
         console.log(`ranked recall output:\n${result}`);
         // The far-more-relevant OLDER row must rank first, ahead of the barely-relevant NEWER row.
         expect(result.indexOf(`#${oldRow.id}`)).toBeLessThan(result.indexOf(`#${newRow.id}`));
@@ -1117,10 +1147,182 @@ describe("DB access layer", () => {
         const result = await __internals.recall({ query: `${marker} vacuum`, limit: 5 }, ctx);
         expect(result).toContain(`#${row.id}`);
         // A gibberish AND-partner still finds nothing - OR is not fuzz.
-        const none = await __internals.recall({ query: `xqzzyblorpn qwintavex`, limit: 5 }, ctx);
-        expect(none).not.toContain(`#${row.id}`);
+        // Asserted with the vector half off: nearest neighbors of gibberish
+        // are arbitrary, and this contract is about keyword semantics.
+        const savedBase = __internals.ollamaBase;
+        __internals.setOllamaBase("http://127.0.0.1:9");
+        try {
+          const none = await __internals.recall({ query: `xqzzyblorpn qwintavex`, limit: 5 }, ctx);
+          expect(none).not.toContain(`#${row.id}`);
+        } finally {
+          __internals.setOllamaBase(savedBase);
+        }
       } finally {
         await __internals.sql`DELETE FROM memories WHERE id = ${row.id}`;
+      }
+    });
+  });
+  describe("hybrid retrieval (keyword + embeddings)", () => {
+    const ctx = { directory: "/tmp/ocpg-test-hybrid", sessionID: "hybrid-t" };
+    // A zero-keyword-overlap paraphrase pair, verified against the real
+    // 475-row corpus: fixture ranks #1 of 476 by cosine (0.576 vs 0.470 next)
+    // and its query tokens hit almost nothing lexically. Semantic area is
+    // deliberately off-corpus so the vector half is the only way to find it.
+    const PARA_CONTENT = "The office espresso machine is descaled on the first Monday of each month.";
+    const PARA_QUERY = "how do I clean the coffee maker";
+
+    // Polls until the fire-and-forget write-path embedding lands.
+    const untilEmbedded = async (id: number): Promise<boolean> => {
+      for (let i = 0; i < 100; i++) {
+        const [row] = await __internals.sql`SELECT embedding IS NOT NULL AS has FROM memories WHERE id = ${id}` as { has: boolean }[];
+        if (row.has) return true;
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      return false;
+    };
+
+    test("rrfMerge: shared rows win, keyword order decides ties, empty halves pass through", () => {
+      const a = { content: "alpha" };
+      const b = { content: "bravo" };
+      const c = { content: "charlie" };
+      const d = { content: "delta" };
+      // b is in both lists and must outrank either list's top row.
+      expect(__internals.rrfMerge([[a, b], [b, c, a]]).map((r) => r.content)).toEqual(["bravo", "alpha", "charlie"]);
+      // Zero-overlap paraphrase case: empty keyword list -> vector order alone.
+      expect(__internals.rrfMerge([[], [c, d]]).map((r) => r.content)).toEqual(["charlie", "delta"]);
+      // Ollama down: keyword list passes through unchanged.
+      expect(__internals.rrfMerge([[b, a]]).map((r) => r.content)).toEqual(["bravo", "alpha"]);
+    });
+
+    test("embed never throws: a refused endpoint returns null fast", async () => {
+      const savedBase = __internals.ollamaBase;
+      __internals.setOllamaBase("http://127.0.0.1:9"); // discard port: connection refused
+      const t0 = performance.now();
+      try {
+        expect(await __internals.embed(["probe"], 1000)).toBe(null);
+        expect(performance.now() - t0).toBeLessThan(1000);
+      } finally {
+        __internals.setOllamaBase(savedBase);
+      }
+    });
+
+    test("embed against a hung endpoint respects the timeout", async () => {
+      const savedBase = __internals.ollamaBase;
+      __internals.setOllamaBase("http://10.255.255.1:11434"); // non-routable: hangs
+      const t0 = performance.now();
+      try {
+        expect(await __internals.embed(["probe"], 200)).toBe(null);
+        expect(performance.now() - t0).toBeLessThan(2000);
+      } finally {
+        __internals.setOllamaBase(savedBase);
+      }
+    });
+
+    test("keyword-only degradation: remember/recall/injection all work with Ollama down", async () => {
+      const savedBase = __internals.ollamaBase;
+      const savedMode = __internals.injectionMode;
+      __internals.setOllamaBase("http://127.0.0.1:9");
+      __internals.setInjectionMode("relevance");
+      const project = "/tmp/ocpg-test-hybrid-down";
+      const marker = `zzzhybriddown${Date.now()}`;
+      try {
+        const stored = await __internals.remember(
+          { content: `Degradation probe ${marker}: keyword search must survive Ollama outages.` },
+          { directory: project, sessionID: "h-down" },
+        );
+        expect(stored).toContain("Stored memory #");
+        expect(await __internals.recall({ query: marker }, { directory: project })).toContain(marker);
+        __internals.invalidateInjection(project);
+        const output: { system: string[] } = { system: [] };
+        await __internals.handleTransform(output, project, marker);
+        expect(output.system.join("")).toContain(marker);
+      } finally {
+        __internals.setOllamaBase(savedBase);
+        __internals.setInjectionMode(savedMode);
+        await __internals.sql`DELETE FROM memories WHERE project = ${project}`;
+        __internals.invalidateInjection(project);
+      }
+    });
+
+    test.skipIf(!hybridReady)("remember populates the embedding; a zero-overlap paraphrase finds the row", async () => {
+      try {
+        const stored = await __internals.remember({ content: PARA_CONTENT }, ctx);
+        const id = Number(stored.match(/#(\d+)/)?.[1]);
+        // The write path is fire-and-forget; wait for the vector to land.
+        expect(await untilEmbedded(id)).toBe(true);
+
+        // limit 20 so corpus keyword noise cannot push the fixture out: the
+        // assertion is that the vector half reached it at all...
+        const found = await __internals.recall({ query: PARA_QUERY, limit: 20 }, ctx);
+        expect(found).toContain(`#${id}`);
+
+        // ...and the control: with Ollama off, the same query must NOT find
+        // it (zero keyword overlap), proving the hit came from embeddings.
+        const savedBase = __internals.ollamaBase;
+        __internals.setOllamaBase("http://127.0.0.1:9");
+        try {
+          expect(await __internals.recall({ query: PARA_QUERY, limit: 20 }, ctx)).not.toContain(`#${id}`);
+        } finally {
+          __internals.setOllamaBase(savedBase);
+        }
+      } finally {
+        await __internals.sql`DELETE FROM memories WHERE project = ${ctx.directory}`;
+        __internals.invalidateInjection(ctx.directory);
+      }
+    });
+
+    test.skipIf(!hybridReady)("injection merges the vector half: a zero-overlap prompt injects the memory", async () => {
+      const savedMode = __internals.injectionMode;
+      __internals.setInjectionMode("relevance");
+      try {
+        const stored = await __internals.remember({ content: PARA_CONTENT }, ctx);
+        const id = Number(stored.match(/#(\d+)/)?.[1]);
+        expect(await untilEmbedded(id)).toBe(true);
+        __internals.invalidateInjection(ctx.directory);
+
+        const output: { system: string[] } = { system: [] };
+        await __internals.handleTransform(output, ctx.directory, PARA_QUERY);
+        expect(output.system.join("")).toContain("espresso machine");
+      } finally {
+        __internals.setInjectionMode(savedMode);
+        await __internals.sql`DELETE FROM memories WHERE project = ${ctx.directory}`;
+        __internals.invalidateInjection(ctx.directory);
+      }
+    });
+
+    test.skipIf(!hybridReady)("memory_update re-embeds: the stored vector follows the content", async () => {
+      try {
+        const stored = await __internals.remember({ content: PARA_CONTENT }, ctx);
+        const id = Number(stored.match(/#(\d+)/)?.[1]);
+        expect(await untilEmbedded(id)).toBe(true);
+
+        const newContent = "The warehouse freezer temperature is logged twice per shift.";
+        await __internals.updateMemory({ id, content: newContent }, ctx);
+        // Wait for the fire-and-forget re-embed to overwrite the vector.
+        const [before] = await __internals.sql`SELECT embedding::text AS e FROM memories WHERE id = ${id}` as { e: string }[];
+        let changed = false;
+        for (let i = 0; i < 100 && !changed; i++) {
+          const [row] = await __internals.sql`SELECT embedding::text AS e FROM memories WHERE id = ${id}` as { e: string | null }[];
+          changed = row.e !== null && row.e !== before.e;
+          if (!changed) await new Promise((r) => setTimeout(r, 100));
+        }
+        expect(changed).toBe(true);
+
+        // The stored vector must now BE an embedding of the new content, not
+        // the old: bge-m3 is deterministic, so same-text cosine is ~1.
+        const [row] = await __internals.sql`SELECT embedding::text AS e FROM memories WHERE id = ${id}` as { e: string }[];
+        const storedVec = JSON.parse(row.e) as number[];
+        const [oldVec, newVec] = (await __internals.embed([PARA_CONTENT, newContent], 5000)) as number[][];
+        const cos = (x: number[], y: number[]) => {
+          let d = 0, nx = 0, ny = 0;
+          for (let i = 0; i < x.length; i++) { d += x[i] * y[i]; nx += x[i] * x[i]; ny += y[i] * y[i]; }
+          return d / (Math.sqrt(nx) * Math.sqrt(ny));
+        };
+        expect(cos(storedVec, newVec)).toBeGreaterThan(0.999);
+        expect(cos(storedVec, oldVec)).toBeLessThan(0.9);
+      } finally {
+        await __internals.sql`DELETE FROM memories WHERE project = ${ctx.directory}`;
+        __internals.invalidateInjection(ctx.directory);
       }
     });
   });

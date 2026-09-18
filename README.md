@@ -2,7 +2,7 @@
 
 Postgres-backed persistent memory plugin for [OpenCode](https://opencode.ai).
 
-Uses the `memories` table (`content`, `tags`, `session_id`, `project`, `created_at`, `search_vector`, `memory_type`, `access_count`, `last_accessed_at`, `updated_at`) and the `pg_trgm` extension. Injects the memories most relevant to what you're currently asking into the system prompt, captures deliberate "remember that..." prompts verbatim, and exposes `memory_recall` / `memory_remember` / `memory_forget` / `memory_update` tools.
+Uses the `memories` table (`content`, `tags`, `session_id`, `project`, `created_at`, `search_vector`, `embedding`, `memory_type`, `access_count`, `last_accessed_at`, `updated_at`) and the `pg_trgm` + `vector` extensions. Injects the memories most relevant to what you're currently asking into the system prompt, captures deliberate "remember that..." prompts verbatim, and exposes `memory_recall` / `memory_remember` / `memory_forget` / `memory_update` tools.
 
 ## Install
 
@@ -39,6 +39,9 @@ export OCPG_SSL="disable"
 | `OCPG_DB`       | `ocpg`       |
 | `OCPG_SSL`      | `disable`    |
 | `OCPG_INJECTION`| `relevance`  |
+| `OCPG_OLLAMA_HOST` | `localhost` |
+| `OCPG_OLLAMA_PORT` | `11434`    |
+| `OCPG_EMBED_MODEL` | `bge-m3`    |
 
 `OCPG_SSL` accepts `disable`, `prefer`, `require`, `verify-ca`, or `verify-full` (anything else falls back to `disable`). It defaults to `disable` for the usual localhost setup - **set it to `require` or stricter whenever `OCPG_HOST` is not local**, otherwise the password handshake crosses the network in plaintext.
 
@@ -75,7 +78,9 @@ By default the block is **relevance-ranked, not recency-ranked**: the user's lat
 
 Set `OCPG_INJECTION=recency` to restore the old blind-last-5 behavior instead: no prompt-matching, just the most recent visible memories (preferences first).
 
-This is keyword relevance, not embedding-based semantic search - close phrasing wins, paraphrases may not. (An internal benchmark measures this explicitly: paraphrase-only queries currently score ~0 recall regardless of ranking strategy tried, which is the known gap and the number that would justify adding semantic search later.) Note the OR ranking: common words in a prompt surface more rows; the ranking favors rows matching more distinctive terms.
+Retrieval is **hybrid**: the prompt runs through keyword full-text search and, when Ollama is reachable, through embedding search (bge-m3, pgvector HNSW, cosine) - the two ranked lists are merged with reciprocal rank fusion, so exact-word hits and said-differently paraphrase hits both surface. The internal benchmark shows hybrid recall never worse than either half alone at 485/5k/50k rows ([`bench/README.md`](./bench/README.md)). Writes are embedded fire-and-forget; rows from before this feature carry no embedding until `bun run backfill` fills them (deploy/README.md).
+
+If Ollama is unreachable - or the database predates the embedding column - search silently degrades to keyword-only; nothing breaks. A cold model load is ~2-3s (over the 1s injection deadline), so the plugin warms the model at session start and pins it with `keep_alive`; a warm embed is ~20ms and runs concurrently with the keyword query.
 
 ## Tools
 

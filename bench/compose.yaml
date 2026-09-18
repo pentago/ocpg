@@ -1,0 +1,22 @@
+# Throwaway Postgres+pgvector for the embedding bench (bench/embed.ts).
+# Never the real agent-memory DB. No volume on purpose - bench data is
+# disposable; regenerate with bench/generate.ts.
+#
+#   docker compose -f bench/compose.yaml up -d
+#   OCPG_PORT=5433 OCPG_PASSWORD=bench bun bench/generate.ts --sizes 500,5000,50000
+#   OCPG_PORT=5433 OCPG_PASSWORD=bench bun bench/embed.ts
+#
+# Embeddings come from the HOST ollama (localhost:11434, GPU). A containerized
+# ollama is CPU-only on this host (no nvidia-container-toolkit), which makes
+# 50k-row embedding take hours - not worth it for a throwaway bench.
+services:
+  pgvector:
+    image: pgvector/pgvector:pg18
+    container_name: ocpg-bench-pgvector
+    environment:
+      POSTGRES_USER: ocpguser
+      POSTGRES_PASSWORD: bench
+      POSTGRES_DB: postgres
+    ports:
+      - "127.0.0.1:5433:5432"
+    restart: "no"

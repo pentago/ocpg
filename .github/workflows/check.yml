@@ -13,8 +13,9 @@ jobs:
     services:
       postgres:
         # Pinned to the same image deploy/compose.yaml runs, so CI exercises the
-        # Postgres the plugin is actually deployed against.
-        image: postgres:18-alpine3.24
+        # Postgres the plugin is actually deployed against (pgvector build: the
+        # schema has a vector column for hybrid retrieval).
+        image: pgvector/pgvector:0.8.6-pg18-trixie
         env:
           POSTGRES_USER: ocpguser
           POSTGRES_PASSWORD: ocpgpass
@@ -43,8 +44,8 @@ jobs:
         run: bunx tsc --noEmit
 
       # Runs the real deploy bootstrap rather than a copy of it, so schema drift
-      # between CI and deploy/ fails here. psql comes from the Postgres image,
-      # which avoids depending on whatever client the runner happens to ship.
+      # between CI and deploy/ fails here. psql comes from the same pgvector
+      # image the service runs (one pull), not whatever client the runner ships.
       - name: Bootstrap schema
         run: |
           docker run --rm --network=host \
@@ -53,7 +54,7 @@ jobs:
             -e POSTGRES_USER=ocpguser \
             -e POSTGRES_DB=ocpg \
             -v "$PWD/deploy/init:/init:ro" \
-            postgres:18-alpine3.24 /init/01-init.sh
+            pgvector/pgvector:0.8.6-pg18-trixie /init/01-init.sh
 
       - name: Test
         env:

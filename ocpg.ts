@@ -129,6 +129,87 @@ async function withDeadline<T>(query: PromiseLike<T>, ms: number): Promise<T> {
   }
 }
 
+// --- Embeddings (hybrid retrieval: keyword + vector) ---
+
+// bge-m3 via the host's Ollama (no container - the plugin calls it over HTTP,
+// same pattern as the bench). Everything here degrades to keyword-only on any
+// failure; embeddings can never break search. Env-only, resolved once at init
+// like the DB config. The model name is an env var so it is swappable without
+// a code change - a model with different dimensions needs the column re-created
+// and a re-embed (deploy/README.md).
+const OLLAMA_HOST = process.env.OCPG_OLLAMA_HOST || "localhost";
+const OLLAMA_PORT = Number(process.env.OCPG_OLLAMA_PORT) || 11434;
+const EMBED_MODEL = process.env.OCPG_EMBED_MODEL || "bge-m3";
+let ollamaBase = `http://${OLLAMA_HOST}:${OLLAMA_PORT}`;
+
+// Warm bge-m3 embed is ~20ms (measured 2026-09-18, RTX 5070); a cold model
+// load is ~2-3s, over the injection deadline - so setup() fires a warm-up and
+// every request passes keep_alive to keep the model resident. The query budget
+// only trips when racing that warm-up or a wedged daemon, and both fall back
+// to keyword-only. The write path is fire-and-forget and tolerates cold loads.
+const EMBED_QUERY_TIMEOUT_MS = 750;
+const EMBED_WRITE_TIMEOUT_MS = 15_000;
+// Candidate slice per hybrid half, mirroring the keyword LIMIT 20.
+const EMBED_CANDIDATES = 20;
+
+// Never rejects: any failure (daemon down, model missing, timeout) logs
+// rate-limited and returns null, and the caller runs keyword-only.
+async function embed(texts: string[], timeoutMs: number): Promise<number[][] | null> {
+  try {
+    const res = await fetch(`${ollamaBase}/api/embed`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      // keep_alive pins the model: the default 5m unload would make the first
+      // query after any idle gap pay the ~2-3s cold load and lose to the timeout.
+      body: JSON.stringify({ model: EMBED_MODEL, input: texts, keep_alive: "30m" }),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!res.ok) throw new Error(`ollama /api/embed ${EMBED_MODEL}: HTTP ${res.status}`);
+    return ((await res.json()) as { embeddings: number[][] }).embeddings;
+  } catch (e: unknown) {
+    logError("embed", `ocpg embedding unavailable, keyword-only: ${e instanceof Error ? e.message : String(e)}`);
+    return null;
+  }
+}
+
+// pgvector literal, e.g. "[0.1,-0.2,...]", sent as a text param cast to vector.
+function vectorLiteral(v: number[]): string {
+  return `[${v.join(",")}]`;
+}
+
+// Reciprocal rank fusion (k=60, the standard constant): a row scores
+// 1/(60 + 1-based rank) in each list it appears in, so a hit in both lists
+// outranks either list's tail. Keyed on content - identical text is the same
+// memory. Bench-verified (hybrid-rrf, bench/README.md): recall >= both the
+// keyword and the embedding parent at 485/5k/50k rows.
+function rrfMerge<T extends { content: string }>(lists: T[][], k = 60): T[] {
+  const scores = new Map<string, { score: number; row: T }>();
+  for (const list of lists) {
+    list.forEach((row, i) => {
+      const entry = scores.get(row.content) ?? { score: 0, row };
+      entry.score += 1 / (k + i + 1);
+      scores.set(row.content, entry);
+    });
+  }
+  // Map preserves insertion order and Array.sort is stable, so fused-score
+  // ties keep the keyword list's order (it is always merged first).
+  return [...scores.values()].sort((a, b) => b.score - a.score).map((e) => e.row);
+}
+
+// Off the write path: embed one memory and store its vector. Never throws -
+// callers fire-and-forget it, so every failure (Ollama down, missing column)
+// lands here. A row whose embedding stays NULL is keyword-only until the
+// backfill (deploy/backfill.ts) or a later memory_update fills it.
+async function embedAndStore(id: number, content: string): Promise<void> {
+  try {
+    const vecs = await embed([content], EMBED_WRITE_TIMEOUT_MS);
+    if (!vecs) return;
+    await sql`UPDATE memories SET embedding = ${vectorLiteral(vecs[0])}::vector WHERE id = ${id}`;
+  } catch (e: unknown) {
+    logError("embed-write", `ocpg embedding store failed for #${id}: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
 // --- Injection pipeline ---
 
 // Injection ranking mode (plan follow-up: relevance over blind recency).
@@ -289,6 +370,25 @@ function buildRelevanceQuery(client: SQL, tsQuery: string, directory: string) {
   `;
 }
 
+// Vector half of the hybrid: nearest neighbors by cosine distance over the
+// same visibility rules as the keyword half. Unlike FTS this always returns
+// rows when embedded rows exist (nearest is always *something*), so the
+// caller merges it via rrfMerge - and the recency fallback stays for the
+// "no retrieval signal at all" case. Fails on a database without the
+// embedding column; the caller catches and runs keyword-only.
+function buildVectorQuery(client: SQL, vectorLit: string, directory: string) {
+  return client`
+    SELECT content, coalesce(tags, '{}') AS tags,
+           to_char(created_at, 'YYYY-MM-DD') AS date,
+           project
+    FROM memories
+    WHERE embedding IS NOT NULL
+      AND ${visibleRows(client, directory)}
+    ORDER BY embedding <=> ${vectorLit}::vector
+    LIMIT ${EMBED_CANDIDATES}
+  `;
+}
+
 // The prompt as an OR of stemmed words: websearch_to_tsquery ANDs the terms,
 // so one word the memory never uses would zero out the whole query (bench:
 // recall 0.00-0.02 on multi-word queries). OR ranks by how many (and how
@@ -318,12 +418,31 @@ async function handleTransform(
     let rows: InjectionRow[];
     const tsQuery = orTsQuery(query);
     if (tsQuery) {
-      rows = await withDeadline(
+      // Hybrid: the keyword half always runs; the embedding half is started
+      // concurrently so a warm bge-m3 (~20ms) hides behind the keyword
+      // round-trip. Null embedding (Ollama down/timeout) or a failed vector
+      // query (pre-migration database, DeadlineError) degrade to keyword-only.
+      const embedding = embed([query], EMBED_QUERY_TIMEOUT_MS);
+      const keywordRows = await withDeadline(
         buildRelevanceQuery(sql, tsQuery, directory) as unknown as PromiseLike<InjectionRow[]>,
         1000,
       );
+      rows = keywordRows;
+      const vecs = await embedding;
+      if (vecs) {
+        const vectorRows = await withDeadline(
+          buildVectorQuery(sql, vectorLiteral(vecs[0]), directory) as unknown as PromiseLike<InjectionRow[]>,
+          1000,
+        ).catch((e: unknown) => {
+          logError("embed-query", `ocpg vector query failed, keyword-only: ${e instanceof Error ? e.message : String(e)}`);
+          return null;
+        });
+        if (vectorRows) rows = rrfMerge([keywordRows, vectorRows]);
+      }
       if (rows.length === 0) {
-        // No keyword match for this prompt - recency beats an empty block.
+        // No retrieval signal at all for this prompt - recency beats an empty
+        // block. The vector half alone counts as a signal: a zero-overlap
+        // paraphrase is exactly what embeddings are for.
         rows = await withDeadline(buildRecencyQuery(sql, directory) as unknown as PromiseLike<InjectionRow[]>, 1000);
       }
     } else {
@@ -419,8 +538,10 @@ async function recall(
     // project_fact only from the origin project unless the caller opts in
     // with global: true.
     const visibleCond = args.global ? sql`` : sql`AND ${visibleRows(sql, ctx.directory)}`;
-    const queryCond = args.query
-      ? sql`AND search_vector @@ to_tsquery('english', ${orTsQuery(args.query)})`
+    const q = args.query ?? "";
+    const tsQuery = q ? orTsQuery(q) : "";
+    const queryCond = q
+      ? sql`AND search_vector @@ to_tsquery('english', ${tsQuery})`
       : sql``;
     // Tags are not part of search_vector (it covers content only), so they are
     // unreachable by query alone. Matches rows carrying ALL the given tags,
@@ -434,19 +555,46 @@ async function recall(
     // was tried and removed: bumping exactly the returned top-5 is a
     // rich-get-richer loop - live corpus rows pinned the top slot after a few
     // runs. access_count stays as data collection; no ranking consumes it.
-    const orderBy = args.query
-      ? sql`ORDER BY ts_rank(search_vector, to_tsquery('english', ${orTsQuery(args.query)})) DESC`
+    const orderBy = q
+      ? sql`ORDER BY ts_rank(search_vector, to_tsquery('english', ${tsQuery})) DESC`
       : sql`ORDER BY (memory_type = 'preference') DESC, created_at DESC`;
 
-    const rows = await sql`
+    // Hybrid: with a searchable query, embed it concurrently so a warm bge-m3
+    // (~20ms) hides behind the keyword round-trip; the vector half then merges
+    // via RRF. Any embedding failure (Ollama down, no embedding column yet)
+    // degrades to exactly the pre-hybrid keyword-only behavior.
+    const embedding = tsQuery ? embed([q], EMBED_QUERY_TIMEOUT_MS) : Promise.resolve(null);
+    // A directed query fetches a candidate slice for the RRF merge; the
+    // caller's limit is applied after. Browse keeps its plain LIMIT.
+    const keywordRows = await sql`
       SELECT id, content, coalesce(tags, '{}') AS tags,
              to_char(created_at, 'YYYY-MM-DD') AS date,
              project, memory_type
       FROM memories
       WHERE 1=1 ${visibleCond} ${queryCond} ${tagCond}
       ${orderBy}
-      LIMIT ${limit}
+      LIMIT ${q ? EMBED_CANDIDATES : limit}
     ` as (MemoryRow & { memory_type: string })[];
+
+    let rows = keywordRows;
+    const vecs = await embedding;
+    if (vecs) {
+      // Same filters as the keyword half, minus the FTS condition.
+      const vectorRows = await (sql`
+        SELECT id, content, coalesce(tags, '{}') AS tags,
+               to_char(created_at, 'YYYY-MM-DD') AS date,
+               project, memory_type
+        FROM memories
+        WHERE embedding IS NOT NULL ${visibleCond} ${tagCond}
+        ORDER BY embedding <=> ${vectorLiteral(vecs[0])}::vector
+        LIMIT ${EMBED_CANDIDATES}
+      ` as unknown as Promise<(MemoryRow & { memory_type: string })[]>).catch((e: unknown) => {
+        logError("embed-query", `ocpg vector query failed, keyword-only: ${e instanceof Error ? e.message : String(e)}`);
+        return null;
+      });
+      if (vectorRows) rows = rrfMerge([keywordRows, vectorRows]);
+    }
+    if (q) rows = rows.slice(0, limit);
 
     // Access ranking is recall-only (plan 2.2): the injection path stays
     // read-only because its per-directory cache would make increments biased.
@@ -526,6 +674,11 @@ async function remember(
       VALUES (${args.content}, ${sql.array(tags, "text")}, ${ctx.sessionID}, ${ctx.directory}, ${resolveMemoryType(args.type)})
       RETURNING id
     ` as { id: number }[];
+
+    // Fire-and-forget embedding (hybrid retrieval): never blocks the
+    // confirmation. A failure leaves embedding NULL - keyword search keeps
+    // working; the backfill (deploy/backfill.ts) fills the gap later.
+    void embedAndStore(inserted[0].id, args.content);
 
     // The injection block is global, but its cache is keyed by the calling
     // directory + prompt; clear the directory's keys.
@@ -654,6 +807,9 @@ async function updateMemory(
       return `No memory #${id}; nothing updated.`;
     }
     invalidateInjection(ctx.directory);
+    // Content changed, so the embedding must follow - same fire-and-forget
+    // path as remember.
+    void embedAndStore(id, args.content);
     return `Updated memory #${id}.`;
   } catch (e: unknown) {
     return toolError("update", "update", e);
@@ -752,6 +908,11 @@ const ocpg = Plugin.define({
     // otherwise the TCP + SCRAM handshake is paid inside the first context hook.
     void sql`SELECT 1`.catch(() => {});
 
+    // Warm the embedding model off the request path: a cold bge-m3 load is
+    // ~2-3s (over the query budget), so without this the first hybrid query of
+    // a session falls back to keyword-only. keep_alive pins it between requests.
+    void embed(["ocpg session warmup"], EMBED_WRITE_TIMEOUT_MS);
+
     // Inject project memories into every model request's system context.
     // Relevance mode derives the retrieval query from the latest user message;
     // handleTransform owns the cache (32-slot, keyed by directory + prompt).
@@ -783,7 +944,7 @@ const ocpg = Plugin.define({
         input: {
           type: "object",
           properties: {
-            query: { type: "string", description: "Full-text search string; omit for the latest memories" },
+            query: { type: "string", description: "Search string (keyword + semantic paraphrase match); omit for the latest memories" },
             tags: {
               type: "array",
               items: { type: "string" },
@@ -974,6 +1135,19 @@ const __internals = {
   orTsQuery,
   buildRecencyQuery,
   buildRelevanceQuery,
+  buildVectorQuery,
+  embed,
+  embedAndStore,
+  rrfMerge,
+  vectorLiteral,
+  get ollamaBase() {
+    return ollamaBase;
+  },
+  // Test hook: point the embed client at a dead endpoint to exercise the
+  // keyword-only degradation paths (module state, like injectionMode).
+  setOllamaBase(base: string) {
+    ollamaBase = base;
+  },
   retain,
   dispose,
 };

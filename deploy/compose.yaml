@@ -2,7 +2,11 @@ services:
   pg:
     container_name: pg
     hostname: pg
-    image: postgres:18-alpine3.24
+    # pgvector build of Postgres 18: the embedding half of hybrid retrieval
+    # (bge-m3, vector(1024)) needs the vector extension. Same major version as
+    # the old postgres:18-alpine image, so existing data dirs keep working -
+    # see README.md ("Upgrading an existing install") for the musl->glibc note.
+    image: pgvector/pgvector:0.8.6-pg18-trixie
     user: ${PUID}:${PGID}
     restart: unless-stopped
     read_only: true

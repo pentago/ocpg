@@ -9,6 +9,10 @@ psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" <<-'EOSQL'
 	-- plugin falls back to a weaker full-text rule that misses near-duplicates.
 	CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
+	-- pgvector backs the embedding half of hybrid retrieval (bge-m3 via Ollama,
+	-- 1024 dims - the column dimension is tied to the embedding model).
+	CREATE EXTENSION IF NOT EXISTS vector;
+
 	CREATE TABLE memories (
 	  id            serial PRIMARY KEY,
 	  content       text        NOT NULL,
@@ -21,12 +25,16 @@ psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" <<-'EOSQL'
 	  last_accessed_at timestamptz,
 	  updated_at    timestamptz,
 	  search_vector tsvector GENERATED ALWAYS AS (to_tsvector('english', content)) STORED,
+	  embedding     vector(1024),
 	  CONSTRAINT memories_type_check
 	    CHECK (memory_type IN ('preference', 'stack_fact', 'project_fact', 'episodic'))
 	);
 	CREATE INDEX idx_memories_search ON memories USING gin (search_vector);
 	CREATE INDEX idx_memories_tags   ON memories USING gin (tags);
 	CREATE INDEX idx_memories_project_created ON memories (project, created_at DESC);
+
+	-- HNSW index for the nearest-neighbor half of hybrid retrieval (cosine).
+	CREATE INDEX idx_memories_embedding ON memories USING hnsw (embedding vector_cosine_ops);
 
 	-- Trigram content index: accelerates memory_consolidate's near-duplicate
 	-- self-join (content % content). Without it the join is O(n^2) similarity

@@ -38,9 +38,33 @@ ALTER TABLE memories ADD COLUMN IF NOT EXISTS updated_at timestamptz;
 -- memory_consolidate (plugin >= 0.14): trigram content index for the
 -- near-duplicate self-join.
 CREATE INDEX IF NOT EXISTS idx_memories_trgm ON memories USING gin (content gin_trgm_ops);
+
+-- Hybrid retrieval: the embedding half of keyword+vector search. Requires the
+-- pgvector image (compose.yaml swapped postgres:18-alpine ->
+-- pgvector/pgvector:0.8.6-pg18-trixie). The column dimension is tied to the
+-- embedding model (bge-m3 = 1024).
+CREATE EXTENSION IF NOT EXISTS vector;
+ALTER TABLE memories ADD COLUMN IF NOT EXISTS embedding vector(1024);
+CREATE INDEX IF NOT EXISTS idx_memories_embedding ON memories USING hnsw (embedding vector_cosine_ops);
 ```
 
 Every statement is idempotent - re-running the block is a no-op.
+
+### Swapping to the pgvector image
+
+`pgvector/pgvector` is a Debian build while the old image was Alpine
+(musl->glibc). Same Postgres major version, so the data dir keeps working;
+if the logs show collation-version warnings after the swap, run
+`REINDEX DATABASE <your-db>;` once. Then fill embeddings for pre-existing
+rows (until this runs they are found by keyword search only):
+
+```bash
+bun run backfill   # same OCPG_* env as the plugin; idempotent, re-runnable
+```
+
+Semantic search needs Ollama on the host with the model pulled
+(`ollama pull bge-m3`). Without Ollama everything still works - search just
+stays keyword-only.
 
 `.env` values:
 
@@ -75,3 +99,5 @@ export OCPG_USER="ocpguser"
 export OCPG_PASSWORD="your-postgres-password"
 export OCPG_DB="ocpg"
 ```
+
+Optional, for the embedding half of hybrid search: `OCPG_OLLAMA_HOST` (default `localhost`), `OCPG_OLLAMA_PORT` (default `11434`), `OCPG_EMBED_MODEL` (default `bge-m3`; a model with different output dimensions needs the `embedding` column re-created at that size plus a re-run of the backfill).

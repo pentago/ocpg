@@ -782,6 +782,11 @@ describe("DB access layer", () => {
     });
 
     test("relevance reaches global types from other projects; other projects' project_fact never surfaces", async () => {
+      // The same-project tiebreak is a KEYWORD-side boost; with the vector
+      // half live, hybridMerge's reserved slots own the top-2 order. Assert
+      // the keyword contract with embeddings off.
+      const savedBase = __internals.ollamaBase;
+      __internals.setOllamaBase("http://127.0.0.1:9");
       try {
         const sibling = "/tmp/ocpg-test-relevance-sibling";
         await __internals.remember(
@@ -814,6 +819,7 @@ describe("DB access layer", () => {
         await __internals.handleTransform(output2, ctx.directory, ask("customer-beta staging DNS resolver flaky"));
         expect(output2.system.join("")).not.toContain("customer-beta's staging DNS");
       } finally {
+        __internals.setOllamaBase(savedBase);
         await __internals.sql`DELETE FROM memories WHERE project = '/tmp/ocpg-test-relevance-sibling'`;
         __internals.invalidateInjection("/tmp/ocpg-test-relevance-sibling");
       }
@@ -838,27 +844,36 @@ describe("DB access layer", () => {
     });
 
     test("cache is keyed by prompt: same prompt is a hit, a new prompt queries afresh", async () => {
-      await __internals.remember({ content: "Cached marker alpha for prompt one." }, ctx);
-      await __internals.remember({ content: "Cached marker bravo for prompt two." }, ctx);
-      __internals.invalidateInjection(ctx.directory);
+      // Keyword-order contract (bravo outranks alpha via more matched terms),
+      // asserted with the vector half off: hybridMerge's reserved slots
+      // legitimately reorder the block's top rows when embeddings are live.
+      const savedBase = __internals.ollamaBase;
+      __internals.setOllamaBase("http://127.0.0.1:9");
+      try {
+        await __internals.remember({ content: "Cached marker alpha for prompt one." }, ctx);
+        await __internals.remember({ content: "Cached marker bravo for prompt two." }, ctx);
+        __internals.invalidateInjection(ctx.directory);
 
-      const p1 = ask("cached marker alpha for prompt one");
-      const first: { system: string[] } = { system: [] };
-      await __internals.handleTransform(first, ctx.directory, p1);
-      const start = performance.now();
-      const warm: { system: string[] } = { system: [] };
-      await __internals.handleTransform(warm, ctx.directory, p1);
-      expect(performance.now() - start).toBeLessThan(5);
-      expect(warm.system[0]).toBe(first.system[0]);
+        const p1 = ask("cached marker alpha for prompt one");
+        const first: { system: string[] } = { system: [] };
+        await __internals.handleTransform(first, ctx.directory, p1);
+        const start = performance.now();
+        const warm: { system: string[] } = { system: [] };
+        await __internals.handleTransform(warm, ctx.directory, p1);
+        expect(performance.now() - start).toBeLessThan(5);
+        expect(warm.system[0]).toBe(first.system[0]);
 
-      const second: { system: string[] } = { system: [] };
-      await __internals.handleTransform(second, ctx.directory, ask("cached marker bravo for prompt two"));
-      // OR semantics: "cached"/"prompt" also match other rows, but the prompt's
-      // own memory must outrank them.
-      const bravoIdx = second.system[0].indexOf("Cached marker bravo");
-      const alphaIdx = second.system[0].indexOf("Cached marker alpha");
-      expect(bravoIdx).toBeGreaterThan(-1);
-      if (alphaIdx > -1) expect(bravoIdx).toBeLessThan(alphaIdx);
+        const second: { system: string[] } = { system: [] };
+        await __internals.handleTransform(second, ctx.directory, ask("cached marker bravo for prompt two"));
+        // OR semantics: "cached"/"prompt" also match other rows, but the prompt's
+        // own memory must outrank them.
+        const bravoIdx = second.system[0].indexOf("Cached marker bravo");
+        const alphaIdx = second.system[0].indexOf("Cached marker alpha");
+        expect(bravoIdx).toBeGreaterThan(-1);
+        if (alphaIdx > -1) expect(bravoIdx).toBeLessThan(alphaIdx);
+      } finally {
+        __internals.setOllamaBase(savedBase);
+      }
     });
 
     test("a write invalidates every prompt-keyed cache entry of the project", async () => {
@@ -1192,6 +1207,20 @@ describe("DB access layer", () => {
       expect(__internals.rrfMerge([[], [c, d]]).map((r) => r.content)).toEqual(["charlie", "delta"]);
       // Ollama down: keyword list passes through unchanged.
       expect(__internals.rrfMerge([[b, a]]).map((r) => r.content)).toEqual(["bravo", "alpha"]);
+    });
+
+    test("hybridMerge: reserves vector rows unconditionally, merge fills the rest", () => {
+      const a = { content: "alpha" };
+      const b = { content: "bravo" };
+      const d = { content: "delta" };
+      const e = { content: "echo" };
+      // kw = [a, b], em = [d, e, a]. Plain RRF: a (in both) > d > b = e (tie,
+      // keyword order wins). R=2 reserves [d, e]; the merge minus the picks
+      // fills with [a, b].
+      expect(__internals.hybridMerge([a, b], [d, e, a], 2).map((r) => r.content)).toEqual(["delta", "echo", "alpha", "bravo"]);
+      // R=0 and an empty vector list both degenerate to the plain merge.
+      expect(__internals.hybridMerge([a, b], [d, e, a], 0).map((r) => r.content)).toEqual(["alpha", "delta", "bravo", "echo"]);
+      expect(__internals.hybridMerge([a, b], [], 2).map((r) => r.content)).toEqual(["alpha", "bravo"]);
     });
 
     test("embed never throws: a refused endpoint returns null fast", async () => {

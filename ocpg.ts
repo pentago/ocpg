@@ -196,6 +196,22 @@ function rrfMerge<T extends { content: string }>(lists: T[][], k = 60): T[] {
   return [...scores.values()].sort((a, b) => b.score - a.score).map((e) => e.row);
 }
 
+// The shipped hybrid composition (bench/rrf-slots.ts): the vector list's top
+// `reserved` rows are UNCONDITIONAL, the rest is the RRF merge minus the
+// picks. Plain RRF alone dilutes vector hits when the keyword half is noisy
+// on the real corpus (equal-weight ties favor keyword-listed rows, and
+// weighting the vector side does not help - rows present in both lists are
+// boosted at any weight). R=2 was the free knee: real paraphrase hit@5
+// 8/20 -> 12/20 with zero measurable synthetic cost (R=3: 13/20 but the first
+// direct-recall regression, and 3/5 of the block can be nearest-neighbor
+// noise on no-signal prompts). reserved=0 or an empty vector list degenerates
+// to the plain merge, so the keyword-only fallbacks need no special case.
+function hybridMerge<T extends { content: string }>(keywordRows: T[], vectorRows: T[], reserved = 2): T[] {
+  const picked = vectorRows.slice(0, reserved);
+  const rest = rrfMerge([keywordRows, vectorRows]).filter((r) => !picked.some((p) => p.content === r.content));
+  return [...picked, ...rest];
+}
+
 // Off the write path: embed one memory and store its vector. Never throws -
 // callers fire-and-forget it, so every failure (Ollama down, missing column)
 // lands here. A row whose embedding stays NULL is keyword-only until the
@@ -437,7 +453,7 @@ async function handleTransform(
           logError("embed-query", `ocpg vector query failed, keyword-only: ${e instanceof Error ? e.message : String(e)}`);
           return null;
         });
-        if (vectorRows) rows = rrfMerge([keywordRows, vectorRows]);
+        if (vectorRows) rows = hybridMerge(keywordRows, vectorRows);
       }
       if (rows.length === 0) {
         // No retrieval signal at all for this prompt - recency beats an empty
@@ -592,7 +608,12 @@ async function recall(
         logError("embed-query", `ocpg vector query failed, keyword-only: ${e instanceof Error ? e.message : String(e)}`);
         return null;
       });
-      if (vectorRows) rows = rrfMerge([keywordRows, vectorRows]);
+      if (vectorRows) {
+        // Reserved slots never exceed half the result: at limit 1-2 the plain
+        // merge decides, so a direct query's exact keyword hit cannot be
+        // displaced by a merely-adjacent vector row.
+        rows = hybridMerge(keywordRows, vectorRows, Math.min(2, Math.floor(limit / 2)));
+      }
     }
     if (q) rows = rows.slice(0, limit);
 
@@ -1139,6 +1160,7 @@ const __internals = {
   embed,
   embedAndStore,
   rrfMerge,
+  hybridMerge,
   vectorLiteral,
   get ollamaBase() {
     return ollamaBase;

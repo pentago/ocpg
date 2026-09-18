@@ -246,9 +246,61 @@ Readings:
 Hybrid recall beats **both** parents at every size (a row present in both
 lists is boosted past either list's noise; at 50k it even beats fts-or on the
 direct-heavy mix, .417 vs .364) and matches the embedding half on paraphrase
-recall - never worse than either, which is why the production hybrid ships
-this shape. Latency note: the bench's shared query-embedding cache hides the
-ollama call in this row; the production cost is one ~20ms warm embed
+recall - never worse than either on the synthetic mix, which is why the
+hybrid shipped. Latency note: the bench's shared query-embedding cache hides
+the ollama call in this row; the production cost is one ~20ms warm embed
 overlapped with the keyword query plus a sub-ms merge. A cold bge-m3 load is
 ~2-3s (over the 1s injection deadline), so the plugin warms the model at
 session start and pins it with `keep_alive`.
+
+### Merge variants (2026-09-18; real 475-row corpus via bench/report.ts + synthetic 50k)
+
+Plain RRF turned out to dilute vector hits when the keyword half is noisy:
+on the real corpus, paraphrase queries still keyword-match unrelated
+memories, and equal-weight RRF ties favor keyword-listed rows - real
+paraphrase hit@5 was 8/20 for the RRF hybrid vs 14/20 embedding-only (the
+synthetic bench cannot show this: its paraphrase words appear nowhere in the
+corpus, so its keyword half is empty there by construction). Two fix shapes
+benched (`bench/rrf-weights.ts`, `bench/rrf-slots.ts`; candidate lists fetched
+once per query, merge varied):
+
+| variant | real hit@5 | syn recall | syn direct | syn para |
+| ------- | ---------- | ---------- | ---------- | -------- |
+| RRF 1x (initial ship) | 8/20 | .422 | .503 | .242 |
+| RRF vector 1.5x/2x/3x | 9/20 | .399 | .469 | .242 |
+| reserved R=1 | 11/20 | .422 | .503 | .242 |
+| **reserved R=2 (shipped)** | **12/20** | **.422** | **.503** | **.242** |
+| reserved R=3 | 13/20 | .413 | .491 | .242 |
+
+Anchors: keyword-only 2/20 real / .364 syn; embedding-only 14/20 / .228.
+
+Weighting fails structurally: rows present in BOTH lists are boosted by both
+terms at any weight (rank debugging: an em-rank-1 target needs ~60x to
+outrank an em-rank-2 double-dipper - weighting degenerates to
+embedding-only). Reserved slots make vector hits unconditional instead.
+
+R=1 recovers less (11/20); R=3 is closest to embedding-only (13/20) but shows
+the first synthetic regression (direct .503 -> .491) and lets
+nearest-neighbor noise hold a majority (3/5) of the block on no-signal
+prompts. R=2 is the knee: half the real gap closed for zero measurable
+synthetic cost - shipped as the production merge (`hybridMerge` in ocpg.ts,
+injection + recall).
+
+### Backend comparison (2026-09-18, `bun bench/ollama-backends.ts`, live 475-row DB)
+
+Host Ollama on the RTX 5070 vs the containerized CPU-only service
+(`deploy/compose.yaml` ollama, 4-CPU/4GB limit, ollama/ollama:0.34.2), same
+bge-m3, measured on the paths the plugin actually pays:
+
+| metric | host-gpu | container-cpu |
+| ------ | -------- | ------------- |
+| cold model load | 2877ms | 1105ms |
+| warm single embed p50 / p95 | 20.6 / 29.3ms | 92.9 / 96.7ms |
+| 32-text batch (write/backfill shape) | 263ms | 3092ms |
+| hybrid path (embed + HNSW query) p50 / p95 | 22.0 / 41.5ms | 94.4 / 98.9ms |
+
+Reading: CPU suffices for daily ocpg use - the warm ~95ms embed fits the
+750ms query budget with 7x headroom, and the cold load is actually faster on
+CPU (no VRAM transfer; both exceed 750ms, which is why the plugin warms the
+model at setup). GPU earns its place only on bulk re-embeds: ~97ms/row CPU vs
+~8ms/row GPU at batch-32, i.e. a 50k-row re-embed is ~80min vs ~7min.

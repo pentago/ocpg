@@ -1,7 +1,7 @@
 services:
-  pg:
-    container_name: pg
-    hostname: pg
+  pgvector:
+    container_name: pgvector
+    hostname: pgvector
     # pgvector build of Postgres 18: the embedding half of hybrid retrieval
     # (bge-m3, vector(1024)) needs the vector extension. Same major version as
     # the old postgres:18-alpine image, so existing data dirs keep working -
@@ -41,6 +41,60 @@ services:
         max-file: "3"
     healthcheck:
       test: ["CMD", "pg_isready", "-U", "${PG_USER}", "-d", "${PG_DB}"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # Optional embeddings backend for hybrid search (bge-m3), as an alternative
+  # to a host-installed Ollama. CPU-only by default and that suffices: ocpg's
+  # embeds are short and rare - measured with this exact service definition
+  # (4-core cap): ~95ms warm, ~1.1s cold model load, well inside the plugin's
+  # 750ms query budget. The commented GPU block (needs nvidia-container-toolkit
+  # on the host) cuts warm to ~20ms and matters for bulk re-embeds at 50k+
+  # rows, not daily use. The plugin runs on the HOST (inside opencode, not in
+  # this compose network) and reaches Ollama via the published port - the
+  # defaults OCPG_OLLAMA_HOST=localhost / OCPG_OLLAMA_PORT=11434 match as-is.
+  # Models persist in ./ollama-models (gitignored); pull once:
+  #   docker exec ollama ollama pull bge-m3
+  # HOME=/models because the server generates its id key there at boot; with
+  # read_only + cap_drop the root path is unwritable (verified).
+  ollama:
+    container_name: ollama
+    hostname: ollama
+    image: ollama/ollama:0.34.2
+    user: ${PUID}:${PGID}
+    restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp
+    environment:
+      HOME: /models
+      OLLAMA_MODELS: /models
+    volumes:
+      - ./ollama-models:/models
+    ports:
+      - "127.0.0.1:11434:11434"
+    deploy:
+      resources:
+        limits:
+          cpus: "4.0"
+          memory: 4G
+        # GPU reservations go here when nvidia-container-toolkit is installed:
+        # reservations:
+        #   devices:
+        #     - driver: nvidia
+        #       capabilities: [gpu]
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "ollama", "ls"]
       interval: 30s
       timeout: 5s
       retries: 3

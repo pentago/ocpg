@@ -16,6 +16,7 @@
     "bench:backends": "bun bench/ollama-backends.ts",
     "bench:report": "bun bench/report.ts",
     "bench:rrf-weights": "bun bench/rrf-weights.ts",
+    "bench:rrf-slots": "bun bench/rrf-slots.ts",
     "backfill": "bun deploy/backfill.ts"
   },
   "exports": {

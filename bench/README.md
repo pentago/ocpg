@@ -304,3 +304,37 @@ Reading: CPU suffices for daily ocpg use - the warm ~95ms embed fits the
 CPU (no VRAM transfer; both exceed 750ms, which is why the plugin warms the
 model at setup). GPU earns its place only on bulk re-embeds: ~97ms/row CPU vs
 ~8ms/row GPU at batch-32, i.e. a 50k-row re-embed is ~80min vs ~7min.
+
+## Smart-write judge gate (2026-09-18, `bun bench/judge.ts`, qwen3:4b, live dev DB)
+
+26 hand-labeled pairs (8 true duplicates, 8 true updates, 10
+similar-sounding-but-distinct) run through the production smart-write path
+(bge-m3 prefilter, 0.7 cosine threshold, judge verdict). Two consecutive
+runs, identical verdicts:
+
+| category | accuracy | misses |
+| -------- | -------- | ------ |
+| duplicate | 7/8 | 1 judged "update" (merged instead of skipped - redundant, not lossy) |
+| update | 7/8 | 1 below the 0.7 prefilter (sim 0.573) - stored as new, consolidate fodder |
+| distinct | 10/10 | **0 false-duplicates, 0 false-updates - the hard ship gate** |
+
+Zero-shot prompting FAILED this gate before the few-shot rewrite: the judge
+called every restatement "update" and synthesized corrupt merges
+("Postgres 1:6", "expires after 2:00 PM"), including one false update that
+clobbered a distinct pair. The few-shot prompt in `buildWritePrompt` is the
+fix - do not simplify it without re-running this gate.
+
+## Compaction-capture gate (2026-09-18, `bun bench/capture.ts`, 5 real sessions)
+
+Extraction-only rehearsal (no writes) on real opencode sessions, qwen3:4b:
+
+- trivial 2-message session (449 chars): correctly skipped by the 500-char
+  floor. Before the floor + stricter prompt it CONFABULATED a preference the
+  session never stated - both guards exist because of this.
+- 4 substantive sessions: 2-3 facts each, mostly genuine decisions, root
+  causes and stated preferences (one matched a preference already in the
+  real store verbatim). Residual noise: ~1 in 9 facts is session status
+  (SHAs, "next step is tagging") - harmless, `auto`-tagged, purgeable.
+- known behavior: overlapping facts inside one batch (e.g. two phrasings of
+  the same gotcha) arrive together; in production the smart-write path
+  dedups the later one, the capture bench does not exercise writes.

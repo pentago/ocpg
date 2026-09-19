@@ -305,7 +305,15 @@ CPU (no VRAM transfer; both exceed 750ms, which is why the plugin warms the
 model at setup). GPU earns its place only on bulk re-embeds: ~97ms/row CPU vs
 ~8ms/row GPU at batch-32, i.e. a 50k-row re-embed is ~80min vs ~7min.
 
-## Smart-write judge gate (2026-09-18, `bun bench/judge.ts`, qwen3:4b, live dev DB)
+## Smart-write judge gate (2026-09-18, `bun bench/judge.ts`, qwen3:4b, live dev DB) - REMOVED 2026-09-19
+
+The judge model (smart writes + compaction capture) was removed entirely:
+duplicate detection moved to `memory_consolidate`'s on-demand embedding pass
+instead of a model running on every write (see `ocpg.ts`'s `consolidate()`
+and `AGENTS.md`). `bench/judge.ts` and `bench/capture.ts` were deleted along
+with the feature they tested. The numbers below are kept as a historical
+record of what was tried and why it passed its own gate before being
+superseded - not as documentation of current behavior.
 
 26 hand-labeled pairs (8 true duplicates, 8 true updates, 10
 similar-sounding-but-distinct) run through the production smart-write path
@@ -321,10 +329,21 @@ runs, identical verdicts:
 Zero-shot prompting FAILED this gate before the few-shot rewrite: the judge
 called every restatement "update" and synthesized corrupt merges
 ("Postgres 1:6", "expires after 2:00 PM"), including one false update that
-clobbered a distinct pair. The few-shot prompt in `buildWritePrompt` is the
-fix - do not simplify it without re-running this gate.
+clobbered a distinct pair. The few-shot prompt in `buildWritePrompt` was the
+fix.
 
-## Compaction-capture gate (2026-09-18, `bun bench/capture.ts`, 5 real sessions)
+The same 26 pairs' bge-m3 cosine similarities (embedding only, no judge) were
+re-measured directly when calibrating `CONSOLIDATE_EMBED_THRESHOLD` for the
+replacement: duplicates clustered 0.78-0.96 (mean .88), distinct pairs topped
+out at 0.76 (mean .58), updates sat in between (0.57-0.87, mean .77) and
+overlap both - see `ocpg.ts`'s threshold comment for the resulting pick (0.83).
+
+## Compaction-capture gate (2026-09-18, `bun bench/capture.ts`, 5 real sessions) - REMOVED 2026-09-19
+
+Removed along with the judge model that powered it - there is no
+judge-free replacement for "extract durable facts from a transcript".
+Keyword-trigger capture is the only automatic capture path that remains.
+Kept as a historical record:
 
 Extraction-only rehearsal (no writes) on real opencode sessions, qwen3:4b:
 
@@ -338,3 +357,59 @@ Extraction-only rehearsal (no writes) on real opencode sessions, qwen3:4b:
 - known behavior: overlapping facts inside one batch (e.g. two phrasings of
   the same gotcha) arrive together; in production the smart-write path
   dedups the later one, the capture bench does not exercise writes.
+
+## Consolidate embedding-pass calibration (2026-09-19, ad hoc script against the same 26 pairs, live Ollama bge-m3)
+
+The judge model's removal needed a replacement threshold for
+`memory_consolidate`'s new meaning (embedding) pass. Re-measured the exact
+26 pairs from the judge gate above directly with bge-m3 cosine (no judge,
+no prefilter - just `existing` vs `incoming` similarity):
+
+| category | min | max | mean |
+| -------- | --- | --- | ---- |
+| duplicate | 0.784 | 0.956 | 0.882 |
+| update    | 0.573 | 0.874 | 0.775 |
+| distinct  | 0.505 | 0.760 | 0.585 |
+
+No single threshold separates "update" (a fact superseding an older one)
+from "duplicate" - the two ranges overlap almost entirely. `distinct` is
+the failure mode that matters (accidentally deleting a genuinely unique
+fact), and its max (0.760) sits comfortably below duplicate's min (0.784).
+`CONSOLIDATE_EMBED_THRESHOLD = 0.83` was picked with margin above the
+distinct ceiling (not the bare midpoint, ~0.77, between the two): it
+catches 7/8 duplicates and 0/10 distinct pairs (the hard gate), and
+2/8 update pairs - deleting the stale side of a superseded fact is an
+acceptable, reviewable outcome (the removed text always returns in
+`memory_consolidate`'s report), not the lost-unique-fact case this
+threshold protects against. Verified end-to-end against the live corpus in
+`tests/ocpg.test.ts`'s "consolidate: embedding-based pass" suite.
+
+## Meaning-pass exclusion filter (2026-09-19, real 476-row corpus, first live run)
+
+The threshold above was calibrated on 26 hand-written pairs; the first real
+run against the live corpus told a different story. It found 32 candidate
+merges - 11 of them wrong, all templated auto-generated content (background-
+task status logs from the team/subagent system, session-compaction
+summaries, per-app migration checklist entries) where a fixed sentence
+template drives cosine similarity high between GENUINELY DIFFERENT facts
+(different task ids, team members, sessions, or apps) because only a few
+words vary against shared boilerplate. Two exclusion strategies were tested:
+
+| strategy | correct merges affected | wrong merges fixed |
+| -------- | ------------------------ | ------------------- |
+| exclude `auto_capture` tag | 15/16 (guts the pass) | 8/11 |
+| exclude by content pattern (`background task bg_`, `session compacting for project`, `For APP <n> (`) | 0/28 | 9/11 |
+
+The tag carries no signal here - it marks "captured automatically" broadly
+(from an earlier, separate capture pipeline predating this project, not
+ocpg's own `auto` tag), and sits on both good and bad merges almost
+universally. The content pattern is precise because it targets the actual
+mechanism (fixed sentence shape), not a proxy for it. Shipped as
+`isTemplatedAutoLogPair`/`isTemplatedAutoLog` in `ocpg.ts`.
+
+The remaining 2 wrong merges (natural-language pairs at ~0.84 cosine - e.g.
+a system-level vs a user-level systemd unit file, described in structurally
+parallel sentences) are NOT templated and were confirmed unfixable by
+threshold alone: excluding them by raising the threshold past 0.84 would
+also have excluded 3 of the corpus's confirmed-correct merges (0.83-0.87
+range). Accepted as a residual, reviewable (not silent) false-merge rate.

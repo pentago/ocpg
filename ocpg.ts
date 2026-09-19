@@ -232,71 +232,6 @@ async function storeEmbedding(id: number, vec: number[]): Promise<void> {
   }
 }
 
-// --- Judge model (smart writes + compaction capture) ---
-
-// A small/cheap model does two judgment jobs: the smart-write verdict on
-// memory_remember and the durable-fact extraction at compaction. Never the
-// user's main coding model. OCPG_JUDGE_MODEL selects it: a "provider/id" ref
-// (contains "/") goes through OpenCode's ctx.generate.text against whatever
-// cheap model the user configured; anything else is an Ollama model name hit
-// directly over HTTP, same client pattern as embed(). "off"/"" disables both
-// features - writes then skip the prefilter entirely (exactly the old
-// behavior) and compaction capture never runs.
-let judgeModel = process.env.OCPG_JUDGE_MODEL || "qwen3:4b";
-
-function judgeEnabled(): boolean {
-  return judgeModel !== "" && judgeModel !== "off";
-}
-
-// Wired up in setup() only when judgeModel is an OpenCode ref; module-level
-// because remember() and the compaction hook have no plugin context.
-let opencodeGenerate: ((prompt: string) => Promise<string>) | null = null;
-
-// Write-path timeout, same budget as embed writes: tolerates a cold model
-// load (~3-6s for a 4b on the RTX 5070) so the first judgment after an idle
-// gap doesn't fall back for no reason.
-const JUDGE_TIMEOUT_MS = 15_000;
-
-// Never rejects: any failure (daemon down, model missing, timeout, OpenCode
-// error) logs rate-limited and returns null, and every caller degrades -
-// writes insert normally, capture skips. The judge can never break a write.
-async function judgeRaw(prompt: string): Promise<string | null> {
-  try {
-    if (judgeModel.includes("/")) {
-      if (!opencodeGenerate) {
-        logError("judge", `ocpg judge model ${judgeModel} is an OpenCode ref but no generate function is wired`);
-        return null;
-      }
-      // Raced, not cancelled - same pattern as withDeadline: the abandoned
-      // generation finishes server-side without blocking the write.
-      return await withDeadline(opencodeGenerate(prompt), JUDGE_TIMEOUT_MS);
-    }
-    const res = await fetch(`${ollamaBase}/api/chat`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        model: judgeModel,
-        messages: [{ role: "user", content: prompt }],
-        stream: false,
-        // think:false skips qwen3-style reasoning traces (ignored by models
-        // without it); format:json constrains the reply to parseable JSON;
-        // keep_alive pins the model like the embed path.
-        think: false,
-        format: "json",
-        keep_alive: "30m",
-        options: { num_ctx: 8192, temperature: 0 },
-      }),
-      signal: AbortSignal.timeout(JUDGE_TIMEOUT_MS),
-    });
-    if (!res.ok) throw new Error(`ollama /api/chat ${judgeModel}: HTTP ${res.status}`);
-    const data = (await res.json()) as { message?: { content?: unknown } };
-    return typeof data.message?.content === "string" ? data.message.content : null;
-  } catch (e: unknown) {
-    logError("judge", `ocpg judge unavailable, degrading: ${e instanceof Error ? e.message : String(e)}`);
-    return null;
-  }
-}
-
 // --- Injection pipeline ---
 
 // Injection ranking mode (plan follow-up: relevance over blind recency).
@@ -747,113 +682,6 @@ function validateWrite(args: RememberArgs): string | null {
 // injected block.
 const DEDUP_SIMILARITY = 0.8;
 
-// --- Smart writes (embedding prefilter + judge verdict) ---
-
-// Cosine-similarity prefilter: only rows at or above this are shown to the
-// judge. It bounds judge CALLS, not correctness - the judge makes the
-// verdict, so the threshold errs low (catch updates, not just restatements).
-// Below it, bge-m3 nearest neighbors are topically related at best and a
-// judge call would be noise. Calibrated by bench/judge.ts.
-const SIMILAR_THRESHOLD = 0.7;
-const SIMILAR_LIMIT = 3;
-
-type SimilarMemory = { id: number; content: string; similarity: number };
-
-// Top-3 nearest embedded rows under the same visibility rules as recall, WITH
-// their similarity score - the threshold is applied by the caller so the
-// bench (bench/judge.ts) can sweep it against raw values.
-async function findSimilarMemories(vectorLit: string, directory: string): Promise<SimilarMemory[]> {
-  const rows = await sql`
-    SELECT id, content, 1 - (embedding <=> ${vectorLit}::vector) AS similarity
-    FROM memories
-    WHERE embedding IS NOT NULL
-      AND ${visibleRows(sql, directory)}
-    ORDER BY embedding <=> ${vectorLit}::vector
-    LIMIT ${SIMILAR_LIMIT}
-  `;
-  return (rows as { id: number; content: string; similarity: number | string }[]).map((r) => ({
-    id: r.id,
-    content: r.content,
-    similarity: Number(r.similarity),
-  }));
-}
-
-type WriteVerdict =
-  | { verdict: "new" }
-  | { verdict: "update"; id: number; mergedContent: string }
-  | { verdict: "duplicate"; id: number };
-
-// Bias-to-store is the load-bearing instruction: a false "duplicate" or a
-// false "update" loses information permanently, a false "new" only feeds
-// memory_consolidate. The few-shot examples are not decoration: without them
-// a 4b judge calls every restatement an "update" and synthesizes merged text
-// that corrupts facts ("Postgres 1:6") - measured in bench/judge.ts.
-function buildWritePrompt(content: string, candidates: SimilarMemory[]): string {
-  const existing = candidates.map((c) => `#${c.id}: ${c.content}`).join("\n");
-  return `You classify whether a NEW memory duplicates or updates existing memories in a memory bank.
-
-Rules:
-- "duplicate": the new memory carries NO information beyond an existing one. A restatement in different words is a duplicate. Never merge restatements.
-- "update": the new memory CHANGES facts in an existing one about the SAME subject - a version, value, date, owner or process that is now different, so old and new cannot both be fully true.
-- "new": everything else. Different entities, environments, or aspects are ALWAYS "new", even when they sound similar: a production database and an analytics replica are different subjects. When in doubt, choose "new".
-
-For "update", include "merged_content": one memory of 1-3 sentences with the new state plus any still-relevant detail from the old one. Copy names, numbers and versions EXACTLY as written; never invent or alter them. If you cannot merge without guessing, choose "new" instead.
-
-Examples:
-Existing: #12: The staging database runs Postgres 15 on port 5432.
-New: The staging database was upgraded to Postgres 16 last week.
-{"verdict":"update","id":12,"merged_content":"The staging database was upgraded from Postgres 15 to Postgres 16 last week; it listens on port 5432."}
-
-Existing: #7: The backup job runs nightly at 02:00 UTC.
-New: Backups run every night at 2am UTC.
-{"verdict":"duplicate","id":7}
-
-Existing: #3: The production database runs Postgres 16 on port 5432.
-New: The analytics replica runs Postgres 16 on port 5433 with logical replication.
-{"verdict":"new"}
-
-Now classify. Existing memories:
-${existing}
-
-New memory:
-${content}
-
-Reply with JSON only, exactly one of:
-{"verdict":"new"}
-{"verdict":"update","id":<number>,"merged_content":"..."}
-{"verdict":"duplicate","id":<number>}`;
-}
-
-// Defensive parse: any malformed reply, hallucinated id, or out-of-bounds
-// merged content returns null and the caller treats it as "new" (insert) -
-// the failure direction that never loses information.
-function parseWriteVerdict(raw: string, candidateIds: number[]): WriteVerdict | null {
-  const match = /\{[\s\S]*\}/.exec(raw);
-  if (!match) return null;
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(match[0]);
-  } catch {
-    return null;
-  }
-  const body = parsed as { verdict?: unknown; id?: unknown; merged_content?: unknown };
-  if (body.verdict === "new") return { verdict: "new" };
-  const id = Number(body.id);
-  if (!Number.isInteger(id) || !candidateIds.includes(id)) return null;
-  if (body.verdict === "duplicate") return { verdict: "duplicate", id };
-  if (body.verdict === "update") {
-    if (
-      typeof body.merged_content !== "string" ||
-      body.merged_content.length < MIN_CONTENT ||
-      body.merged_content.length > MAX_CONTENT
-    ) {
-      return null;
-    }
-    return { verdict: "update", id, mergedContent: body.merged_content };
-  }
-  return null;
-}
-
 async function remember(
   args: RememberArgs,
   ctx: { directory: string; sessionID: string },
@@ -866,46 +694,6 @@ async function remember(
     const tags = args.tags ?? [];
     const basename = ctx.directory.split('/').pop() ?? ctx.directory;
 
-    // Smart-write check: embed the candidate and look for meaning-level near
-    // neighbors BEFORE inserting. No embedding (Ollama down/timeout, missing
-    // column) or nothing above the threshold → insert immediately, no judge
-    // call. The judge only runs when a candidate exists, and its failure
-    // (timeout, malformed reply) also degrades to inserting - the judge can
-    // delay a write but never lose one.
-    let vecs: number[][] | null = null;
-    if (judgeEnabled()) {
-      vecs = await embed([args.content], EMBED_WRITE_TIMEOUT_MS);
-      if (vecs) {
-        const similar = await findSimilarMemories(vectorLiteral(vecs[0]), ctx.directory).catch(
-          (e: unknown) => {
-            logError("similar", `ocpg similarity search failed, inserting: ${e instanceof Error ? e.message : String(e)}`);
-            return [] as SimilarMemory[];
-          },
-        );
-        const candidates = similar.filter((s) => s.similarity >= SIMILAR_THRESHOLD);
-        if (candidates.length > 0) {
-          const raw = await judgeRaw(buildWritePrompt(args.content, candidates));
-          const verdict = raw ? parseWriteVerdict(raw, candidates.map((c) => c.id)) : null;
-          if (verdict?.verdict === "duplicate") {
-            const existing = candidates.find((c) => c.id === verdict.id);
-            return `Not stored: #${verdict.id} already covers this ("${truncateMemory(existing?.content ?? "")}"). Use memory_update on #${verdict.id} if it should change.`;
-          }
-          if (verdict?.verdict === "update") {
-            const existing = candidates.find((c) => c.id === verdict.id);
-            // Goes through the normal update path: same validation, same
-            // origin-project scoping, same re-embed.
-            const res = await updateMemory({ id: verdict.id, content: verdict.mergedContent }, ctx);
-            if (res.startsWith("Updated memory #")) {
-              return `Merged into memory #${verdict.id} (was: "${truncateMemory(existing?.content ?? "")}").`;
-            }
-            // Update refused (foreign row, validation) - fall through and
-            // store the new memory instead of losing it.
-            logError("judge", `ocpg smart-write update on #${verdict.id} failed, inserting instead: ${res}`);
-          }
-        }
-      }
-    }
-
     // sql.array(tags) alone encodes text[] with quoted elements under bun 1.4.2;
     // the element type hint is required for clean array storage.
     const inserted = await sql`
@@ -914,13 +702,9 @@ async function remember(
       RETURNING id
     ` as { id: number }[];
 
-    // The prefilter already computed this write's embedding - store it
-    // directly instead of embedding twice. Without it (judge disabled or
-    // embed failed), fire-and-forget the embed as before: a failure leaves
-    // embedding NULL, keyword search keeps working, and the backfill
-    // (deploy/backfill.ts) fills the gap later.
-    if (vecs) void storeEmbedding(inserted[0].id, vecs[0]);
-    else void embedAndStore(inserted[0].id, args.content);
+    // Fire-and-forget: a failure leaves embedding NULL, keyword search keeps
+    // working, and the backfill (deploy/backfill.ts) fills the gap later.
+    void embedAndStore(inserted[0].id, args.content);
 
     // The injection block is global, but its cache is keyed by the calling
     // directory + prompt; clear the directory's keys.
@@ -972,134 +756,6 @@ async function captureFromPrompt(
     await remember({ content, tags: ["user-requested"] }, { directory, sessionID });
   } catch (e: unknown) {
     logError("capture", `ocpg keyword capture failed: ${e instanceof Error ? e.message : String(e)}`);
-  }
-}
-
-// --- Compaction capture (auto path) ---
-
-// Third capture path alongside the keyword trigger and manual
-// memory_remember: when a session is compacted, the judge model reads the
-// transcript and extracts 0-3 durable facts, each written through the NORMAL
-// remember() path - same validation, same smart-write check, tagged "auto".
-// The smart-write check is also the dedup for repeated compactions of one
-// session: overlapping transcripts re-extract the same facts, which the judge
-// then marks duplicate of the rows the first compaction stored.
-const CAPTURE_MAX_FACTS = 3;
-// Tail-biased cap: fresh work (and its decisions) sits at the end, and the
-// judge's num_ctx (8192) bounds what fits. ~16k chars ≈ ~4-5k tokens.
-const TRANSCRIPT_CAP = 16_000;
-
-// Structural typing like extractPromptQuery: the hook passes @opencode/ai
-// Message objects, but only role + text/tool-call parts are read.
-function renderTranscript(
-  messages: ReadonlyArray<{
-    role: unknown;
-    content: ReadonlyArray<{ type?: unknown; text?: unknown; name?: unknown }>;
-  }>,
-): string {
-  const lines: string[] = [];
-  for (const m of messages) {
-    const parts: string[] = [];
-    for (const p of m.content ?? []) {
-      if (p.type === "text" && typeof p.text === "string") parts.push(p.text);
-      // Tool names orient the judge ("ran tests", "edited deploy.yaml") at
-      // zero token cost; tool RESULTS are deliberately dropped - too large,
-      // and the durable knowledge surfaces in the assistant's own text.
-      else if (p.type === "tool-call" && typeof p.name === "string") parts.push(`[tool: ${p.name}]`);
-    }
-    const text = parts.join(" ").trim();
-    if (text) lines.push(`${String(m.role)}: ${text}`);
-  }
-  const full = lines.join("\n");
-  return full.length <= TRANSCRIPT_CAP ? full : `[...earlier messages omitted...]\n${full.slice(-TRANSCRIPT_CAP)}`;
-}
-
-function buildCapturePrompt(transcript: string): string {
-  return `Below is the transcript of an AI coding session that is about to be compacted.
-
-Extract up to ${CAPTURE_MAX_FACTS} DURABLE facts worth remembering for future sessions, but ONLY facts the transcript explicitly establishes:
-- decisions made and why
-- non-obvious fixes or root causes discovered
-- user preferences the user stated in so many words
-- environment or tooling facts not stated in the code
-
-Do NOT extract:
-- session progress or task status ("the assistant implemented X" is progress, not a durable fact)
-- plans, proposals, or rejected options: what the session was GOING to do is not durable - only what it concluded, decided, or discovered
-- anything the code or config itself already states
-- inferences or generalizations the transcript does not state outright
-- file contents or secrets
-
-A short or trivial session has nothing durable. If in doubt, return an empty list - storing nothing is a correct and common outcome.
-
-Reply with JSON only:
-{"facts":[{"content":"1-3 self-contained sentences","type":"preference|stack_fact|project_fact","tags":["..."]}]}
-
-Transcript:
-${transcript}`;
-}
-
-type ExtractedFact = { content: string; type?: MemoryType; tags: string[] };
-
-// Defensive parse, same rule as parseWriteVerdict: anything malformed drops
-// the fact (a lost EXTRACTION is silent in the transcript anyway; a garbage
-// WRITE pollutes the store). Content bounds mirror validateWrite so nothing
-// here can fail the write it is handed to.
-function parseExtractedFacts(raw: string): ExtractedFact[] {
-  const match = /\{[\s\S]*\}/.exec(raw);
-  if (!match) return [];
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(match[0]);
-  } catch {
-    return [];
-  }
-  const facts = (parsed as { facts?: unknown }).facts;
-  if (!Array.isArray(facts)) return [];
-  const out: ExtractedFact[] = [];
-  // The cap counts VALID facts: filter first, stop at the cap - slicing the
-  // raw array first would let invalid entries eat a valid fact's slot.
-  for (const f of facts) {
-    if (out.length >= CAPTURE_MAX_FACTS) break;
-    const fact = f as { content?: unknown; type?: unknown; tags?: unknown };
-    if (typeof fact.content !== "string") continue;
-    const content = fact.content.trim();
-    if (content.length < MIN_CONTENT || content.length > MAX_CONTENT) continue;
-    // -1: the "auto" tag is appended by the caller and must fit the cap.
-    const tags = Array.isArray(fact.tags)
-      ? fact.tags.filter((t): t is string => typeof t === "string" && t.length > 0 && t.length <= MAX_TAG_LENGTH).slice(0, MAX_TAGS - 1)
-      : [];
-    out.push({ content, type: resolveMemoryType(fact.type), tags });
-  }
-  return out;
-}
-
-// Fire-and-forget from the compaction hook: compaction itself must not wait
-// on a judge call. Never throws - a judge failure/timeout just skips capture
-// for that compaction, the same degrade pattern as embeddings.
-async function captureFromCompaction(
-  messages: ReadonlyArray<{
-    role: unknown;
-    content: ReadonlyArray<{ type?: unknown; text?: unknown; name?: unknown }>;
-  }>,
-  directory: string,
-  sessionID: string,
-): Promise<void> {
-  if (!judgeEnabled()) return;
-  try {
-    const transcript = renderTranscript(messages);
-    // Below this there is no session to speak of (a stub exchange); judging
-    // it would only risk hallucinated "facts" - measured in gate 2, where a
-    // 449-char trivial exchange produced a confabulated preference.
-    if (transcript.length < 500) return;
-    const raw = await judgeRaw(buildCapturePrompt(transcript));
-    if (!raw) return;
-    for (const fact of parseExtractedFacts(raw)) {
-      const tags = fact.tags.includes("auto") ? fact.tags : [...fact.tags, "auto"];
-      await remember({ content: fact.content, type: fact.type, tags }, { directory, sessionID });
-    }
-  } catch (e: unknown) {
-    logError("capture", `ocpg compaction capture failed: ${e instanceof Error ? e.message : String(e)}`);
   }
 }
 
@@ -1186,16 +842,81 @@ async function updateMemory(
   }
 }
 
+// Embedding-similarity threshold for consolidate's second pass, calibrated
+// against the same hand-labeled pairs the (now-removed) judge bench used
+// (bench/judge.ts's PAIRS, bge-m3 cosine, measured 2026-09-19 before removal):
+// true duplicates clustered 0.78-0.96 (mean .88), genuinely distinct-but-
+// related pairs topped out at 0.76 (mean .58), and true "updates" (a fact
+// superseding an older one, e.g. "Postgres 15" -> "upgraded to Postgres 16")
+// sat in between (0.57-0.87, mean .77) and overlap both other groups - no
+// threshold cleanly separates updates from duplicates. 0.83 sits clear of
+// every distinct pair (zero false merges on the one failure mode that
+// matters, per the spec: never delete a genuinely unique fact) while still
+// catching most duplicates (7/8 of the sample) and about half the update
+// pairs - deleting the stale side of a superseded fact is an acceptable,
+// reviewable outcome here (the removed text always comes back in the
+// report), not the lost-information case this threshold is tuned against.
+const CONSOLIDATE_EMBED_THRESHOLD = 0.83;
+
+// Mutual visibility for consolidation, mirroring visibleRows(): a project_fact
+// may only cluster with another row from its OWN project (regardless of that
+// row's type); global types (preference, stack_fact) cluster with anything.
+// Consolidation must never merge/delete across a boundary memory_forget and
+// memory_update already refuse to cross.
+function mutuallyVisible(client: SQL) {
+  return client`((a.memory_type != 'project_fact' AND b.memory_type != 'project_fact') OR a.project = b.project)`;
+}
+
+// Excludes structurally templated, auto-generated content from the meaning
+// pass: verified against the real corpus (2026-09-19 audit, see AGENTS.md)
+// that three fixed sentence templates - background-task status logs from the
+// team/subagent system, session-compaction summaries, and per-app migration
+// checklist entries - drive cosine similarity high between GENUINELY
+// DIFFERENT facts (different task ids, different sessions, different apps)
+// purely because only a few words vary while the rest of the sentence is
+// boilerplate. This is a content-pattern check, not the `auto_capture` tag:
+// that tag was tested first and rejected - it sits on ~90% of BOTH correct
+// and incorrect merges alike in the real corpus, so excluding by tag would
+// gut the pass. The three patterns below have zero overlap with any
+// confirmed-correct meaning-pass merge in that same audit. A residual, much
+// smaller false-merge rate remains on natural-language content whose
+// wording happens to be structurally parallel (e.g. two genuinely different
+// systemd unit files described in near-identical sentences) - no threshold
+// or pattern separates that case from true duplicates without also losing
+// real ones (see AGENTS.md), so it is accepted rather than "fixed". Two
+// variants: the self-join (a/b aliases) and the plain single-table form.
+function isTemplatedAutoLogPair(client: SQL) {
+  return client`(
+    a.content ILIKE '%background task bg_%' OR b.content ILIKE '%background task bg_%'
+    OR a.content ILIKE '%session compacting for project%' OR b.content ILIKE '%session compacting for project%'
+    OR a.content ~ 'For APP.{0,3}[0-9]+.{0,3}\\(' OR b.content ~ 'For APP.{0,3}[0-9]+.{0,3}\\('
+  )`;
+}
+
+function isTemplatedAutoLog(client: SQL) {
+  return client`(
+    content ILIKE '%background task bg_%'
+    OR content ILIKE '%session compacting for project%'
+    OR content ~ 'For APP.{0,3}[0-9]+.{0,3}\\('
+  )`;
+}
+
 // Deterministic consolidation, no model calls inside the plugin: find
-// near-duplicate clusters (trigram similarity >= DEDUP_SIMILARITY over the
-// whole content, global), keep the newest of each, delete the rest. The
+// near-duplicate clusters, keep the newest of each, delete the rest. The
 // deleted texts are returned verbatim so the CALLING agent - itself a model -
 // can merge any unique fact back into the survivor via memory_update. Merging
 // is language synthesis, which is the caller's job, not the plugin's.
-// Runs on demand (user-invoked), never on a schedule; capped at 25 clusters
-// per run so a wildly-duplicated corpus cannot turn into one huge report.
+// Runs on demand (user-invoked), never on a schedule.
+//
+// Two passes, run in sequence (the second sees whatever the first already
+// removed): trigram similarity over content (wording-level restatements,
+// unchanged from the original implementation) and embedding cosine
+// similarity (meaning-level duplicates worded completely differently, the
+// case trigram structurally cannot reach). Each is capped at 25 clusters per
+// run so a wildly-duplicated corpus cannot turn into one huge report.
 async function consolidate(): Promise<string> {
   try {
+    // --- Pass 1: wording (trigram similarity over content) ---
     const rows = await sql`
       SELECT id, content, coalesce(tags, '{}') AS tags, created_at
       FROM memories
@@ -1223,12 +944,11 @@ async function consolidate(): Promise<string> {
       else clusters.push([entry]);
     }
 
-    const multi = clusters.filter((c) => c.length > 1).slice(0, 25);
-    if (multi.length === 0) return "No duplicates found; nothing to consolidate.";
+    const wordingGroups = clusters.filter((c) => c.length > 1).slice(0, 25);
 
     let removed = 0;
     const report: string[] = [];
-    for (const cluster of multi) {
+    for (const cluster of wordingGroups) {
       const survivor = cluster[0].row;
       const removedRows = cluster.slice(1).map((e) => e.row);
       for (const r of removedRows) {
@@ -1238,14 +958,72 @@ async function consolidate(): Promise<string> {
       // Show what died so the calling agent can merge unique facts back into
       // the survivor.
       report.push(
-        `Kept #${survivor.id}: ${truncateMemory(survivor.content)}\n` +
+        `[wording] Kept #${survivor.id}: ${truncateMemory(survivor.content)}\n` +
           removedRows.map((r) => `  removed #${r.id}: ${truncateMemory(r.content)}`).join("\n"),
       );
     }
 
+    // --- Pass 2: meaning (embedding cosine similarity) ---
+    // Only rows the wording pass left behind, only embedded rows (a row
+    // Ollama never reached - down at write time, pre-migration database - is
+    // simply not a candidate, same graceful-degradation posture as everywhere
+    // else), and never templated auto-logs (isTemplatedAutoLog - see its
+    // comment for why). The pairwise threshold join is pushed into Postgres
+    // (pgvector's <=> operator) rather than pulled into TS: cheap for the
+    // corpus sizes this tool already accepts an O(n^2) cost for (see the
+    // wording pass), and it lets the DB do the floating-point work instead of JS.
+    const embedPairs = (await sql`
+      SELECT a.id AS a_id, b.id AS b_id
+      FROM memories a
+      JOIN memories b ON a.id < b.id
+      WHERE a.embedding IS NOT NULL
+        AND b.embedding IS NOT NULL
+        AND (1 - (a.embedding <=> b.embedding)) >= ${CONSOLIDATE_EMBED_THRESHOLD}
+        AND ${mutuallyVisible(sql)}
+        AND NOT ${isTemplatedAutoLogPair(sql)}
+    `) as { a_id: number; b_id: number }[];
+
+    if (embedPairs.length > 0) {
+      const linked = new Set<string>();
+      for (const p of embedPairs) linked.add(`${p.a_id}:${p.b_id}`);
+      const isLinked = (x: number, y: number) => (x < y ? linked.has(`${x}:${y}`) : linked.has(`${y}:${x}`));
+
+      const embedRows = (await sql`
+        SELECT id, content, coalesce(tags, '{}') AS tags, created_at
+        FROM memories
+        WHERE embedding IS NOT NULL AND NOT ${isTemplatedAutoLog(sql)}
+        ORDER BY created_at DESC
+      `) as { id: number; content: string; tags: string[]; created_at: Date }[];
+
+      // Same greedy "newest anchors a cluster" shape as the wording pass,
+      // matched by the pair list above instead of a text-similarity test.
+      const embedClusters: Array<Array<(typeof embedRows)[number]>> = [];
+      for (const row of embedRows) {
+        const host = embedClusters.find((c) => isLinked(c[0].id, row.id));
+        if (host) host.push(row);
+        else embedClusters.push([row]);
+      }
+      const meaningGroups = embedClusters.filter((c) => c.length > 1).slice(0, 25);
+
+      for (const cluster of meaningGroups) {
+        const survivor = cluster[0];
+        const removedRows = cluster.slice(1);
+        for (const r of removedRows) {
+          await sql`DELETE FROM memories WHERE id = ${r.id}`;
+        }
+        removed += removedRows.length;
+        report.push(
+          `[meaning] Kept #${survivor.id}: ${truncateMemory(survivor.content)}\n` +
+            removedRows.map((r) => `  removed #${r.id}: ${truncateMemory(r.content)}`).join("\n"),
+        );
+      }
+    }
+
+    if (report.length === 0) return "No duplicates found; nothing to consolidate.";
+
     if (removed > 0) injectionCache.clear();
     return (
-      `Removed ${removed} duplicate ${removed === 1 ? "memory" : "memories"} across ${multi.length} groups (kept the newest of each).\n` +
+      `Removed ${removed} duplicate ${removed === 1 ? "memory" : "memories"} across ${report.length} groups (kept the newest of each; [wording] = matched by trigram similarity, [meaning] = matched by embedding similarity).\n` +
       `Check the removed texts - if any carries a fact the kept memory lacks, merge it in with memory_update:\n\n` +
       report.join("\n")
     );
@@ -1300,23 +1078,6 @@ const ocpg = Plugin.define({
       void captureFromPrompt(event.prompt.text, directory, event.sessionID);
     });
 
-    // A "provider/model" judge ref runs through OpenCode's own model stack
-    // (the user's configured cheap model); a bare name hits Ollama directly
-    // and needs no wiring here.
-    if (judgeEnabled() && judgeModel.includes("/")) {
-      const [providerID, ...rest] = judgeModel.split("/");
-      const id = rest.join("/");
-      opencodeGenerate = async (prompt: string) =>
-        (await ctx.generate.text({ model: { providerID, id }, prompt })).text;
-    }
-
-    // Compaction capture (auto path): the hook hands us the transcript being
-    // summarized. It is fire-and-forget - compaction must not wait on a judge
-    // call - and never sets event.result: OpenCode's own summary is untouched.
-    await ctx.session.hook("compaction", (event) => {
-      void captureFromCompaction(event.messages, directory, event.sessionID);
-    });
-
     // Agent tools: recall + remember with dedup-on-write. Input schemas are raw
     // JSON Schema (V2 contract); sizes are enforced in remember().
     await ctx.tool.transform((editor) => {
@@ -1367,9 +1128,8 @@ const ocpg = Plugin.define({
           "global: true. Use after user corrections (immediately), architecture decisions, " +
           "non-trivial fixes, environment facts, and stated preferences. " +
           "Do not store session progress, secrets, or anything the code itself already states. " +
-          "Before storing, a similar-memory check may merge this into an existing memory or " +
-          "skip it as a duplicate - the result always says what actually happened, so a " +
-          "skipped/merged write needs no retry.",
+          "Duplicate writes are never rejected - run memory_consolidate afterward to clean up " +
+          "near-duplicates if the corpus has accumulated restatements of one fact.",
         input: {
           type: "object",
           properties: {
@@ -1467,12 +1227,11 @@ const ocpg = Plugin.define({
         options: { codemode: false },
         // User-invoked cleanup, not a write-path gate: writes never reject on
         // duplicates, so call this when the corpus has accumulated near-dupes.
-        // User-invoked cleanup, not a write-path gate: writes never reject on
-        // duplicates, so call this when the corpus has accumulated near-dupes.
         // The deleted texts come back in the result so the calling agent can
         // merge unique facts into the survivors via memory_update.
         description:
-          "Remove near-duplicate memories: keeps the newest of each >=80%-similar content group anywhere in the store and deletes the rest, returning the removed texts. " +
+          "Remove near-duplicate memories: keeps the newest of each near-duplicate group anywhere in the store and deletes the rest, returning the removed texts. " +
+          "Finds duplicates two ways - matching wording (trigram similarity) and matching meaning (embedding similarity, catches the same fact stated in different words). " +
           "After running it, merge any unique fact from the removed texts into the kept memory via memory_update. Deterministic - run it when the user asks to tidy or consolidate memories.",
         input: {
           type: "object",
@@ -1529,26 +1288,7 @@ const __internals = {
   embed,
   embedAndStore,
   storeEmbedding,
-  judgeRaw,
-  findSimilarMemories,
-  buildWritePrompt,
-  parseWriteVerdict,
-  renderTranscript,
-  buildCapturePrompt,
-  parseExtractedFacts,
-  captureFromCompaction,
-  get judgeModel() {
-    return judgeModel;
-  },
-  // Test hook: "off" makes writes deterministic (no prefilter, no judge),
-  // which the pre-smart-write tests rely on; the judge suites re-enable it.
-  setJudgeModel(model: string) {
-    judgeModel = model;
-  },
-  get judgeTimeoutMs() {
-    return JUDGE_TIMEOUT_MS;
-  },
-  SIMILAR_THRESHOLD,
+  CONSOLIDATE_EMBED_THRESHOLD,
   rrfMerge,
   hybridMerge,
   vectorLiteral,

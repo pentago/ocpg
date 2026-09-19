@@ -73,13 +73,8 @@ bun run backfill   # same OCPG_* env as the plugin; idempotent, re-runnable
 Semantic search needs a reachable Ollama with the model pulled
 (`ollama pull bge-m3`) - host-installed or the compose `ollama` service, the
 plugin defaults match either. Without Ollama everything still works - search
-just stays keyword-only.
-
-Smart writes and compaction capture additionally want the judge model
-(`ollama pull qwen3:4b`, override with `OCPG_JUDGE_MODEL`). A CPU-only Ollama
-serves bge-m3 fine but makes the 4b judge slow enough to hit its 15s
-timeout - on CPU-only setups either accept the timeouts (writes just fall
-back to plain inserts) or set `OCPG_JUDGE_MODEL=off`.
+just stays keyword-only, and `memory_consolidate`'s meaning pass simply has
+no embedded rows to compare.
 
 `.env` values:
 

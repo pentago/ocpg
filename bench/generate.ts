@@ -47,24 +47,6 @@ CREATE INDEX idx_memories_tags   ON memories USING gin (tags);
 CREATE INDEX idx_memories_project_created ON memories (project, created_at DESC);
 `;
 
-// Thesaurus dictionary + config for the fts-*-thesaurus strategies in run.ts.
-// Query-time only: search_vector stays generated with to_tsvector('english'),
-// so the same column and GIN index serve every strategy. DictFile is resolved
-// against the server's tsearch_data directory - bench_synonyms.ths must be
-// copied there first (bench/README.md). A server without the file still gets
-// usable bench DBs; run.ts then skips the thesaurus strategies.
-const THESAURUS_DDL = `
-CREATE TEXT SEARCH DICTIONARY bench_thesaurus (
-  TEMPLATE = thesaurus,
-  DictFile = bench_synonyms,
-  Dictionary = english_stem
-);
-CREATE TEXT SEARCH CONFIGURATION bench_thesaurus_cfg (COPY = english);
-ALTER TEXT SEARCH CONFIGURATION bench_thesaurus_cfg
-  ALTER MAPPING FOR asciiword, asciihword, hword, hword_part, hword_asciipart, hword_numpart
-  WITH bench_thesaurus, english_stem;
-`;
-
 // admin = the connection that creates/drops databases.
 const admin = new SQL(makeSql("postgres"));
 
@@ -75,13 +57,6 @@ for (const size of sizes) {
   const db = new SQL(makeSql(dbname));
   try {
     await db.unsafe(DDL);
-    try {
-      await db.unsafe(THESAURUS_DDL);
-    } catch (err) {
-      console.warn(
-        `${dbname}: bench_thesaurus_cfg not installed (${err instanceof Error ? err.message : err}) - thesaurus strategies will be skipped`,
-      );
-    }
 
     const rand = rng(seed + size);
     const rows: Array<[string, string[], string, number]> = []; // content, tags, project, daysAgo

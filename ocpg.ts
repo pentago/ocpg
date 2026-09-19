@@ -1289,6 +1289,7 @@ const __internals = {
   embedAndStore,
   storeEmbedding,
   CONSOLIDATE_EMBED_THRESHOLD,
+  isTemplatedAutoLog,
   rrfMerge,
   hybridMerge,
   vectorLiteral,

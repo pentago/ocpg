@@ -1579,6 +1579,159 @@ describe("DB access layer", () => {
         __internals.invalidateInjection(project);
       }
     });
+
+    test.skipIf(!hybridReady)("session-compaction summaries (real template shape) are excluded from the meaning pass", async () => {
+      // Mirrors real corpus rows #12/#794/#803: same fixed template, only the
+      // session id and counters vary, and real measured cosine similarity
+      // between them was 0.97-0.98 - among the highest false-merge risk found
+      // in the 2026-09-19 audit. Trigram jaccard for this pair is ~0.70 (below
+      // DEDUP_SIMILARITY 0.8), so the wording pass must not catch it either -
+      // any removal here would prove the meaning pass, not a fixture artifact.
+      const project = "/tmp/ocpg-test-consolidate-sesscompact";
+      try {
+        const a = await __internals.remember(
+          { content: "User performed session compacting for project widget-frontend-repo on branch main, session ses_aaabbbcccdddeeefff111, recording 3 memories stored, 0 searches, and 10 messages." },
+          { directory: project, sessionID: "sc" },
+        );
+        const aId = Number(a.match(/#(\d+)/)?.[1]);
+        const b = await __internals.remember(
+          { content: "User performed session compacting for project widget-frontend-repo on branch main, session ses_gggghhhhiiiijjjjkkkk222, recording 4 memories stored, 0 searches, and 14 messages." },
+          { directory: project, sessionID: "sc" },
+        );
+        const bId = Number(b.match(/#(\d+)/)?.[1]);
+        expect(await untilEmbedded(aId)).toBe(true);
+        expect(await untilEmbedded(bId)).toBe(true);
+
+        await __internals.consolidate();
+
+        // Both survive - two different sessions of the same project, not a
+        // duplicate - despite the near-identical wording.
+        const [rowA] = await __internals.sql`SELECT count(*) AS n FROM memories WHERE id = ${aId}` as { n: string }[];
+        const [rowB] = await __internals.sql`SELECT count(*) AS n FROM memories WHERE id = ${bId}` as { n: string }[];
+        expect(Number(rowA.n)).toBe(1);
+        expect(Number(rowB.n)).toBe(1);
+      } finally {
+        await __internals.sql`DELETE FROM memories WHERE project = ${project}`;
+        __internals.invalidateInjection(project);
+      }
+    });
+
+    test.skipIf(!hybridReady)("per-app migration checklist entries (real template shape) are excluded from the meaning pass", async () => {
+      // Mirrors real corpus rows #519/#520: "For APP N (...)" checklist
+      // entries for two DIFFERENT apps, real measured cosine ~0.89. Trigram
+      // jaccard for this pair is ~0.69 (below DEDUP_SIMILARITY 0.8), so the
+      // wording pass must not catch it either.
+      const project = "/tmp/ocpg-test-consolidate-perapp";
+      try {
+        const a = await __internals.remember(
+          { content: "For APP 1 (widget-frontend), User lists: old values file charts_values/environments/staging/widget.frontend.values.yaml; live dump apps/live-staging-dump/widget-frontend/live.all.yaml; test reference charts_values/environments/test/widget-frontend.values.new.yaml; release name widget-frontend; chart app name widget-frontend; per-app secret name widget-frontend-secrets." },
+          { directory: project, sessionID: "pa" },
+        );
+        const aId = Number(a.match(/#(\d+)/)?.[1]);
+        const b = await __internals.remember(
+          { content: "For APP 2 (gizmo-worker), User lists: old values file charts_values/environments/staging/gizmo.worker.values.yaml; live dump apps/live-staging-dump/gizmo-worker/live.all.yaml; test reference charts_values/environments/test/gizmo-worker.values.new.yaml; release name gizmo-worker; chart app name gizmo-worker; per-app secret name gizmo-worker-secrets." },
+          { directory: project, sessionID: "pa" },
+        );
+        const bId = Number(b.match(/#(\d+)/)?.[1]);
+        expect(await untilEmbedded(aId)).toBe(true);
+        expect(await untilEmbedded(bId)).toBe(true);
+
+        await __internals.consolidate();
+
+        // Both survive - two different apps' migration details, not a
+        // duplicate - despite the shared checklist template.
+        const [rowA] = await __internals.sql`SELECT count(*) AS n FROM memories WHERE id = ${aId}` as { n: string }[];
+        const [rowB] = await __internals.sql`SELECT count(*) AS n FROM memories WHERE id = ${bId}` as { n: string }[];
+        expect(Number(rowA.n)).toBe(1);
+        expect(Number(rowB.n)).toBe(1);
+      } finally {
+        await __internals.sql`DELETE FROM memories WHERE project = ${project}`;
+        __internals.invalidateInjection(project);
+      }
+    });
+  });
+
+  describe("consolidate: isTemplatedAutoLog predicate (regression, no embeddings needed)", () => {
+    // Permanent regression net for the exclusion predicate itself: runs the
+    // exact SQL fragment consolidate() uses (via __internals.isTemplatedAutoLog),
+    // against representative strings pulled from the 2026-09-19 real-corpus
+    // audit - so a future refactor of the predicate is caught here even
+    // without a live Ollama/pgvector setup (no hybridReady gate, no writes).
+    const matches = async (content: string): Promise<boolean> => {
+      const [row] = await __internals.sql`
+        SELECT ${__internals.isTemplatedAutoLog(__internals.sql)} AS matches
+        FROM (SELECT ${content}::text AS content) AS t
+      ` as { matches: boolean }[];
+      return row.matches;
+    };
+
+    test("matches all three real-corpus template shapes", async () => {
+      // Background-task status logs (team/subagent system) - both phrasing
+      // variants seen in the real corpus ("Background task bg_..." and
+      // "User reported that background task bg_...").
+      expect(
+        await matches(
+          "Background task bg_8bc0727a, intended to create the team member aur-makefile-review/creative-analyst, was cancelled for the same reason: the subagent called team_task_list ten consecutive times.",
+        ),
+      ).toBe(true);
+      expect(
+        await matches(
+          "User reported that background task bg_a638c530 attempted ImageUpdater Job handling, failed session ses_0c70329cdffe5h115YnXI5BaO6 using model opencode/north-mini-code-free, hit a Bad Gateway error, and was re-queued on fallback model opencode/deepseek-v4-flash-free.",
+        ),
+      ).toBe(true);
+
+      // Session-compaction summaries.
+      expect(
+        await matches(
+          "User performed session compacting for project pentago-dotfiles on branch main, session ses_066a7d7d8ffeZ4Ui7QdapK6qnV, recording 3 memories stored, 0 searches, and 10 messages.",
+        ),
+      ).toBe(true);
+
+      // Per-app migration checklist entries.
+      expect(
+        await matches(
+          "For APP 1 (storybook-web), User lists: old values file charts_values/environments/staging/storybook.web.values.yaml; release name vedur-storybook-web.",
+        ),
+      ).toBe(true);
+      expect(
+        await matches(
+          "For APP 2 (skridur), User lists: old values file charts_values/environments/staging/vedur.skridur.values.yaml; release name vedur-skridur.",
+        ),
+      ).toBe(true);
+    });
+
+    test("does not match real natural-language content, including confirmed-correct meaning-pass merges", async () => {
+      // These are the actual "correct merge" pairs from the 2026-09-19 audit
+      // (real fact restatements the meaning pass is supposed to keep
+      // catching) - a predicate refactor that starts matching these would
+      // silently gut the pass, exactly the auto_capture-tag failure mode.
+      expect(
+        await matches(
+          "Surviving finding: the IgnorePath pattern '/etc/*-' in 00-ignores.sh line 21 is overly broad, matching any /etc/ entry ending with a hyphen; recommendation is to replace it with explicit backup file patterns or add a clarifying comment.",
+        ),
+      ).toBe(false);
+      expect(
+        await matches(
+          "The IgnorePath rule `/etc/*-` (line 21) matches any file or directory under `/etc/` ending with a hyphen, which is risky; it should be replaced with explicit patterns for known backup files.",
+        ),
+      ).toBe(false);
+      expect(
+        await matches(
+          "User specifies intended differences that should not be corrected: rename secret applications-azure-secrets to <app>-secrets, addition of a new ExternalSecret resource, change to unichart label/selector scheme, and release-derived naming conventions.",
+        ),
+      ).toBe(false);
+
+      // The two residual, NOT-templated false-merge risks the audit
+      // explicitly accepted rather than fixed (natural language, not
+      // boilerplate) - the predicate must not "solve" these by accident
+      // either, since that's not what it's for.
+      expect(
+        await matches("User created a systemd system service file at /etc/systemd/system/openfortivpn-origo.service that runs as root and whose ExecStart points to the openfortivpn wrapper script"),
+      ).toBe(false);
+      expect(
+        await matches("User created the systemd user service file at ~/.config/systemd/user/openfortivpn-origo.service and supporting wrapper scripts at ~/.config/waybar/indicators/openfortivpn-origo, toggle-vpn, and vpn.sh for starting, stopping, and checking service status"),
+      ).toBe(false);
+    });
   });
 });
 

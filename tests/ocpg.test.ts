@@ -171,10 +171,9 @@ describe("DB access layer", () => {
         await __internals.handleTransform(cold, project);
         expect(cold.system.join("")).not.toContain(marker);
 
-        // The probe is a preference so the real corpus (7+ global preference
-        // rows, which fill the 5-slot recency-fallback block) cannot crowd it
-        // out - a fresh preference is always the newest of its type, slot 1.
-        await __internals.remember({ content: `Invalidation probe ${marker}`, type: "preference" }, { directory: project, sessionID: "sess-a" });
+        // The recency-fallback block is plain newest-first, so a freshly
+        // stored row is always slot 1 regardless of type.
+        await __internals.remember({ content: `Invalidation probe ${marker}` }, { directory: project, sessionID: "sess-a" });
 
         // A write from one session must be visible to every other session in
         // the project, not just the one that wrote it.
@@ -337,10 +336,9 @@ describe("DB access layer", () => {
       const project = "/tmp/ocpg-test-forget";
       const marker = `zzzforget${Date.now()}`;
       try {
-        // Preference type: the recency-fallback block is preferences-first and
-        // the live corpus has 7+ of them, so a project_fact probe would never
-        // reach the top 5 (corpus-dependent test rot).
-        const stored = await __internals.remember({ content: `Obsolete note ${marker}`, type: "preference" }, { directory: project, sessionID: "fg" });
+        // The recency-fallback block is plain newest-first, so a freshly
+        // stored row is always slot 1 regardless of type.
+        const stored = await __internals.remember({ content: `Obsolete note ${marker}` }, { directory: project, sessionID: "fg" });
         const id = Number(stored.match(/#(\d+)/)?.[1]);
 
         // Warm the injection cache so the delete has something to invalidate.
@@ -492,21 +490,21 @@ describe("DB access layer", () => {
   describe("memory_type (plan 2.1: defaulted, never required)", () => {
     const ctx = { directory: "/tmp/ocpg-test-type", sessionID: "type-t" };
 
-    test("remember defaults to project_fact and accepts an explicit preference", async () => {
+    test("remember defaults to project_fact and accepts an explicit episodic type", async () => {
       try {
         const fact = await __internals.remember({ content: "The make target is make verify, not make test." }, ctx);
         expect(fact).toContain("Stored memory #");
-        const pref = await __internals.remember(
-          { content: "The operator prefers short commit subjects.", type: "preference" },
+        const ep = await __internals.remember(
+          { content: "The operator prefers short commit subjects.", type: "episodic" },
           ctx,
         );
-        expect(pref).toContain("Stored memory #");
+        expect(ep).toContain("Stored memory #");
 
         const rows = await __internals.sql`
           SELECT content, memory_type FROM memories WHERE project = ${ctx.directory}
         ` as { content: string; memory_type: string }[];
         expect(rows.find((r) => r.content.startsWith("The make target"))?.memory_type).toBe("project_fact");
-        expect(rows.find((r) => r.content.startsWith("The operator prefers"))?.memory_type).toBe("preference");
+        expect(rows.find((r) => r.content.startsWith("The operator prefers"))?.memory_type).toBe("episodic");
       } finally {
         await __internals.sql`DELETE FROM memories WHERE project = ${ctx.directory}`;
       }
@@ -518,19 +516,30 @@ describe("DB access layer", () => {
         ctx,
       );
       expect(result).toContain("ERROR");
-      expect(result).toContain("preference, stack_fact, project_fact, episodic");
+      expect(result).toContain("stack_fact, project_fact, episodic");
       const [n] = await __internals.sql`SELECT count(*) AS n FROM memories WHERE project = ${ctx.directory}` as { n: string }[];
       expect(Number(n.n)).toBe(0);
     });
 
-    test("injection puts preference rows first, ahead of newer facts", async () => {
+    test("preference is no longer a valid type", async () => {
+      const result = await __internals.remember(
+        { content: "valid content for the type check", type: "preference" as unknown as "project_fact" },
+        ctx,
+      );
+      expect(result).toContain("ERROR");
+      expect(result).toContain("stack_fact, project_fact, episodic");
+      const [n] = await __internals.sql`SELECT count(*) AS n FROM memories WHERE project = ${ctx.directory}` as { n: string }[];
+      expect(Number(n.n)).toBe(0);
+    });
+
+    test("undirected recall/injection ordering is plain recency now that preference is gone", async () => {
       try {
-        // Fact stored NOW, preference stored an hour ago: recency would put the
-        // fact first; type-aware ordering must not.
+        // Fact stored NOW, an older fact stored an hour ago: recency must put
+        // the newer one first - there is no type-based ordering boost left.
         await __internals.remember({ content: "Recent project fact about the build cache." }, ctx);
         await __internals.sql`
-          INSERT INTO memories (content, tags, session_id, project, memory_type, created_at)
-          VALUES ('Standing preference: never amend pushed commits.', ${__internals.sql.array([], "text")}, 'type-t', ${ctx.directory}, 'preference', now() - interval '1 hour')
+          INSERT INTO memories (content, tags, session_id, project, created_at)
+          VALUES ('Older note: never amend pushed commits.', ${__internals.sql.array([], "text")}, 'type-t', ${ctx.directory}, now() - interval '1 hour')
         `;
         __internals.invalidateInjection(ctx.directory);
 
@@ -538,15 +547,12 @@ describe("DB access layer", () => {
         await __internals.handleTransform(output, ctx.directory);
         const block = output.system[0];
         expect(block).toContain("never amend pushed commits");
-        // Ordering is asserted at the query level: the 5-slot block is full of
-        // the real corpus's global preference rows, so a fixture project_fact
-        // never renders - but the 20-row candidate slice contains both.
         const rows = await __internals.buildRecencyQuery(__internals.sql, ctx.directory) as unknown as { content: string }[];
-        const prefIdx = rows.findIndex((r) => r.content.includes("never amend pushed commits"));
-        const factIdx = rows.findIndex((r) => r.content.includes("Recent project fact"));
-        expect(prefIdx).toBeGreaterThan(-1);
-        expect(factIdx).toBeGreaterThan(-1);
-        expect(prefIdx).toBeLessThan(factIdx);
+        const olderIdx = rows.findIndex((r) => r.content.includes("never amend pushed commits"));
+        const newerIdx = rows.findIndex((r) => r.content.includes("Recent project fact"));
+        expect(olderIdx).toBeGreaterThan(-1);
+        expect(newerIdx).toBeGreaterThan(-1);
+        expect(newerIdx).toBeLessThan(olderIdx);
       } finally {
         await __internals.sql`DELETE FROM memories WHERE project = ${ctx.directory}`;
         __internals.invalidateInjection(ctx.directory);
@@ -555,15 +561,17 @@ describe("DB access layer", () => {
 
     test("resolveMemoryType coerces unknown/undefined to the default", () => {
       expect(__internals.resolveMemoryType(undefined)).toBe("project_fact");
-      expect(__internals.resolveMemoryType("preference")).toBe("preference");
+      expect(__internals.resolveMemoryType("stack_fact")).toBe("stack_fact");
+      // preference was removed as a type; it now defaults like any other unknown value.
+      expect(__internals.resolveMemoryType("preference")).toBe("project_fact");
       expect(__internals.resolveMemoryType("nope")).toBe("project_fact");
     });
 
     test("recall surfaces non-default types in its output", async () => {
       try {
-        await __internals.remember({ content: "Preference surfaced in recall output.", type: "preference" }, ctx);
+        await __internals.remember({ content: "Episodic type surfaced in recall output.", type: "episodic" }, ctx);
         const result = await __internals.recall({ query: "surfaced in recall", limit: 2 }, ctx);
-        expect(result).toContain("[preference]");
+        expect(result).toContain("[episodic]");
       } finally {
         await __internals.sql`DELETE FROM memories WHERE project = ${ctx.directory}`;
       }
@@ -610,16 +618,16 @@ describe("DB access layer", () => {
 
     test("explicit tags and type replace the stored ones", async () => {
       try {
-        const stored = await __internals.remember({ content: "A memory that will be retyped as a preference." }, ctx);
+        const stored = await __internals.remember({ content: "A memory that will be retyped as episodic." }, ctx);
         const id = Number(stored.match(/#(\d+)/)?.[1]);
         expect(
-          await __internals.updateMemory({ id, content: "Retyped as a standing preference.", type: "preference" }, ctx),
+          await __internals.updateMemory({ id, content: "Retyped as episodic.", type: "episodic" }, ctx),
         ).toBe(`Updated memory #${id}.`);
         const [row] = await __internals.sql`SELECT memory_type, tags FROM memories WHERE id = ${id}` as {
           memory_type: string;
           tags: string[];
         }[];
-        expect(row.memory_type).toBe("preference");
+        expect(row.memory_type).toBe("episodic");
         expect(row.tags).toEqual([]);
       } finally {
         await __internals.sql`DELETE FROM memories WHERE project = ${ctx.directory}`;
@@ -666,17 +674,17 @@ describe("DB access layer", () => {
 
       expect(await __internals.updateMemory({ id: -1, content: "valid content here" }, ctx)).toContain("positive integer");
       expect(await __internals.updateMemory({ id: 1, content: "short" }, ctx)).toContain("at least 10 characters");
-      expect(await __internals.updateMemory({ id: 1, content: "valid content here", type: "nope" as unknown as "preference" }, ctx)).toContain(
-        "preference, stack_fact, project_fact, episodic",
+      expect(await __internals.updateMemory({ id: 1, content: "valid content here", type: "nope" as unknown as "project_fact" }, ctx)).toContain(
+        "stack_fact, project_fact, episodic",
       );
     });
 
     test("an update invalidates the injected block", async () => {
       const marker = `zzzupdate${Date.now()}`;
       try {
-        // Preference type: the recency-fallback block is preferences-first and
-        // the live corpus fills it - a project_fact marker would never render.
-        const stored = await __internals.remember({ content: `Original note ${marker}`, type: "preference" }, ctx);
+        // The recency-fallback block is plain newest-first, so the freshly
+        // stored row is always slot 1 regardless of type.
+        const stored = await __internals.remember({ content: `Original note ${marker}` }, ctx);
         const id = Number(stored.match(/#(\d+)/)?.[1]);
         const before: { system: string[] } = { system: [] };
         await __internals.handleTransform(before, ctx.directory);
@@ -703,8 +711,8 @@ describe("DB access layer", () => {
         const stored = await __internals.remember({ content: `Access tracking probe ${marker} for the recall bump.` }, ctx);
         const id = Number(stored.match(/#(\d+)/)?.[1]);
         // Queried recall, not a browse: undirected browse returns the top-5 by
-        // preference-then-recency, which the live corpus's global preferences
-        // fill entirely - the fixture would never be a returned row to bump.
+        // plain recency, which the live corpus's many rows fill entirely -
+        // the fixture would never be a returned row to bump.
         await __internals.recall({ query: marker }, ctx);
         await __internals.recall({ query: marker }, ctx);
         // Fire-and-forget: give the abandoned UPDATE a beat to land.
@@ -863,10 +871,9 @@ describe("DB access layer", () => {
       const savedBase = __internals.ollamaBase;
       __internals.setOllamaBase("http://127.0.0.1:9");
       try {
-        // Preference type: the fallback block is preferences-first and the
-        // live corpus fills it with global preference rows - a project_fact
-        // probe would never render (corpus-dependent test rot).
-        await __internals.remember({ content: "Sole memory of the fallback probe project.", type: "preference" }, ctx);
+        // The recency-fallback block is plain newest-first, so the freshly
+        // stored row is always slot 1 regardless of type.
+        await __internals.remember({ content: "Sole memory of the fallback probe project." }, ctx);
         __internals.invalidateInjection(ctx.directory);
         const output: { system: string[] } = { system: [] };
         await __internals.handleTransform(output, ctx.directory, ask("xqzzyblorpn kwintavex blorptonic qwertyuiopas"));
@@ -1082,8 +1089,8 @@ describe("DB access layer", () => {
         const [n] = await __internals.sql`SELECT count(*) AS n FROM memories WHERE project = ${project}` as { n: string }[];
         expect(Number(n.n)).toBe(2);
         // The collapse assertion uses a relevance prompt: the no-prompt
-        // recency block is preferences-first and the live corpus's global
-        // preferences fill it, so a fixture project_fact never renders there.
+        // recency block is plain newest-first and the live corpus's many
+        // rows fill it, so a fixture project_fact never renders there.
         // The mode is set explicitly because the relevance describe's afterAll
         // flips the module default to recency (file-order state).
         const savedMode = __internals.injectionMode;

@@ -35,6 +35,15 @@ ALTER TABLE memories DROP CONSTRAINT IF EXISTS memories_type_check;
 ALTER TABLE memories ADD CONSTRAINT memories_type_check
   CHECK (memory_type IN ('preference', 'stack_fact', 'project_fact', 'episodic'));
 
+-- preference removed (plugin >= 0.15): AGENTS.md now covers the "applies
+-- everywhere" use case better than a relevance-ranked memory ever could.
+-- Delete existing preference rows and tighten the constraint - do this only
+-- once every preference-typed row has been reviewed (they're gone after).
+DELETE FROM memories WHERE memory_type = 'preference';
+ALTER TABLE memories DROP CONSTRAINT IF EXISTS memories_type_check;
+ALTER TABLE memories ADD CONSTRAINT memories_type_check
+  CHECK (memory_type IN ('stack_fact', 'project_fact', 'episodic'));
+
 -- recall access ranking (plugin >= 0.14): incremented by memory_recall only;
 -- the injection path stays read-only.
 ALTER TABLE memories ADD COLUMN IF NOT EXISTS access_count integer NOT NULL DEFAULT 0;

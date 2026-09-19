@@ -73,7 +73,8 @@ bun run backfill   # same OCPG_* env as the plugin; idempotent, re-runnable
 Semantic search needs a reachable Ollama with the model pulled
 (`ollama pull bge-m3`) - host-installed or the compose `ollama` service, the
 plugin defaults match either. Without Ollama everything still works - search
-just stays keyword-only.
+just stays keyword-only, and `memory_consolidate`'s meaning pass simply has
+no embedded rows to compare.
 
 `.env` values:
 

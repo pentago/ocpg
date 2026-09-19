@@ -867,6 +867,40 @@ function mutuallyVisible(client: SQL) {
   return client`((a.memory_type != 'project_fact' AND b.memory_type != 'project_fact') OR a.project = b.project)`;
 }
 
+// Excludes structurally templated, auto-generated content from the meaning
+// pass: verified against the real corpus (2026-09-19 audit, see AGENTS.md)
+// that three fixed sentence templates - background-task status logs from the
+// team/subagent system, session-compaction summaries, and per-app migration
+// checklist entries - drive cosine similarity high between GENUINELY
+// DIFFERENT facts (different task ids, different sessions, different apps)
+// purely because only a few words vary while the rest of the sentence is
+// boilerplate. This is a content-pattern check, not the `auto_capture` tag:
+// that tag was tested first and rejected - it sits on ~90% of BOTH correct
+// and incorrect merges alike in the real corpus, so excluding by tag would
+// gut the pass. The three patterns below have zero overlap with any
+// confirmed-correct meaning-pass merge in that same audit. A residual, much
+// smaller false-merge rate remains on natural-language content whose
+// wording happens to be structurally parallel (e.g. two genuinely different
+// systemd unit files described in near-identical sentences) - no threshold
+// or pattern separates that case from true duplicates without also losing
+// real ones (see AGENTS.md), so it is accepted rather than "fixed". Two
+// variants: the self-join (a/b aliases) and the plain single-table form.
+function isTemplatedAutoLogPair(client: SQL) {
+  return client`(
+    a.content ILIKE '%background task bg_%' OR b.content ILIKE '%background task bg_%'
+    OR a.content ILIKE '%session compacting for project%' OR b.content ILIKE '%session compacting for project%'
+    OR a.content ~ 'For APP.{0,3}[0-9]+.{0,3}\\(' OR b.content ~ 'For APP.{0,3}[0-9]+.{0,3}\\('
+  )`;
+}
+
+function isTemplatedAutoLog(client: SQL) {
+  return client`(
+    content ILIKE '%background task bg_%'
+    OR content ILIKE '%session compacting for project%'
+    OR content ~ 'For APP.{0,3}[0-9]+.{0,3}\\('
+  )`;
+}
+
 // Deterministic consolidation, no model calls inside the plugin: find
 // near-duplicate clusters, keep the newest of each, delete the rest. The
 // deleted texts are returned verbatim so the CALLING agent - itself a model -
@@ -930,13 +964,14 @@ async function consolidate(): Promise<string> {
     }
 
     // --- Pass 2: meaning (embedding cosine similarity) ---
-    // Only rows the wording pass left behind, and only embedded rows - a row
-    // Ollama never reached (down at write time, pre-migration database) is
+    // Only rows the wording pass left behind, only embedded rows (a row
+    // Ollama never reached - down at write time, pre-migration database - is
     // simply not a candidate, same graceful-degradation posture as everywhere
-    // else. The pairwise threshold join is pushed into Postgres (pgvector's
-    // <=> operator) rather than pulled into TS: cheap for the corpus sizes
-    // this tool already accepts an O(n^2) cost for (see the wording pass), and
-    // it lets the DB do the floating-point work instead of JS.
+    // else), and never templated auto-logs (isTemplatedAutoLog - see its
+    // comment for why). The pairwise threshold join is pushed into Postgres
+    // (pgvector's <=> operator) rather than pulled into TS: cheap for the
+    // corpus sizes this tool already accepts an O(n^2) cost for (see the
+    // wording pass), and it lets the DB do the floating-point work instead of JS.
     const embedPairs = (await sql`
       SELECT a.id AS a_id, b.id AS b_id
       FROM memories a
@@ -945,6 +980,7 @@ async function consolidate(): Promise<string> {
         AND b.embedding IS NOT NULL
         AND (1 - (a.embedding <=> b.embedding)) >= ${CONSOLIDATE_EMBED_THRESHOLD}
         AND ${mutuallyVisible(sql)}
+        AND NOT ${isTemplatedAutoLogPair(sql)}
     `) as { a_id: number; b_id: number }[];
 
     if (embedPairs.length > 0) {
@@ -955,7 +991,7 @@ async function consolidate(): Promise<string> {
       const embedRows = (await sql`
         SELECT id, content, coalesce(tags, '{}') AS tags, created_at
         FROM memories
-        WHERE embedding IS NOT NULL
+        WHERE embedding IS NOT NULL AND NOT ${isTemplatedAutoLog(sql)}
         ORDER BY created_at DESC
       `) as { id: number; content: string; tags: string[]; created_at: Date }[];
 

@@ -1542,6 +1542,43 @@ describe("DB access layer", () => {
         __internals.invalidateInjection(projectB);
       }
     });
+
+    test.skipIf(!hybridReady)("templated auto-generated content (background-task logs, session-compaction summaries, per-app checklists) is excluded from the meaning pass", async () => {
+      // Real-corpus audit (2026-09-19): these three fixed sentence templates
+      // drive cosine similarity high between GENUINELY DIFFERENT facts
+      // (different task ids, different team members) purely because only a
+      // few words vary while the rest is boilerplate - the `auto_capture`
+      // tag was tried first and rejected (present on ~90% of both correct
+      // and incorrect merges alike). Content-pattern exclusion instead.
+      const project = "/tmp/ocpg-test-consolidate-templated";
+      const marker = `zzzconsoltemplated${Date.now()}`;
+      try {
+        const a = await __internals.remember(
+          { content: `Background task bg_${marker}aaa, intended to create the team member demo-project/alpha-analyst, was cancelled for the same reason: the subagent called team_task_list ten consecutive times.` },
+          { directory: project, sessionID: "tp" },
+        );
+        const aId = Number(a.match(/#(\d+)/)?.[1]);
+        const b = await __internals.remember(
+          { content: `Background task bg_${marker}bbb, intended to create the team member demo-project/beta-analyst, was cancelled because the subagent called team_task_list ten consecutive times, exceeding the threshold.` },
+          { directory: project, sessionID: "tp" },
+        );
+        const bId = Number(b.match(/#(\d+)/)?.[1]);
+        expect(await untilEmbedded(aId)).toBe(true);
+        expect(await untilEmbedded(bId)).toBe(true);
+
+        await __internals.consolidate();
+
+        // Both survive despite high embedding similarity (~0.93 measured) -
+        // the "background task bg_" template excludes them from the pass.
+        const [rowA2] = await __internals.sql`SELECT count(*) AS n FROM memories WHERE id = ${aId}` as { n: string }[];
+        const [rowB2] = await __internals.sql`SELECT count(*) AS n FROM memories WHERE id = ${bId}` as { n: string }[];
+        expect(Number(rowA2.n)).toBe(1);
+        expect(Number(rowB2.n)).toBe(1);
+      } finally {
+        await __internals.sql`DELETE FROM memories WHERE project = ${project}`;
+        __internals.invalidateInjection(project);
+      }
+    });
   });
 });
 

@@ -305,7 +305,15 @@ CPU (no VRAM transfer; both exceed 750ms, which is why the plugin warms the
 model at setup). GPU earns its place only on bulk re-embeds: ~97ms/row CPU vs
 ~8ms/row GPU at batch-32, i.e. a 50k-row re-embed is ~80min vs ~7min.
 
-## Smart-write judge gate (2026-09-18, `bun bench/judge.ts`, qwen3:4b, live dev DB)
+## Smart-write judge gate (2026-09-18, `bun bench/judge.ts`, qwen3:4b, live dev DB) - REMOVED 2026-09-19
+
+The judge model (smart writes + compaction capture) was removed entirely:
+duplicate detection moved to `memory_consolidate`'s on-demand trigram-based
+consolidation instead of a model running on every write (see `ocpg.ts` and
+`AGENTS.md`). `bench/judge.ts` and `bench/capture.ts` were deleted along
+with the feature they tested. The numbers below are kept as a historical
+record of what was tried and why it passed its own gate before being
+superseded - not as documentation of current behavior.
 
 26 hand-labeled pairs (8 true duplicates, 8 true updates, 10
 similar-sounding-but-distinct) run through the production smart-write path
@@ -321,10 +329,15 @@ runs, identical verdicts:
 Zero-shot prompting FAILED this gate before the few-shot rewrite: the judge
 called every restatement "update" and synthesized corrupt merges
 ("Postgres 1:6", "expires after 2:00 PM"), including one false update that
-clobbered a distinct pair. The few-shot prompt in `buildWritePrompt` is the
-fix - do not simplify it without re-running this gate.
+clobbered a distinct pair. The few-shot prompt in `buildWritePrompt` was the
+fix.
 
-## Compaction-capture gate (2026-09-18, `bun bench/capture.ts`, 5 real sessions)
+## Compaction-capture gate (2026-09-18, `bun bench/capture.ts`, 5 real sessions) - REMOVED 2026-09-19
+
+Removed along with the judge model that powered it - there is no
+judge-free replacement for "extract durable facts from a transcript".
+Keyword-trigger capture is the only automatic capture path that remains.
+Kept as a historical record:
 
 Extraction-only rehearsal (no writes) on real opencode sessions, qwen3:4b:
 

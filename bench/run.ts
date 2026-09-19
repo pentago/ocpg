@@ -21,10 +21,9 @@
 // __internals); the other strategies are candidates under evaluation. The
 // EXPLAIN pass re-expresses each query as literal SQL for EXPLAIN (ANALYZE,
 // BUFFERS) - parameters are pre-sanitized [a-z0-9 |] tokens, safe to inline.
-import { readFileSync } from "node:fs";
 import { SQL } from "bun";
 import ocpg from "../ocpg.ts";
-import { PROJECTS, benchDbName, makeSql, pick, rng, thesaurusContent } from "./config.ts";
+import { PROJECTS, benchDbName, makeSql, pick, rng } from "./config.ts";
 import {
   type BenchRow,
   type Case,
@@ -47,20 +46,6 @@ const sizes = opt("--sizes", "500,5000").split(",").map(Number);
 const perMix = Number(opt("--queries", "150"));
 const skipExplain = args.includes("--skip-explain");
 
-// The .ths file is a generated artifact checked into the repo (Postgres reads
-// dictionary files from its tsearch_data dir at DDL time, not from an
-// arbitrary path), so it can silently drift from PARAPHRASES. Failing the
-// whole run beats silently benchmarking a stale dictionary.
-function assertThesaurusFresh(): void {
-  const actual = readFileSync(new URL("./thesaurus/bench_synonyms.ths", import.meta.url), "utf8");
-  if (actual !== thesaurusContent()) {
-    throw new Error(
-      "bench/thesaurus/bench_synonyms.ths is stale relative to PARAPHRASES in bench/config.ts - run: bun bench/generate-thesaurus.ts",
-    );
-  }
-}
-assertThesaurusFresh();
-
 type Strategy = {
   name: string;
   describe: string;
@@ -78,7 +63,7 @@ const strategies: Strategy[] = [
   },
   {
     name: "fts-and",
-    describe: "websearch_to_tsquery AND semantics - what memory_recall uses",
+    describe: "websearch_to_tsquery AND semantics - the rejected alternative to prod's OR shape",
     run: async (c, q, d) =>
       (await c`SELECT content, project FROM memories WHERE search_vector @@ websearch_to_tsquery('english', ${q}) AND (memory_type != 'project_fact' OR project = ${d}) ORDER BY ts_rank(search_vector, websearch_to_tsquery('english', ${q})) DESC LIMIT 5`) as Array<{ content: string; project: string }>,
     explainSql: (q, d) =>
@@ -109,49 +94,6 @@ const strategies: Strategy[] = [
       `SELECT id, content, project FROM memories WHERE search_vector @@ to_tsquery('english', '${sanitizeOr(q)}') AND (memory_type != 'project_fact' OR project = '${d}') ORDER BY ts_rank(search_vector, to_tsquery('english', '${sanitizeOr(q)}')) + 0.05 / (extract(epoch from (now() - created_at)) / 86400 + 2) + (CASE WHEN project = '${d}' THEN 0.01 ELSE 0 END) DESC LIMIT 5`,
   },
   {
-    name: "fts-or-thesaurus",
-    describe: "fts-or through thesaurus config; OR operands are single tokens, so only single-word rules fire",
-    run: async (c, q, d) =>
-      (await c`SELECT content, project FROM memories WHERE search_vector @@ to_tsquery('bench_thesaurus_cfg', ${sanitizeOr(q)}) AND (memory_type != 'project_fact' OR project = ${d}) ORDER BY ts_rank(search_vector, to_tsquery('bench_thesaurus_cfg', ${sanitizeOr(q)})) + (CASE WHEN project = ${d} THEN 0.01 ELSE 0 END) DESC, created_at DESC LIMIT 5`) as Array<{ content: string; project: string }>,
-    explainSql: (q, d) =>
-      `SELECT id, content, project FROM memories WHERE search_vector @@ to_tsquery('bench_thesaurus_cfg', '${sanitizeOr(q)}') AND (memory_type != 'project_fact' OR project = '${d}') ORDER BY ts_rank(search_vector, to_tsquery('bench_thesaurus_cfg', '${sanitizeOr(q)}')) + (CASE WHEN project = '${d}' THEN 0.01 ELSE 0 END) DESC, created_at DESC LIMIT 5`,
-  },
-  {
-    // plainto_tsquery feeds adjacent tokens through the config pipeline, so
-    // multi-word thesaurus rules can fire; AND semantics over the substituted
-    // lexemes is fine while each paraphrase query is a single phrase (the
-    // mix's shape today). Direct queries pay the AND collapse - the para-rec
-    // column is what this variant exists for.
-    name: "fts-phrase-thes",
-    describe: "plainto_tsquery through thesaurus config - adjacent tokens, so multi-word rules fire (AND semantics)",
-    run: async (c, q, d) =>
-      (await c`SELECT content, project FROM memories WHERE search_vector @@ plainto_tsquery('bench_thesaurus_cfg', ${q}) AND (memory_type != 'project_fact' OR project = ${d}) ORDER BY ts_rank(search_vector, plainto_tsquery('bench_thesaurus_cfg', ${q})) + (CASE WHEN project = ${d} THEN 0.01 ELSE 0 END) DESC, created_at DESC LIMIT 5`) as Array<{ content: string; project: string }>,
-    explainSql: (q, d) =>
-      `SELECT id, content, project FROM memories WHERE search_vector @@ plainto_tsquery('bench_thesaurus_cfg', '${q.replace(/'/g, "''")}') AND (memory_type != 'project_fact' OR project = '${d}') ORDER BY ts_rank(search_vector, plainto_tsquery('bench_thesaurus_cfg', '${q.replace(/'/g, "''")}')) + (CASE WHEN project = '${d}' THEN 0.01 ELSE 0 END) DESC, created_at DESC LIMIT 5`,
-  },
-  {
-    name: "fts-or-plus-thesaurus",
-    describe: "OR-of-terms match UNION thesaurus phrase match, ranked by the better of the two scores",
-    run: async (c, q, d) =>
-      (await c`
-      SELECT content, project FROM memories
-      WHERE (
-        search_vector @@ to_tsquery('english', ${sanitizeOr(q)})
-        OR search_vector @@ plainto_tsquery('bench_thesaurus_cfg', ${q})
-      )
-      AND (memory_type != 'project_fact' OR project = ${d})
-      ORDER BY GREATEST(
-                 ts_rank(search_vector, to_tsquery('english', ${sanitizeOr(q)})),
-                 ts_rank(search_vector, plainto_tsquery('bench_thesaurus_cfg', ${q}))
-               )
-               + (CASE WHEN project = ${d} THEN 0.01 ELSE 0 END) DESC,
-               created_at DESC
-      LIMIT 5
-    `) as Array<{ content: string; project: string }>,
-    explainSql: (q, d) =>
-      `SELECT id, content, project FROM memories WHERE (search_vector @@ to_tsquery('english', '${sanitizeOr(q)}') OR search_vector @@ plainto_tsquery('bench_thesaurus_cfg', '${q.replace(/'/g, "''")}')) AND (memory_type != 'project_fact' OR project = '${d}') ORDER BY GREATEST(ts_rank(search_vector, to_tsquery('english', '${sanitizeOr(q)}')), ts_rank(search_vector, plainto_tsquery('bench_thesaurus_cfg', '${q.replace(/'/g, "''")}'))) + (CASE WHEN project = '${d}' THEN 0.01 ELSE 0 END) DESC LIMIT 5`,
-  },
-  {
     name: "recency-only",
     describe: "the old blind last-5 (baseline; ignores the query)",
     run: (c, _q, d) => __internals.buildRecencyQuery(c, d) as unknown as Promise<Array<{ content: string; project: string }>>,
@@ -169,18 +111,11 @@ async function benchDataset(size: number): Promise<void> {
   try {
     const rows = await loadRows(db);
     console.log(`\n=== ${benchDbName(size)}: ${rows.length} memories, ${new Set(rows.map((r) => r.project)).size} projects ===`);
-    // The thesaurus strategies need bench_thesaurus_cfg installed in the
-    // target DB (bench/README.md). Skip with a notice rather than erroring
-    // per query - the other strategies still measure.
-    const hasThesaurus =
-      (await db`SELECT 1 FROM pg_ts_config WHERE cfgname = 'bench_thesaurus_cfg' LIMIT 1`).length > 0;
-    const active = hasThesaurus ? strategies : strategies.filter((s) => !s.name.includes("thesaurus"));
-    if (!hasThesaurus) console.log("bench_thesaurus_cfg not installed - thesaurus strategies skipped (bench/README.md)");
     const mix = buildMix(rng(999 + size), buildCorpusWords(rows), perMix);
     const columnHeads = `strategy          p50ms  p95ms  recall@5  mrr@5  prec@5  para-rec  bufhit`;
     console.log(columnHeads);
 
-    for (const strategy of active) {
+    for (const strategy of strategies) {
       const rand = rng(size * 31 + 7);
       const project = pick(rand, PROJECTS);
       const topicIds = buildTopicIds(rows, project);

@@ -108,17 +108,6 @@ export const PARAPHRASES: Record<string, string> = {
   ssh: "secure remote login",
 };
 
-// Thesaurus rule content derived from PARAPHRASES. Postgres thesaurus rules
-// are directional (sample : substitute); queries are built from the paraphrase
-// side and corpus content from the original word, so the rule must rewrite
-// paraphrase -> original ("dbms engine : postgres"). Single source for the
-// generator (generate-thesaurus.ts) and run.ts's staleness check.
-export function thesaurusContent(): string {
-  return `${Object.entries(PARAPHRASES)
-    .map(([original, paraphrase]) => `${paraphrase} : ${original}`)
-    .join("\n")}\n`;
-}
-
 export function benchDbName(size: number): string {
   return `agent-memory-bench-${size}`;
 }

@@ -36,38 +36,9 @@ Requires the `OCPG_*` env user to hold CREATEDB. Bench DBs are
 `agent-memory-bench-<size>`; delete them anytime with plain
 `DROP DATABASE` (or regenerate - it drops first).
 
-### Thesaurus strategies (setup)
-
-`fts-or-thesaurus` / `fts-phrase-thes` query through a thesaurus text search
-config built from the bench's own `PARAPHRASES` map - the missing dimension in
-every other candidate, which differ only in ranking/scoring, not vocabulary.
-
-Setup (one-time per Postgres server; restart of the *container* loses it):
-
-```bash
-bun bench:thesaurus                                            # regenerate the .ths from PARAPHRASES
-# system install: copy into /usr/share/postgresql/<version>/tsearch_data/
-docker cp bench/thesaurus/bench_synonyms.ths <pg-container>:/usr/local/share/postgresql/tsearch_data/
-bun bench:generate --sizes 500,5000                            # CREATE TEXT SEARCH DICTIONARY ... per bench DB
-```
-
-`generate.ts` installs the dictionary into each bench DB it creates; a server
-without the `.ths` file still generates fine and `run.ts` skips the thesaurus
-strategies with a notice. The `.ths` file is generated from `PARAPHRASES` and
-checked in; `run.ts` fails the whole bench when it drifts from the map.
-Dictionary rules are query-time only - `search_vector` stays
-`to_tsvector('english')`, so the same column and GIN index serve every
-strategy.
-
-`fts-or-thesaurus` keeps the OR shape (direct queries must match
-`fts-or (prod)`) but to_tsquery OR operands are single tokens, so multi-word
-thesaurus rules cannot fire there; `fts-phrase-thes` uses `plainto_tsquery`,
-whose adjacent tokens let multi-word rules fire - at the cost of AND
-semantics on direct queries. Read the para-rec columns of both together.
-
 `fts-or (prod)` executes the **exact production injection query**, imported
 from ocpg's `__internals` - the refactor exists so the harness cannot drift
-from shipped SQL. The other strategies are candidates defined here.
+from shipped SQL. The other strategies in `run.ts` are candidates.
 
 ### Embedding strategies (pgvector + local Ollama)
 
@@ -133,7 +104,17 @@ strategies against each other on identical visibility.
 | fts-or-recency | 0.04ms / rec .26    | 0.07ms / rec .37    |
 | recency-only   | 0.11ms / rec .20    | 0.7ms / rec .06     |
 
-### Thesaurus results (2026-09-17, ephemeral postgres:18-alpine, thesaurus from PARAPHRASES)
+### Thesaurus results (2026-09-17, ephemeral postgres:18-alpine, thesaurus from PARAPHRASES) - SUPERSEDED 2026-09-18, bench code removed 2026-09-19
+
+A bounded thesaurus (rules generated from `PARAPHRASES`) was explored as an
+alternative to vector search for closing the paraphrase gap, before the
+embedding results below made the case for hybrid retrieval instead. Hybrid
+(FTS + bge-m3 embeddings via `hybridMerge`) is what shipped in `ocpg.ts` -
+none of the thesaurus strategies (`fts-or-thesaurus`, `fts-phrase-thes`,
+`fts-or-plus-thesaurus`) or their harness code (`bench/generate-thesaurus.ts`,
+`bench/thesaurus/`, the thesaurus DDL in `generate.ts`, the strategies in
+`run.ts`) exist in the repo anymore. Kept below as a historical record of
+what was tried and why it looked promising at the time.
 
 | strategy          | 485 rows            | 5k rows             |
 | ----------------- | ------------------- | ------------------- |
@@ -141,7 +122,7 @@ strategies against each other on identical visibility.
 | fts-or-thesaurus  | rec .29 / para .000 | rec .44 / para .05  |
 | fts-phrase-thes   | rec .11 / para .32  | rec .19 / para .60  |
 
-### Combined-shape results (2026-09-17, ephemeral postgres:18-alpine, thesaurus from PARAPHRASES)
+### Combined-shape results (2026-09-17, ephemeral postgres:18-alpine, thesaurus from PARAPHRASES) - SUPERSEDED, see above
 
 | strategy                 | 485 rows            | 5k rows             |
 | ------------------------ | ------------------- | ------------------- |
@@ -161,9 +142,11 @@ rows. Latency p50 1.33ms / p95 1.84ms at 5k (prod 1.16/1.74) - the OR of two
 `@@` conditions costs ~15%, far inside the injection budget; bufhit stays
 100% (no seq-scan collapse). The hyphenated-paraphrase gap ("in-memory
 store") persists unchanged - it lives in the phrase half this shape unions
-in, and fixing it is out of scope. Verdict: **go** - this is the strategy
-for a follow-up production spec (dictionary shipping in `deploy/init/` +
-migration path).
+in, and fixing it is out of scope. Verdict at the time: **go** - proposed as
+the strategy for a follow-up production spec (dictionary shipping in
+`deploy/init/` + migration path). This was **not** what shipped: the
+embedding/hybrid results below won out instead, and the thesaurus follow-up
+spec was never written.
 
 Readings:
 
@@ -226,11 +209,11 @@ Readings:
    near-identical sentence templates blur together in dense space, while
    ts_rank keeps separating on distinctive terms. A production design would be
    hybrid (lexical + vector union), not vector replacement.
-3. **The bounded thesaurus still beats the general embedder on paraphrase**
-   (.60 vs .295 at 5k) - but it only covers its own synonym list, while
-   bge-m3 generalizes to paraphrases nobody wrote down. Which matters more
-   depends on how real-world phrasing drifts; today the thesaurus direction
-   (fts-or-plus-thesaurus) remains the better production candidate.
+3. **The bounded thesaurus still beat the general embedder on paraphrase**
+   (.60 vs .295 at 5k) - but it only covered its own synonym list, while
+   bge-m3 generalizes to paraphrases nobody wrote down. This reading did not
+   hold up as the final call: the hybrid results below (FTS + embeddings)
+   beat both, so hybrid shipped instead of the thesaurus direction.
 4. **Cost of the vector path**: a live ollama call per injection (~20ms p50
    for bge-m3; the model must stay loaded) plus a per-write embed and a
    re-embed story on model change. fts-or is 0.08-3.7ms of pure Postgres.

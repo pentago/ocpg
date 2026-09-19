@@ -1,6 +1,6 @@
 {
   "name": "@dzhi/ocpg",
-  "version": "0.26.0",
+  "version": "0.26.1",
   "type": "module",
   "description": "Postgres-backed persistent memory plugin for OpenCode",
   "main": "ocpg.ts",
@@ -10,7 +10,6 @@
     "typecheck": "tsc --noEmit",
     "test": "bun test",
     "bench:generate": "bun bench/generate.ts",
-    "bench:thesaurus": "bun bench/generate-thesaurus.ts",
     "bench": "bun bench/run.ts",
     "bench:embed": "OCPG_USER=ocpguser OCPG_PORT=5433 OCPG_PASSWORD=bench bun bench/embed.ts",
     "bench:backends": "bun bench/ollama-backends.ts",

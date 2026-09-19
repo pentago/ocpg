@@ -171,10 +171,9 @@ describe("DB access layer", () => {
         await __internals.handleTransform(cold, project);
         expect(cold.system.join("")).not.toContain(marker);
 
-        // The probe is a preference so the real corpus (7+ global preference
-        // rows, which fill the 5-slot recency-fallback block) cannot crowd it
-        // out - a fresh preference is always the newest of its type, slot 1.
-        await __internals.remember({ content: `Invalidation probe ${marker}`, type: "preference" }, { directory: project, sessionID: "sess-a" });
+        // The recency-fallback block is plain newest-first, so a freshly
+        // stored row is always slot 1 regardless of type.
+        await __internals.remember({ content: `Invalidation probe ${marker}` }, { directory: project, sessionID: "sess-a" });
 
         // A write from one session must be visible to every other session in
         // the project, not just the one that wrote it.
@@ -337,10 +336,9 @@ describe("DB access layer", () => {
       const project = "/tmp/ocpg-test-forget";
       const marker = `zzzforget${Date.now()}`;
       try {
-        // Preference type: the recency-fallback block is preferences-first and
-        // the live corpus has 7+ of them, so a project_fact probe would never
-        // reach the top 5 (corpus-dependent test rot).
-        const stored = await __internals.remember({ content: `Obsolete note ${marker}`, type: "preference" }, { directory: project, sessionID: "fg" });
+        // The recency-fallback block is plain newest-first, so a freshly
+        // stored row is always slot 1 regardless of type.
+        const stored = await __internals.remember({ content: `Obsolete note ${marker}` }, { directory: project, sessionID: "fg" });
         const id = Number(stored.match(/#(\d+)/)?.[1]);
 
         // Warm the injection cache so the delete has something to invalidate.
@@ -492,21 +490,21 @@ describe("DB access layer", () => {
   describe("memory_type (plan 2.1: defaulted, never required)", () => {
     const ctx = { directory: "/tmp/ocpg-test-type", sessionID: "type-t" };
 
-    test("remember defaults to project_fact and accepts an explicit preference", async () => {
+    test("remember defaults to project_fact and accepts an explicit episodic type", async () => {
       try {
         const fact = await __internals.remember({ content: "The make target is make verify, not make test." }, ctx);
         expect(fact).toContain("Stored memory #");
-        const pref = await __internals.remember(
-          { content: "The operator prefers short commit subjects.", type: "preference" },
+        const ep = await __internals.remember(
+          { content: "The operator prefers short commit subjects.", type: "episodic" },
           ctx,
         );
-        expect(pref).toContain("Stored memory #");
+        expect(ep).toContain("Stored memory #");
 
         const rows = await __internals.sql`
           SELECT content, memory_type FROM memories WHERE project = ${ctx.directory}
         ` as { content: string; memory_type: string }[];
         expect(rows.find((r) => r.content.startsWith("The make target"))?.memory_type).toBe("project_fact");
-        expect(rows.find((r) => r.content.startsWith("The operator prefers"))?.memory_type).toBe("preference");
+        expect(rows.find((r) => r.content.startsWith("The operator prefers"))?.memory_type).toBe("episodic");
       } finally {
         await __internals.sql`DELETE FROM memories WHERE project = ${ctx.directory}`;
       }
@@ -518,19 +516,30 @@ describe("DB access layer", () => {
         ctx,
       );
       expect(result).toContain("ERROR");
-      expect(result).toContain("preference, stack_fact, project_fact, episodic");
+      expect(result).toContain("stack_fact, project_fact, episodic");
       const [n] = await __internals.sql`SELECT count(*) AS n FROM memories WHERE project = ${ctx.directory}` as { n: string }[];
       expect(Number(n.n)).toBe(0);
     });
 
-    test("injection puts preference rows first, ahead of newer facts", async () => {
+    test("preference is no longer a valid type", async () => {
+      const result = await __internals.remember(
+        { content: "valid content for the type check", type: "preference" as unknown as "project_fact" },
+        ctx,
+      );
+      expect(result).toContain("ERROR");
+      expect(result).toContain("stack_fact, project_fact, episodic");
+      const [n] = await __internals.sql`SELECT count(*) AS n FROM memories WHERE project = ${ctx.directory}` as { n: string }[];
+      expect(Number(n.n)).toBe(0);
+    });
+
+    test("undirected recall/injection ordering is plain recency now that preference is gone", async () => {
       try {
-        // Fact stored NOW, preference stored an hour ago: recency would put the
-        // fact first; type-aware ordering must not.
+        // Fact stored NOW, an older fact stored an hour ago: recency must put
+        // the newer one first - there is no type-based ordering boost left.
         await __internals.remember({ content: "Recent project fact about the build cache." }, ctx);
         await __internals.sql`
-          INSERT INTO memories (content, tags, session_id, project, memory_type, created_at)
-          VALUES ('Standing preference: never amend pushed commits.', ${__internals.sql.array([], "text")}, 'type-t', ${ctx.directory}, 'preference', now() - interval '1 hour')
+          INSERT INTO memories (content, tags, session_id, project, created_at)
+          VALUES ('Older note: never amend pushed commits.', ${__internals.sql.array([], "text")}, 'type-t', ${ctx.directory}, now() - interval '1 hour')
         `;
         __internals.invalidateInjection(ctx.directory);
 
@@ -538,15 +547,12 @@ describe("DB access layer", () => {
         await __internals.handleTransform(output, ctx.directory);
         const block = output.system[0];
         expect(block).toContain("never amend pushed commits");
-        // Ordering is asserted at the query level: the 5-slot block is full of
-        // the real corpus's global preference rows, so a fixture project_fact
-        // never renders - but the 20-row candidate slice contains both.
         const rows = await __internals.buildRecencyQuery(__internals.sql, ctx.directory) as unknown as { content: string }[];
-        const prefIdx = rows.findIndex((r) => r.content.includes("never amend pushed commits"));
-        const factIdx = rows.findIndex((r) => r.content.includes("Recent project fact"));
-        expect(prefIdx).toBeGreaterThan(-1);
-        expect(factIdx).toBeGreaterThan(-1);
-        expect(prefIdx).toBeLessThan(factIdx);
+        const olderIdx = rows.findIndex((r) => r.content.includes("never amend pushed commits"));
+        const newerIdx = rows.findIndex((r) => r.content.includes("Recent project fact"));
+        expect(olderIdx).toBeGreaterThan(-1);
+        expect(newerIdx).toBeGreaterThan(-1);
+        expect(newerIdx).toBeLessThan(olderIdx);
       } finally {
         await __internals.sql`DELETE FROM memories WHERE project = ${ctx.directory}`;
         __internals.invalidateInjection(ctx.directory);
@@ -555,15 +561,17 @@ describe("DB access layer", () => {
 
     test("resolveMemoryType coerces unknown/undefined to the default", () => {
       expect(__internals.resolveMemoryType(undefined)).toBe("project_fact");
-      expect(__internals.resolveMemoryType("preference")).toBe("preference");
+      expect(__internals.resolveMemoryType("stack_fact")).toBe("stack_fact");
+      // preference was removed as a type; it now defaults like any other unknown value.
+      expect(__internals.resolveMemoryType("preference")).toBe("project_fact");
       expect(__internals.resolveMemoryType("nope")).toBe("project_fact");
     });
 
     test("recall surfaces non-default types in its output", async () => {
       try {
-        await __internals.remember({ content: "Preference surfaced in recall output.", type: "preference" }, ctx);
+        await __internals.remember({ content: "Episodic type surfaced in recall output.", type: "episodic" }, ctx);
         const result = await __internals.recall({ query: "surfaced in recall", limit: 2 }, ctx);
-        expect(result).toContain("[preference]");
+        expect(result).toContain("[episodic]");
       } finally {
         await __internals.sql`DELETE FROM memories WHERE project = ${ctx.directory}`;
       }
@@ -610,16 +618,16 @@ describe("DB access layer", () => {
 
     test("explicit tags and type replace the stored ones", async () => {
       try {
-        const stored = await __internals.remember({ content: "A memory that will be retyped as a preference." }, ctx);
+        const stored = await __internals.remember({ content: "A memory that will be retyped as episodic." }, ctx);
         const id = Number(stored.match(/#(\d+)/)?.[1]);
         expect(
-          await __internals.updateMemory({ id, content: "Retyped as a standing preference.", type: "preference" }, ctx),
+          await __internals.updateMemory({ id, content: "Retyped as episodic.", type: "episodic" }, ctx),
         ).toBe(`Updated memory #${id}.`);
         const [row] = await __internals.sql`SELECT memory_type, tags FROM memories WHERE id = ${id}` as {
           memory_type: string;
           tags: string[];
         }[];
-        expect(row.memory_type).toBe("preference");
+        expect(row.memory_type).toBe("episodic");
         expect(row.tags).toEqual([]);
       } finally {
         await __internals.sql`DELETE FROM memories WHERE project = ${ctx.directory}`;
@@ -666,17 +674,17 @@ describe("DB access layer", () => {
 
       expect(await __internals.updateMemory({ id: -1, content: "valid content here" }, ctx)).toContain("positive integer");
       expect(await __internals.updateMemory({ id: 1, content: "short" }, ctx)).toContain("at least 10 characters");
-      expect(await __internals.updateMemory({ id: 1, content: "valid content here", type: "nope" as unknown as "preference" }, ctx)).toContain(
-        "preference, stack_fact, project_fact, episodic",
+      expect(await __internals.updateMemory({ id: 1, content: "valid content here", type: "nope" as unknown as "project_fact" }, ctx)).toContain(
+        "stack_fact, project_fact, episodic",
       );
     });
 
     test("an update invalidates the injected block", async () => {
       const marker = `zzzupdate${Date.now()}`;
       try {
-        // Preference type: the recency-fallback block is preferences-first and
-        // the live corpus fills it - a project_fact marker would never render.
-        const stored = await __internals.remember({ content: `Original note ${marker}`, type: "preference" }, ctx);
+        // The recency-fallback block is plain newest-first, so the freshly
+        // stored row is always slot 1 regardless of type.
+        const stored = await __internals.remember({ content: `Original note ${marker}` }, ctx);
         const id = Number(stored.match(/#(\d+)/)?.[1]);
         const before: { system: string[] } = { system: [] };
         await __internals.handleTransform(before, ctx.directory);
@@ -703,8 +711,8 @@ describe("DB access layer", () => {
         const stored = await __internals.remember({ content: `Access tracking probe ${marker} for the recall bump.` }, ctx);
         const id = Number(stored.match(/#(\d+)/)?.[1]);
         // Queried recall, not a browse: undirected browse returns the top-5 by
-        // preference-then-recency, which the live corpus's global preferences
-        // fill entirely - the fixture would never be a returned row to bump.
+        // plain recency, which the live corpus's many rows fill entirely -
+        // the fixture would never be a returned row to bump.
         await __internals.recall({ query: marker }, ctx);
         await __internals.recall({ query: marker }, ctx);
         // Fire-and-forget: give the abandoned UPDATE a beat to land.
@@ -863,10 +871,9 @@ describe("DB access layer", () => {
       const savedBase = __internals.ollamaBase;
       __internals.setOllamaBase("http://127.0.0.1:9");
       try {
-        // Preference type: the fallback block is preferences-first and the
-        // live corpus fills it with global preference rows - a project_fact
-        // probe would never render (corpus-dependent test rot).
-        await __internals.remember({ content: "Sole memory of the fallback probe project.", type: "preference" }, ctx);
+        // The recency-fallback block is plain newest-first, so the freshly
+        // stored row is always slot 1 regardless of type.
+        await __internals.remember({ content: "Sole memory of the fallback probe project." }, ctx);
         __internals.invalidateInjection(ctx.directory);
         const output: { system: string[] } = { system: [] };
         await __internals.handleTransform(output, ctx.directory, ask("xqzzyblorpn kwintavex blorptonic qwertyuiopas"));
@@ -1082,8 +1089,8 @@ describe("DB access layer", () => {
         const [n] = await __internals.sql`SELECT count(*) AS n FROM memories WHERE project = ${project}` as { n: string }[];
         expect(Number(n.n)).toBe(2);
         // The collapse assertion uses a relevance prompt: the no-prompt
-        // recency block is preferences-first and the live corpus's global
-        // preferences fill it, so a fixture project_fact never renders there.
+        // recency block is plain newest-first and the live corpus's many
+        // rows fill it, so a fixture project_fact never renders there.
         // The mode is set explicitly because the relevance describe's afterAll
         // flips the module default to recency (file-order state).
         const savedMode = __internals.injectionMode;
@@ -1578,6 +1585,159 @@ describe("DB access layer", () => {
         await __internals.sql`DELETE FROM memories WHERE project = ${project}`;
         __internals.invalidateInjection(project);
       }
+    });
+
+    test.skipIf(!hybridReady)("session-compaction summaries (real template shape) are excluded from the meaning pass", async () => {
+      // Mirrors real corpus rows #12/#794/#803: same fixed template, only the
+      // session id and counters vary, and real measured cosine similarity
+      // between them was 0.97-0.98 - among the highest false-merge risk found
+      // in the 2026-09-19 audit. Trigram jaccard for this pair is ~0.70 (below
+      // DEDUP_SIMILARITY 0.8), so the wording pass must not catch it either -
+      // any removal here would prove the meaning pass, not a fixture artifact.
+      const project = "/tmp/ocpg-test-consolidate-sesscompact";
+      try {
+        const a = await __internals.remember(
+          { content: "User performed session compacting for project widget-frontend-repo on branch main, session ses_aaabbbcccdddeeefff111, recording 3 memories stored, 0 searches, and 10 messages." },
+          { directory: project, sessionID: "sc" },
+        );
+        const aId = Number(a.match(/#(\d+)/)?.[1]);
+        const b = await __internals.remember(
+          { content: "User performed session compacting for project widget-frontend-repo on branch main, session ses_gggghhhhiiiijjjjkkkk222, recording 4 memories stored, 0 searches, and 14 messages." },
+          { directory: project, sessionID: "sc" },
+        );
+        const bId = Number(b.match(/#(\d+)/)?.[1]);
+        expect(await untilEmbedded(aId)).toBe(true);
+        expect(await untilEmbedded(bId)).toBe(true);
+
+        await __internals.consolidate();
+
+        // Both survive - two different sessions of the same project, not a
+        // duplicate - despite the near-identical wording.
+        const [rowA] = await __internals.sql`SELECT count(*) AS n FROM memories WHERE id = ${aId}` as { n: string }[];
+        const [rowB] = await __internals.sql`SELECT count(*) AS n FROM memories WHERE id = ${bId}` as { n: string }[];
+        expect(Number(rowA.n)).toBe(1);
+        expect(Number(rowB.n)).toBe(1);
+      } finally {
+        await __internals.sql`DELETE FROM memories WHERE project = ${project}`;
+        __internals.invalidateInjection(project);
+      }
+    });
+
+    test.skipIf(!hybridReady)("per-app migration checklist entries (real template shape) are excluded from the meaning pass", async () => {
+      // Mirrors real corpus rows #519/#520: "For APP N (...)" checklist
+      // entries for two DIFFERENT apps, real measured cosine ~0.89. Trigram
+      // jaccard for this pair is ~0.69 (below DEDUP_SIMILARITY 0.8), so the
+      // wording pass must not catch it either.
+      const project = "/tmp/ocpg-test-consolidate-perapp";
+      try {
+        const a = await __internals.remember(
+          { content: "For APP 1 (widget-frontend), User lists: old values file charts_values/environments/staging/widget.frontend.values.yaml; live dump apps/live-staging-dump/widget-frontend/live.all.yaml; test reference charts_values/environments/test/widget-frontend.values.new.yaml; release name widget-frontend; chart app name widget-frontend; per-app secret name widget-frontend-secrets." },
+          { directory: project, sessionID: "pa" },
+        );
+        const aId = Number(a.match(/#(\d+)/)?.[1]);
+        const b = await __internals.remember(
+          { content: "For APP 2 (gizmo-worker), User lists: old values file charts_values/environments/staging/gizmo.worker.values.yaml; live dump apps/live-staging-dump/gizmo-worker/live.all.yaml; test reference charts_values/environments/test/gizmo-worker.values.new.yaml; release name gizmo-worker; chart app name gizmo-worker; per-app secret name gizmo-worker-secrets." },
+          { directory: project, sessionID: "pa" },
+        );
+        const bId = Number(b.match(/#(\d+)/)?.[1]);
+        expect(await untilEmbedded(aId)).toBe(true);
+        expect(await untilEmbedded(bId)).toBe(true);
+
+        await __internals.consolidate();
+
+        // Both survive - two different apps' migration details, not a
+        // duplicate - despite the shared checklist template.
+        const [rowA] = await __internals.sql`SELECT count(*) AS n FROM memories WHERE id = ${aId}` as { n: string }[];
+        const [rowB] = await __internals.sql`SELECT count(*) AS n FROM memories WHERE id = ${bId}` as { n: string }[];
+        expect(Number(rowA.n)).toBe(1);
+        expect(Number(rowB.n)).toBe(1);
+      } finally {
+        await __internals.sql`DELETE FROM memories WHERE project = ${project}`;
+        __internals.invalidateInjection(project);
+      }
+    });
+  });
+
+  describe("consolidate: isTemplatedAutoLog predicate (regression, no embeddings needed)", () => {
+    // Permanent regression net for the exclusion predicate itself: runs the
+    // exact SQL fragment consolidate() uses (via __internals.isTemplatedAutoLog),
+    // against representative strings pulled from the 2026-09-19 real-corpus
+    // audit - so a future refactor of the predicate is caught here even
+    // without a live Ollama/pgvector setup (no hybridReady gate, no writes).
+    const matches = async (content: string): Promise<boolean> => {
+      const [row] = await __internals.sql`
+        SELECT ${__internals.isTemplatedAutoLog(__internals.sql)} AS matches
+        FROM (SELECT ${content}::text AS content) AS t
+      ` as { matches: boolean }[];
+      return row.matches;
+    };
+
+    test("matches all three real-corpus template shapes", async () => {
+      // Background-task status logs (team/subagent system) - both phrasing
+      // variants seen in the real corpus ("Background task bg_..." and
+      // "User reported that background task bg_...").
+      expect(
+        await matches(
+          "Background task bg_8bc0727a, intended to create the team member aur-makefile-review/creative-analyst, was cancelled for the same reason: the subagent called team_task_list ten consecutive times.",
+        ),
+      ).toBe(true);
+      expect(
+        await matches(
+          "User reported that background task bg_a638c530 attempted ImageUpdater Job handling, failed session ses_0c70329cdffe5h115YnXI5BaO6 using model opencode/north-mini-code-free, hit a Bad Gateway error, and was re-queued on fallback model opencode/deepseek-v4-flash-free.",
+        ),
+      ).toBe(true);
+
+      // Session-compaction summaries.
+      expect(
+        await matches(
+          "User performed session compacting for project pentago-dotfiles on branch main, session ses_066a7d7d8ffeZ4Ui7QdapK6qnV, recording 3 memories stored, 0 searches, and 10 messages.",
+        ),
+      ).toBe(true);
+
+      // Per-app migration checklist entries.
+      expect(
+        await matches(
+          "For APP 1 (storybook-web), User lists: old values file charts_values/environments/staging/storybook.web.values.yaml; release name vedur-storybook-web.",
+        ),
+      ).toBe(true);
+      expect(
+        await matches(
+          "For APP 2 (skridur), User lists: old values file charts_values/environments/staging/vedur.skridur.values.yaml; release name vedur-skridur.",
+        ),
+      ).toBe(true);
+    });
+
+    test("does not match real natural-language content, including confirmed-correct meaning-pass merges", async () => {
+      // These are the actual "correct merge" pairs from the 2026-09-19 audit
+      // (real fact restatements the meaning pass is supposed to keep
+      // catching) - a predicate refactor that starts matching these would
+      // silently gut the pass, exactly the auto_capture-tag failure mode.
+      expect(
+        await matches(
+          "Surviving finding: the IgnorePath pattern '/etc/*-' in 00-ignores.sh line 21 is overly broad, matching any /etc/ entry ending with a hyphen; recommendation is to replace it with explicit backup file patterns or add a clarifying comment.",
+        ),
+      ).toBe(false);
+      expect(
+        await matches(
+          "The IgnorePath rule `/etc/*-` (line 21) matches any file or directory under `/etc/` ending with a hyphen, which is risky; it should be replaced with explicit patterns for known backup files.",
+        ),
+      ).toBe(false);
+      expect(
+        await matches(
+          "User specifies intended differences that should not be corrected: rename secret applications-azure-secrets to <app>-secrets, addition of a new ExternalSecret resource, change to unichart label/selector scheme, and release-derived naming conventions.",
+        ),
+      ).toBe(false);
+
+      // The two residual, NOT-templated false-merge risks the audit
+      // explicitly accepted rather than fixed (natural language, not
+      // boilerplate) - the predicate must not "solve" these by accident
+      // either, since that's not what it's for.
+      expect(
+        await matches("User created a systemd system service file at /etc/systemd/system/openfortivpn-origo.service that runs as root and whose ExecStart points to the openfortivpn wrapper script"),
+      ).toBe(false);
+      expect(
+        await matches("User created the systemd user service file at ~/.config/systemd/user/openfortivpn-origo.service and supporting wrapper scripts at ~/.config/waybar/indicators/openfortivpn-origo, toggle-vpn, and vpn.sh for starting, stopping, and checking service status"),
+      ).toBe(false);
     });
   });
 });

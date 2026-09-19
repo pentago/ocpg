@@ -345,19 +345,19 @@ function extractPromptQuery(
   return "";
 }
 
-// Visibility rule shared by recall and both injection builders: global types
-// (preference, stack_fact) are visible everywhere; project_fact is visible
-// only from its origin project unless explicitly opted out with
-// global: true (recall) - at injection time there is no caller to opt in, so
-// other projects' project_fact rows never surface as ambient context.
+// Visibility rule shared by recall and both injection builders: the global
+// type (stack_fact) is visible everywhere; project_fact is visible only from
+// its origin project unless explicitly opted out with global: true (recall)
+// - at injection time there is no caller to opt in, so other projects'
+// project_fact rows never surface as ambient context.
 function visibleRows(client: SQL, directory: string) {
   return client`(memory_type != 'project_fact' OR project = ${directory})`;
 }
 
 // Recency query shared by the recency mode and the no-match fallback: latest
-// visible rows, preferences first. Global by design - the project column
-// records origin, not visibility... for global types; project_fact is
-// origin-scoped (see visibleRows).
+// visible rows, newest first. Global by design - the project column records
+// origin, not visibility, for global types; project_fact is origin-scoped
+// (see visibleRows).
 // Query builders are pure functions of the client so the benchmark
 // (bench/run.ts) can execute the EXACT production SQL against bench
 // databases - no drift between what is measured and what runs.
@@ -369,7 +369,7 @@ function buildRecencyQuery(client: SQL, directory: string) {
            project
     FROM memories
     WHERE ${visibleRows(client, directory)}
-    ORDER BY (memory_type = 'preference') DESC, created_at DESC
+    ORDER BY created_at DESC
     LIMIT 20
   `;
 }
@@ -516,12 +516,12 @@ const MAX_TAG_LENGTH = 64;
 
 // The stored vocabulary mirrors the DB CHECK constraint (memories_type_check);
 // rows predate the column, so "required" would break every existing caller -
-// type is always defaulted. Visibility follows the type: preference and
-// stack_fact are global (tooling knowledge ports across every project using
-// the stack), project_fact is origin-project-only (customer-specific facts
-// must not surface elsewhere), episodic is reserved for the (cut, opt-in) 1.3
-// feature; remember accepts it so the vocabulary stays in one place.
-const MEMORY_TYPES = ["preference", "stack_fact", "project_fact", "episodic"] as const;
+// type is always defaulted. Visibility follows the type: stack_fact is
+// global (tooling knowledge ports across every project using the stack),
+// project_fact is origin-project-only (customer-specific facts must not
+// surface elsewhere), episodic is reserved for the (cut, opt-in) 1.3 feature;
+// remember accepts it so the vocabulary stays in one place.
+const MEMORY_TYPES = ["stack_fact", "project_fact", "episodic"] as const;
 type MemoryType = (typeof MEMORY_TYPES)[number];
 
 function resolveMemoryType(raw: unknown): MemoryType {
@@ -556,9 +556,8 @@ async function recall(
 ): Promise<string> {
   try {
     const limit = resolveLimit(args.limit);
-    // Visibility: global types (preference, stack_fact) everywhere;
-    // project_fact only from the origin project unless the caller opts in
-    // with global: true.
+    // Visibility: the global type (stack_fact) everywhere; project_fact only
+    // from the origin project unless the caller opts in with global: true.
     const visibleCond = args.global ? sql`` : sql`AND ${visibleRows(sql, ctx.directory)}`;
     const q = args.query ?? "";
     const tsQuery = q ? orTsQuery(q) : "";
@@ -573,13 +572,13 @@ async function recall(
       ? sql`AND tags @> ${sql.array(tagList, "text")}`
       : sql``;
     // Relevance-ranked when searching; undirected browse is plain recency
-    // (preferences first, matching the injection fallback). A frequency blend
-    // was tried and removed: bumping exactly the returned top-5 is a
-    // rich-get-richer loop - live corpus rows pinned the top slot after a few
-    // runs. access_count stays as data collection; no ranking consumes it.
+    // (matching the injection fallback). A frequency blend was tried and
+    // removed: bumping exactly the returned top-5 is a rich-get-richer loop -
+    // live corpus rows pinned the top slot after a few runs. access_count
+    // stays as data collection; no ranking consumes it.
     const orderBy = q
       ? sql`ORDER BY ts_rank(search_vector, to_tsquery('english', ${tsQuery})) DESC`
-      : sql`ORDER BY (memory_type = 'preference') DESC, created_at DESC`;
+      : sql`ORDER BY created_at DESC`;
 
     // Hybrid: with a searchable query, embed it concurrently so a warm bge-m3
     // (~20ms) hides behind the keyword round-trip; the vector half then merges
@@ -639,8 +638,8 @@ async function recall(
       .map((r) => {
         const tags = r.tags ?? [];
         const tagStr = tags.length ? ` (${tags.join(', ')})` : '';
-        // preference/episodic are worth surfacing; project_fact is the default
-        // every pre-column row carries, so printing it is pure noise.
+        // episodic is worth surfacing; project_fact is the default every
+        // pre-column row carries, so printing it is pure noise.
         const typeStr = r.memory_type === "project_fact" ? "" : ` [${r.memory_type}]`;
         return `[${r.date}] [${r.project}]${typeStr}${tagStr}\n#${r.id}\n${r.content}`;
       })
@@ -760,8 +759,8 @@ async function captureFromPrompt(
 }
 
 // project_fact rows are origin-scoped (a customer-B agent must not delete
-// customer-A's customer facts); global types (preference, stack_fact) are
-// maintainable from any project - that's what global means for them.
+// customer-A's customer facts); the global type (stack_fact) is
+// maintainable from any project - that's what global means for it.
 async function forget(
   args: ForgetArgs,
   ctx: { directory: string },
@@ -860,7 +859,7 @@ const CONSOLIDATE_EMBED_THRESHOLD = 0.83;
 
 // Mutual visibility for consolidation, mirroring visibleRows(): a project_fact
 // may only cluster with another row from its OWN project (regardless of that
-// row's type); global types (preference, stack_fact) cluster with anything.
+// row's type); the global type (stack_fact) clusters with anything.
 // Consolidation must never merge/delete across a boundary memory_forget and
 // memory_update already refuse to cross.
 function mutuallyVisible(client: SQL) {
@@ -1088,7 +1087,7 @@ const ocpg = Plugin.define({
         // breaks direct invocation without adding value.
         options: { codemode: false },
         description:
-          "Search past memories. Global types (preference, stack_fact) are always searched; this project's project_fact memories are searched by default. Use before non-trivial work to check for relevant lessons, fixes, and decisions.",
+          "Search past memories. The stack_fact type is always searched; this project's project_fact memories are searched by default. Use before non-trivial work to check for relevant lessons, fixes, and decisions.",
         input: {
           type: "object",
           properties: {
@@ -1104,7 +1103,7 @@ const ocpg = Plugin.define({
               type: "boolean",
               description:
                 "Also search other projects' project_fact memories (default: only this " +
-                "project's project_fact memories, plus all preference/stack_fact memories, " +
+                "project's project_fact memories, plus all stack_fact memories, " +
                 "which are always global).",
             },
             limit: { type: "number", description: "1-20, default 5" },
@@ -1123,7 +1122,7 @@ const ocpg = Plugin.define({
         // injected block is skipped entirely for projects with no memories and
         // the user may have no project instructions at all.
         description:
-          "Store a durable memory. preference and stack_fact are shared across all projects; " +
+          "Store a durable memory. stack_fact is shared across all projects; " +
           "project_fact (the default) is visible only in this project unless recalled with " +
           "global: true. Use after user corrections (immediately), architecture decisions, " +
           "non-trivial fixes, environment facts, and stated preferences. " +
@@ -1141,10 +1140,9 @@ const ocpg = Plugin.define({
               type: "string",
               enum: [...MEMORY_TYPES],
               description:
-                "preference = a standing user preference (global, injected first). " +
                 "stack_fact = true about the tooling/stack itself, portable to any project " +
                 "using the same stack (e.g. a Terraform module quirk, an ArgoCD gotcha, a " +
-                "Helm chart convention) - global, like preference. " +
+                "Helm chart convention) - global. " +
                 "project_fact (default) = true about THIS specific project/customer only " +
                 "(an environment quirk, a customer's specific request, a one-off workaround) " +
                 "- visible only in this project unless the caller asks for global search. " +
@@ -1173,7 +1171,7 @@ const ocpg = Plugin.define({
         options: { codemode: false },
         description:
           "Delete a memory by id (get ids from memory_recall). Use for memories that are wrong or obsolete; prefer storing a corrected memory when the old one is still useful history. " +
-          "preference and stack_fact can be deleted from any project; project_fact can only be " +
+          "stack_fact can be deleted from any project; project_fact can only be " +
           "deleted by its origin project (the delete will fail with the owning project's name).",
         input: {
           type: "object",
@@ -1192,7 +1190,7 @@ const ocpg = Plugin.define({
         options: { codemode: false },
         description:
           "Rewrite an existing memory by id (get ids from memory_recall). Use when a memory is outdated but still worth keeping: the corrected content replaces the old, keeping the original learned date. " +
-          "Omitted tags/type are kept as-is. preference and stack_fact can be edited from any " +
+          "Omitted tags/type are kept as-is. stack_fact can be edited from any " +
           "project; project_fact can only be edited by its origin project. " +
           "For obsolete memories use memory_forget; for genuinely new memories use memory_remember.",
         input: {
@@ -1289,6 +1287,7 @@ const __internals = {
   embedAndStore,
   storeEmbedding,
   CONSOLIDATE_EMBED_THRESHOLD,
+  isTemplatedAutoLog,
   rrfMerge,
   hybridMerge,
   vectorLiteral,

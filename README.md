@@ -99,7 +99,12 @@ This runs alongside the model's own judgment to call `memory_remember` - it does
 
 ### Duplicates
 
-Writes are never rejected for duplicates. Near-duplicates (>=80% content similarity, measured on the real corpus - the old FTS-on-first-60-chars rule missed 28 pairs) are collapsed out of the injected block automatically, and `memory_consolidate` removes them on demand (keeps the newest of each group, reports removed texts for the agent to merge back). Needs the trgm index; fresh installs from [`deploy/`](./deploy) get it automatically, existing databases run the upgrade block in [`deploy/README.md`](./deploy/README.md).
+Writes are never rejected for duplicates - cleanup is `memory_consolidate`'s job, run on demand. It runs two passes and reports which one found each removed group:
+
+- **`[wording]`** - trigram content similarity (>=80%): catches restatements that share most of their wording (the old FTS-on-first-60-chars rule missed 28 such pairs on the real corpus).
+- **`[meaning]`** - embedding cosine similarity (bge-m3, >=0.83): catches the same fact stated in completely different words, which trigram similarity structurally cannot reach. Only memories that have an embedding participate.
+
+Both passes keep the newest of every group and delete the rest, returning the removed texts so the agent can merge back any unique detail with `memory_update`. Near-duplicates are also collapsed out of the injected block automatically between consolidations. The wording pass needs the trgm index; fresh installs from [`deploy/`](./deploy) get it automatically, existing databases run the upgrade block in [`deploy/README.md`](./deploy/README.md). The meaning pass needs the `embedding` column populated (see "How injection picks memories" below) - rows Ollama never reached simply aren't candidates for it.
 
 If the database is unreachable, memory injection is skipped and the tools return a generic error - a slow or dead database never blocks a model request.
 

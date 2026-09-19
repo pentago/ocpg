@@ -252,8 +252,11 @@ describe("DB access layer", () => {
 
         // Deterministic: the older row dies, the newest survives, and the
         // removed text comes back so the calling agent can merge unique facts.
+        // Note: consolidate scans the whole store (not just this fixture), so
+        // the report's overall totals are not asserted here - only this
+        // pair's own outcome.
         const result = await __internals.consolidate();
-        expect(result).toContain("Removed 1 duplicate");
+        expect(result).toContain("[wording]");
         expect(result).toContain("staging cluster must be drained");
         const [survivor] = await __internals.sql`SELECT content FROM memories WHERE id = ${secondId}` as { content: string }[];
         expect(survivor.content).toBe(restated);
@@ -263,8 +266,12 @@ describe("DB access layer", () => {
         expect(Number(a.n)).toBe(0);
         expect(Number(b.n)).toBe(1);
 
-        // Idempotent: a second pass finds nothing.
-        expect(await __internals.consolidate()).toContain("No duplicates found");
+        // Idempotent for this pair: a second pass must not touch the survivor
+        // (the wider corpus may still have other groups left to clean up, so
+        // a bare "No duplicates found" is not asserted here).
+        await __internals.consolidate();
+        const [stillThere] = await __internals.sql`SELECT content FROM memories WHERE id = ${secondId}` as { content: string }[];
+        expect(stillThere.content).toBe(restated);
       } finally {
         await __internals.sql`DELETE FROM memories WHERE project = ${project}`;
       }
@@ -293,9 +300,10 @@ describe("DB access layer", () => {
         expect(await __internals.remember({ content }, { directory: project, sessionID: "f" })).toContain("Stored memory #");
         const [n] = await __internals.sql`SELECT count(*) AS n FROM memories WHERE project = ${project}` as { n: string }[];
         expect(Number(n.n)).toBe(2);
-        // Consolidation removes the exact dupe; the report shows what was removed.
+        // Consolidation removes the exact dupe; the report shows what was
+        // removed. consolidate scans the whole store, so the overall totals
+        // are not asserted here - only that this project's own dupe is gone.
         const result = await __internals.consolidate();
-        expect(result).toContain("Removed 1 duplicate");
         expect(result).toContain("Renovate opens dependency PRs");
         const [n2] = await __internals.sql`SELECT count(*) AS n FROM memories WHERE project = ${project}` as { n: string }[];
         expect(Number(n2.n)).toBe(1);
@@ -1389,6 +1397,149 @@ describe("DB access layer", () => {
       } finally {
         await __internals.sql`DELETE FROM memories WHERE project = ${ctx.directory}`;
         __internals.invalidateInjection(ctx.directory);
+      }
+    });
+  });
+
+  describe("consolidate: embedding-based pass (meaning-level duplicates)", () => {
+    // Cosine similarities for these exact fixtures were measured directly
+    // against bge-m3 before writing this test: the duplicate pair is ~0.946
+    // (above CONSOLIDATE_EMBED_THRESHOLD 0.83), the distinct pair ~0.57
+    // (comfortably below). Trigram Jaccard for both pairs is ~0.24-0.67,
+    // below DEDUP_SIMILARITY (0.8) - the wording pass must not catch either,
+    // so any group found here is provably the meaning pass's work.
+    const untilEmbedded = async (id: number): Promise<boolean> => {
+      for (let i = 0; i < 100; i++) {
+        const [row] = await __internals.sql`SELECT embedding IS NOT NULL AS has FROM memories WHERE id = ${id}` as { has: boolean }[];
+        if (row.has) return true;
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      return false;
+    };
+
+    test.skipIf(!hybridReady)("a differently-worded duplicate is caught and reported as [meaning]", async () => {
+      const project = "/tmp/ocpg-test-consolidate-embed";
+      const marker = `zzzconsolembed${Date.now()}`;
+      try {
+        const first = await __internals.remember(
+          { content: `Fixture ${marker}: the production database runs Postgres 16 on port 5432.` },
+          { directory: project, sessionID: "ce" },
+        );
+        const firstId = Number(first.match(/#(\d+)/)?.[1]);
+        const second = await __internals.remember(
+          { content: `Fixture ${marker}: Postgres 16 is the production database version, listening on port 5432.` },
+          { directory: project, sessionID: "ce" },
+        );
+        const secondId = Number(second.match(/#(\d+)/)?.[1]);
+        expect(await untilEmbedded(firstId)).toBe(true);
+        expect(await untilEmbedded(secondId)).toBe(true);
+
+        const result = await __internals.consolidate();
+        expect(result).toContain("[meaning]");
+        expect(result).toContain(marker);
+
+        // Exactly one of the pair survives (the newest); which physical id
+        // survives depends on insertion order, so assert the total, not identity.
+        const [a] = await __internals.sql`SELECT count(*) AS n FROM memories WHERE id = ${firstId}` as { n: string }[];
+        const [b] = await __internals.sql`SELECT count(*) AS n FROM memories WHERE id = ${secondId}` as { n: string }[];
+        expect(Number(a.n) + Number(b.n)).toBe(1);
+      } finally {
+        await __internals.sql`DELETE FROM memories WHERE project = ${project}`;
+        __internals.invalidateInjection(project);
+      }
+    });
+
+    test.skipIf(!hybridReady)("genuinely distinct facts with moderate embedding similarity are not merged", async () => {
+      const project = "/tmp/ocpg-test-consolidate-distinct";
+      const marker = `zzzconsoldistinct${Date.now()}`;
+      try {
+        const first = await __internals.remember(
+          { content: `Fixture ${marker}: the production database runs Postgres 16 on port 5432.` },
+          { directory: project, sessionID: "cd" },
+        );
+        const firstId = Number(first.match(/#(\d+)/)?.[1]);
+        const second = await __internals.remember(
+          { content: `Fixture ${marker}: the Redis cache for sessions expires after 24 hours of inactivity.` },
+          { directory: project, sessionID: "cd" },
+        );
+        const secondId = Number(second.match(/#(\d+)/)?.[1]);
+        expect(await untilEmbedded(firstId)).toBe(true);
+        expect(await untilEmbedded(secondId)).toBe(true);
+
+        await __internals.consolidate();
+
+        // Both must survive - the failure mode this threshold exists to avoid.
+        const [a] = await __internals.sql`SELECT count(*) AS n FROM memories WHERE id = ${firstId}` as { n: string }[];
+        const [b] = await __internals.sql`SELECT count(*) AS n FROM memories WHERE id = ${secondId}` as { n: string }[];
+        expect(Number(a.n)).toBe(1);
+        expect(Number(b.n)).toBe(1);
+      } finally {
+        await __internals.sql`DELETE FROM memories WHERE project = ${project}`;
+        __internals.invalidateInjection(project);
+      }
+    });
+
+    test.skipIf(!hybridReady)("a project_fact is never merged against another project's project_fact, even at high similarity", async () => {
+      const projectA = "/tmp/ocpg-test-consolidate-vis-a";
+      const projectB = "/tmp/ocpg-test-consolidate-vis-b";
+      const marker = `zzzconsolvis${Date.now()}`;
+      try {
+        const a = await __internals.remember(
+          { content: `Fixture ${marker}: the production database runs Postgres 16 on port 5432.` },
+          { directory: projectA, sessionID: "va" },
+        );
+        const aId = Number(a.match(/#(\d+)/)?.[1]);
+        const b = await __internals.remember(
+          { content: `Fixture ${marker}: Postgres 16 is the production database version, listening on port 5432.` },
+          { directory: projectB, sessionID: "vb" },
+        );
+        const bId = Number(b.match(/#(\d+)/)?.[1]);
+        expect(await untilEmbedded(aId)).toBe(true);
+        expect(await untilEmbedded(bId)).toBe(true);
+
+        await __internals.consolidate();
+
+        // Both project_fact rows survive - they are invisible to each other,
+        // exactly like memory_forget/memory_update across this boundary.
+        const [rowA] = await __internals.sql`SELECT count(*) AS n FROM memories WHERE id = ${aId}` as { n: string }[];
+        const [rowB] = await __internals.sql`SELECT count(*) AS n FROM memories WHERE id = ${bId}` as { n: string }[];
+        expect(Number(rowA.n)).toBe(1);
+        expect(Number(rowB.n)).toBe(1);
+      } finally {
+        await __internals.sql`DELETE FROM memories WHERE project = ${projectA} OR project = ${projectB}`;
+        __internals.invalidateInjection(projectA);
+        __internals.invalidateInjection(projectB);
+      }
+    });
+
+    test.skipIf(!hybridReady)("global-type duplicates ARE merged across projects (mutual visibility, not same-project)", async () => {
+      const projectA = "/tmp/ocpg-test-consolidate-global-a";
+      const projectB = "/tmp/ocpg-test-consolidate-global-b";
+      const marker = `zzzconsolglobal${Date.now()}`;
+      try {
+        const a = await __internals.remember(
+          { content: `Fixture ${marker}: the production database runs Postgres 16 on port 5432.`, type: "stack_fact" },
+          { directory: projectA, sessionID: "ga" },
+        );
+        const aId = Number(a.match(/#(\d+)/)?.[1]);
+        const b = await __internals.remember(
+          { content: `Fixture ${marker}: Postgres 16 is the production database version, listening on port 5432.`, type: "stack_fact" },
+          { directory: projectB, sessionID: "gb" },
+        );
+        const bId = Number(b.match(/#(\d+)/)?.[1]);
+        expect(await untilEmbedded(aId)).toBe(true);
+        expect(await untilEmbedded(bId)).toBe(true);
+
+        const result = await __internals.consolidate();
+        expect(result).toContain("[meaning]");
+
+        const [rowA] = await __internals.sql`SELECT count(*) AS n FROM memories WHERE id = ${aId}` as { n: string }[];
+        const [rowB] = await __internals.sql`SELECT count(*) AS n FROM memories WHERE id = ${bId}` as { n: string }[];
+        expect(Number(rowA.n) + Number(rowB.n)).toBe(1);
+      } finally {
+        await __internals.sql`DELETE FROM memories WHERE project = ${projectA} OR project = ${projectB}`;
+        __internals.invalidateInjection(projectA);
+        __internals.invalidateInjection(projectB);
       }
     });
   });

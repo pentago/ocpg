@@ -351,3 +351,29 @@ Extraction-only rehearsal (no writes) on real opencode sessions, qwen3:4b:
 - known behavior: overlapping facts inside one batch (e.g. two phrasings of
   the same gotcha) arrive together; in production the smart-write path
   dedups the later one, the capture bench does not exercise writes.
+
+## Consolidate embedding-pass calibration (2026-09-19, ad hoc script against the same 26 pairs, live Ollama bge-m3)
+
+The judge model's removal needed a replacement threshold for
+`memory_consolidate`'s new meaning (embedding) pass. Re-measured the exact
+26 pairs from the judge gate above directly with bge-m3 cosine (no judge,
+no prefilter - just `existing` vs `incoming` similarity):
+
+| category | min | max | mean |
+| -------- | --- | --- | ---- |
+| duplicate | 0.784 | 0.956 | 0.882 |
+| update    | 0.573 | 0.874 | 0.775 |
+| distinct  | 0.505 | 0.760 | 0.585 |
+
+No single threshold separates "update" (a fact superseding an older one)
+from "duplicate" - the two ranges overlap almost entirely. `distinct` is
+the failure mode that matters (accidentally deleting a genuinely unique
+fact), and its max (0.760) sits comfortably below duplicate's min (0.784).
+`CONSOLIDATE_EMBED_THRESHOLD = 0.83` was picked with margin above the
+distinct ceiling (not the bare midpoint, ~0.77, between the two): it
+catches 7/8 duplicates and 0/10 distinct pairs (the hard gate), and
+2/8 update pairs - deleting the stale side of a superseded fact is an
+acceptable, reviewable outcome (the removed text always returns in
+`memory_consolidate`'s report), not the lost-unique-fact case this
+threshold protects against. Verified end-to-end against the live corpus in
+`tests/ocpg.test.ts`'s "consolidate: embedding-based pass" suite.

@@ -842,16 +842,47 @@ async function updateMemory(
   }
 }
 
+// Embedding-similarity threshold for consolidate's second pass, calibrated
+// against the same hand-labeled pairs the (now-removed) judge bench used
+// (bench/judge.ts's PAIRS, bge-m3 cosine, measured 2026-09-19 before removal):
+// true duplicates clustered 0.78-0.96 (mean .88), genuinely distinct-but-
+// related pairs topped out at 0.76 (mean .58), and true "updates" (a fact
+// superseding an older one, e.g. "Postgres 15" -> "upgraded to Postgres 16")
+// sat in between (0.57-0.87, mean .77) and overlap both other groups - no
+// threshold cleanly separates updates from duplicates. 0.83 sits clear of
+// every distinct pair (zero false merges on the one failure mode that
+// matters, per the spec: never delete a genuinely unique fact) while still
+// catching most duplicates (7/8 of the sample) and about half the update
+// pairs - deleting the stale side of a superseded fact is an acceptable,
+// reviewable outcome here (the removed text always comes back in the
+// report), not the lost-information case this threshold is tuned against.
+const CONSOLIDATE_EMBED_THRESHOLD = 0.83;
+
+// Mutual visibility for consolidation, mirroring visibleRows(): a project_fact
+// may only cluster with another row from its OWN project (regardless of that
+// row's type); global types (preference, stack_fact) cluster with anything.
+// Consolidation must never merge/delete across a boundary memory_forget and
+// memory_update already refuse to cross.
+function mutuallyVisible(client: SQL) {
+  return client`((a.memory_type != 'project_fact' AND b.memory_type != 'project_fact') OR a.project = b.project)`;
+}
+
 // Deterministic consolidation, no model calls inside the plugin: find
-// near-duplicate clusters (trigram similarity >= DEDUP_SIMILARITY over the
-// whole content, global), keep the newest of each, delete the rest. The
+// near-duplicate clusters, keep the newest of each, delete the rest. The
 // deleted texts are returned verbatim so the CALLING agent - itself a model -
 // can merge any unique fact back into the survivor via memory_update. Merging
 // is language synthesis, which is the caller's job, not the plugin's.
-// Runs on demand (user-invoked), never on a schedule; capped at 25 clusters
-// per run so a wildly-duplicated corpus cannot turn into one huge report.
+// Runs on demand (user-invoked), never on a schedule.
+//
+// Two passes, run in sequence (the second sees whatever the first already
+// removed): trigram similarity over content (wording-level restatements,
+// unchanged from the original implementation) and embedding cosine
+// similarity (meaning-level duplicates worded completely differently, the
+// case trigram structurally cannot reach). Each is capped at 25 clusters per
+// run so a wildly-duplicated corpus cannot turn into one huge report.
 async function consolidate(): Promise<string> {
   try {
+    // --- Pass 1: wording (trigram similarity over content) ---
     const rows = await sql`
       SELECT id, content, coalesce(tags, '{}') AS tags, created_at
       FROM memories
@@ -879,12 +910,11 @@ async function consolidate(): Promise<string> {
       else clusters.push([entry]);
     }
 
-    const multi = clusters.filter((c) => c.length > 1).slice(0, 25);
-    if (multi.length === 0) return "No duplicates found; nothing to consolidate.";
+    const wordingGroups = clusters.filter((c) => c.length > 1).slice(0, 25);
 
     let removed = 0;
     const report: string[] = [];
-    for (const cluster of multi) {
+    for (const cluster of wordingGroups) {
       const survivor = cluster[0].row;
       const removedRows = cluster.slice(1).map((e) => e.row);
       for (const r of removedRows) {
@@ -894,14 +924,70 @@ async function consolidate(): Promise<string> {
       // Show what died so the calling agent can merge unique facts back into
       // the survivor.
       report.push(
-        `Kept #${survivor.id}: ${truncateMemory(survivor.content)}\n` +
+        `[wording] Kept #${survivor.id}: ${truncateMemory(survivor.content)}\n` +
           removedRows.map((r) => `  removed #${r.id}: ${truncateMemory(r.content)}`).join("\n"),
       );
     }
 
+    // --- Pass 2: meaning (embedding cosine similarity) ---
+    // Only rows the wording pass left behind, and only embedded rows - a row
+    // Ollama never reached (down at write time, pre-migration database) is
+    // simply not a candidate, same graceful-degradation posture as everywhere
+    // else. The pairwise threshold join is pushed into Postgres (pgvector's
+    // <=> operator) rather than pulled into TS: cheap for the corpus sizes
+    // this tool already accepts an O(n^2) cost for (see the wording pass), and
+    // it lets the DB do the floating-point work instead of JS.
+    const embedPairs = (await sql`
+      SELECT a.id AS a_id, b.id AS b_id
+      FROM memories a
+      JOIN memories b ON a.id < b.id
+      WHERE a.embedding IS NOT NULL
+        AND b.embedding IS NOT NULL
+        AND (1 - (a.embedding <=> b.embedding)) >= ${CONSOLIDATE_EMBED_THRESHOLD}
+        AND ${mutuallyVisible(sql)}
+    `) as { a_id: number; b_id: number }[];
+
+    if (embedPairs.length > 0) {
+      const linked = new Set<string>();
+      for (const p of embedPairs) linked.add(`${p.a_id}:${p.b_id}`);
+      const isLinked = (x: number, y: number) => (x < y ? linked.has(`${x}:${y}`) : linked.has(`${y}:${x}`));
+
+      const embedRows = (await sql`
+        SELECT id, content, coalesce(tags, '{}') AS tags, created_at
+        FROM memories
+        WHERE embedding IS NOT NULL
+        ORDER BY created_at DESC
+      `) as { id: number; content: string; tags: string[]; created_at: Date }[];
+
+      // Same greedy "newest anchors a cluster" shape as the wording pass,
+      // matched by the pair list above instead of a text-similarity test.
+      const embedClusters: Array<Array<(typeof embedRows)[number]>> = [];
+      for (const row of embedRows) {
+        const host = embedClusters.find((c) => isLinked(c[0].id, row.id));
+        if (host) host.push(row);
+        else embedClusters.push([row]);
+      }
+      const meaningGroups = embedClusters.filter((c) => c.length > 1).slice(0, 25);
+
+      for (const cluster of meaningGroups) {
+        const survivor = cluster[0];
+        const removedRows = cluster.slice(1);
+        for (const r of removedRows) {
+          await sql`DELETE FROM memories WHERE id = ${r.id}`;
+        }
+        removed += removedRows.length;
+        report.push(
+          `[meaning] Kept #${survivor.id}: ${truncateMemory(survivor.content)}\n` +
+            removedRows.map((r) => `  removed #${r.id}: ${truncateMemory(r.content)}`).join("\n"),
+        );
+      }
+    }
+
+    if (report.length === 0) return "No duplicates found; nothing to consolidate.";
+
     if (removed > 0) injectionCache.clear();
     return (
-      `Removed ${removed} duplicate ${removed === 1 ? "memory" : "memories"} across ${multi.length} groups (kept the newest of each).\n` +
+      `Removed ${removed} duplicate ${removed === 1 ? "memory" : "memories"} across ${report.length} groups (kept the newest of each; [wording] = matched by trigram similarity, [meaning] = matched by embedding similarity).\n` +
       `Check the removed texts - if any carries a fact the kept memory lacks, merge it in with memory_update:\n\n` +
       report.join("\n")
     );
@@ -1105,12 +1191,11 @@ const ocpg = Plugin.define({
         options: { codemode: false },
         // User-invoked cleanup, not a write-path gate: writes never reject on
         // duplicates, so call this when the corpus has accumulated near-dupes.
-        // User-invoked cleanup, not a write-path gate: writes never reject on
-        // duplicates, so call this when the corpus has accumulated near-dupes.
         // The deleted texts come back in the result so the calling agent can
         // merge unique facts into the survivors via memory_update.
         description:
-          "Remove near-duplicate memories: keeps the newest of each >=80%-similar content group anywhere in the store and deletes the rest, returning the removed texts. " +
+          "Remove near-duplicate memories: keeps the newest of each near-duplicate group anywhere in the store and deletes the rest, returning the removed texts. " +
+          "Finds duplicates two ways - matching wording (trigram similarity) and matching meaning (embedding similarity, catches the same fact stated in different words). " +
           "After running it, merge any unique fact from the removed texts into the kept memory via memory_update. Deterministic - run it when the user asks to tidy or consolidate memories.",
         input: {
           type: "object",
@@ -1167,6 +1252,7 @@ const __internals = {
   embed,
   embedAndStore,
   storeEmbedding,
+  CONSOLIDATE_EMBED_THRESHOLD,
   rrfMerge,
   hybridMerge,
   vectorLiteral,

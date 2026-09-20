@@ -397,6 +397,91 @@ threshold alone: excluding them by raising the threshold past 0.84 would
 also have excluded 3 of the corpus's confirmed-correct merges (0.83-0.87
 range). Accepted as a residual, reviewable (not silent) false-merge rate.
 
+## QQP stress test (2026-09-20, `bun bench/qqp-consolidate.ts`, Quora Question Pairs)
+
+The 0.83 threshold and the `isTemplatedAutoLog` exclusion filter were both
+calibrated on small, hand-built sets (26 pairs; 32 real corpus candidates).
+This test throws real scale at the same question: a balanced 5,000-pair
+sample (2,500 duplicate / 2,500 distinct) from Quora Question Pairs (QQP,
+`nyu-mll/glue`'s `qqp` config on Hugging Face - public parquet, no Kaggle
+login; Quora's own license note is "subject to Quora's Terms of Service,
+allowing for non-commercial use", which this local, non-redistributed
+benchmark satisfies), run through the exact production pipeline
+(`__internals.embed`, bge-m3) against a scratch DB (`qqp-consolidate-bench`,
+schema mirrors `deploy/init/01-init.sh`, dropped after use, never
+`agent-memory-bench-*` or the real DB). `bench/qqp-prepare.py` (one-off,
+needs `duckdb` in a throwaway Python venv - not a project dependency) turns
+the parquet into `bench/data/qqp-sample.ndjson` (gitignored, regenerate
+rather than commit).
+
+Calibration table (same shape as the 26-pair table above):
+
+| category  | min   | max   | mean  | n    |
+| --------- | ----- | ----- | ----- | ---- |
+| duplicate | 0.629 | 1.000 | 0.899 | 2500 |
+| distinct  | 0.160 | 0.999 | 0.663 | 2500 |
+
+Unlike the 26-pair set (distinct max 0.760, duplicate min 0.784 - a real
+gap), QQP's ranges overlap almost completely. Full threshold sweep:
+
+| threshold | precision | recall | FPR   |
+| --------- | --------- | ------ | ----- |
+| 0.70      | 0.676     | 0.988  | 0.474 |
+| 0.75      | 0.722     | 0.959  | 0.370 |
+| 0.80      | 0.766     | 0.880  | 0.268 |
+| **0.83**  | **0.804** | **0.822** | **0.200** |
+| 0.86      | 0.837     | 0.726  | 0.142 |
+| 0.90      | 0.892     | 0.553  | 0.067 |
+| 0.93      | 0.916     | 0.401  | 0.037 |
+| 0.95      | 0.942     | 0.301  | 0.018 |
+| 0.97      | 0.961     | 0.189  | 0.008 |
+| 0.99      | 0.978     | 0.072  | 0.002 |
+
+Readings:
+
+1. **0.83 does not sit in a safe margin at QQP's scale** - 20% of genuinely
+   distinct pairs are flagged (vs 0/10 on the 26-pair set). The curve has no
+   knee: FPR falls off smoothly all the way to 0.99, where it finally
+   reaches the 26-pair set's near-zero level, but at the cost of recall
+   collapsing to 0.072. Every threshold in between is a smooth trade, not a
+   stable region - the 26-pair set's clean separation does not reproduce at
+   real scale.
+2. **Manual inspection of the false positives splits into two causes, not
+   one.** Sampling the highest-cosine "distinct" pairs (0.98-0.999) shows
+   QQP label noise, not embedding error - e.g. "How do I get rid of
+   stuttering?" / "How can I get rid of stuttering?" is labeled
+   not-duplicate at cosine 0.999. This is a documented property of QQP
+   (crowdsourced labels, acknowledged annotator subjectivity), not a defect
+   in the pipeline being tested. Sampling pairs right at 0.83-0.85 shows the
+   *other* failure mode instead - genuinely different questions that merely
+   share topic and phrasing ("What are some ways to calculate moles?" /
+   "How do you calculate the moles of acid?", "What does hematology test
+   for?" / "What is hematology?") - the same "distinct-but-related" case the
+   26-pair set already worried about, just at a false-positive rate the
+   26-pair set was too small to reveal.
+3. **A scoping caveat, not a rebuttal**: QQP pairs are all
+   Quora-style questions ("How do I...", "What is...") on a handful of
+   recurring topics (health, relationships, careers, tech), so shared
+   question phrasing alone likely inflates cosine similarity between
+   unrelated QQP pairs in a way that may not transfer to ocpg's real corpus,
+   where distinct memories are typically about unrelated subjects entirely,
+   not the same subject phrased as a question two different ways. QQP is
+   still the more honest stress test of "does the embedding model conflate
+   near-paraphrase with true duplication" - it just does not prove the
+   corpus-level false-merge rate would be 20% in production.
+4. **Exclusion filter negative control passes cleanly**: `isTemplatedAutoLog`
+   fired on 0/10,000 QQP rows. It stays narrowly targeted at ocpg's own
+   auto-generated content shapes and does not accidentally suppress
+   ordinary natural-language duplicate detection.
+
+Decision (per the spec, this is a recommendation, not a threshold change):
+0.83 is real production experience validated against 26 pairs and a live
+corpus audit, both showing zero false merges on the failure mode that
+matters; QQP shows that guarantee does not extend to arbitrary natural
+language at scale, with the caveat in reading 3 that QQP's own genre may
+overstate the real-corpus risk. Any change to `CONSOLIDATE_EMBED_THRESHOLD`
+is an explicit follow-up, not part of this result.
+
 ## Cross-session recall signal (2026-09-20, `bun bench/cross-session.ts`, 485/4970/49980-row bench DBs)
 
 Spec: replace the dormant `access_count` (bumped on every recall, unused by

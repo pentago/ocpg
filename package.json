@@ -1,6 +1,6 @@
 {
   "name": "@dzhi/ocpg",
-  "version": "0.27.0",
+  "version": "0.30.0",
   "type": "module",
   "description": "Postgres-backed persistent memory plugin for OpenCode",
   "main": "ocpg.ts",
@@ -17,6 +17,8 @@
     "bench:rrf-weights": "bun bench/rrf-weights.ts",
     "bench:rrf-slots": "bun bench/rrf-slots.ts",
     "bench:cross-session": "bun bench/cross-session.ts",
+    "bench:qqp-consolidate": "bun bench/qqp-consolidate.ts",
+    "bench:ocpg-shaped-consolidate": "bun bench/ocpg-shaped-consolidate.ts",
     "backfill": "bun deploy/backfill.ts"
   },
   "exports": {

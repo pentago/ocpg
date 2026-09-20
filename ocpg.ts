@@ -292,6 +292,14 @@ function formatBlock(rows: InjectionRow[], projectDir: string): string {
   if (rows.length === 0) return "";
   const lines: string[] = [
     "<persistent-project-memory>",
+    // Framing goes BEFORE the rows, not after: it must be read as "this is
+    // what you already know" before the model sees the list, not skimmed as
+    // a footnote once attention has moved on to the rows themselves.
+    "This is your memory of this project across sessions. You have no other",
+    "access to it - anything not recorded here or retrievable via memory_recall",
+    "did not survive. Treat these as established facts you already know, not",
+    "suggestions.",
+    "",
     `Project: ${projectDir}`,
     "Memories:",
   ];
@@ -304,8 +312,23 @@ function formatBlock(rows: InjectionRow[], projectDir: string): string {
     lines.push(`- [${row.date}] (${origin})${tagStr} ${sanitizeMemory(truncateMemory(row.content))}`);
   }
   lines.push("");
+  // Concrete, observable triggers replace "non-trivial work": a threshold the
+  // model evaluates in its own favor always resolves toward skipping, so each
+  // bullet names an event instead of asking for a judgment call. The "lost
+  // permanently" framing states the cost of skipping, which the old trailing
+  // line never did.
   lines.push(
-    "Before non-trivial work, check these. After user corrections, architecture decisions, or non-trivial fixes, call memory_remember. Use memory_recall to search past lessons.",
+    "Write to memory when any of these happen - do not defer, the session ends without warning and unwritten context is lost permanently:",
+  );
+  lines.push("- the user corrects you, states a preference, or tells you how they want something done");
+  lines.push("- you discover why something is the way it is (a constraint, a gotcha, a non-obvious reason behind a decision)");
+  lines.push("- you solve something that took more than one attempt");
+  lines.push("- you learn a fact about this environment that isn't visible in the code");
+  lines.push("");
+  // Framed as self-interested efficiency, not rule compliance: finding a past
+  // answer is cheaper than rediscovering it.
+  lines.push(
+    "Search memory (memory_recall) before starting anything you have not done in this session - past attempts, decisions, and fixes are there, and finding them is cheaper than rediscovering them.",
   );
   lines.push("</persistent-project-memory>");
   return lines.join("\n");
@@ -1087,7 +1110,11 @@ const ocpg = Plugin.define({
         // breaks direct invocation without adding value.
         options: { codemode: false },
         description:
-          "Search past memories. The stack_fact type is always searched; this project's project_fact memories are searched by default. Use before non-trivial work to check for relevant lessons, fixes, and decisions.",
+          "Search past memories - your own record of previous sessions, which you otherwise have no access to. " +
+          "Search before starting anything you have not already done in this session: a past attempt, decision, " +
+          "or fix is almost always cheaper to find than to rediscover. Matches on both keywords and meaning, so " +
+          "approximate phrasing works. The stack_fact type is always searched; this project's project_fact " +
+          "memories are searched by default.",
         input: {
           type: "object",
           properties: {
@@ -1122,10 +1149,14 @@ const ocpg = Plugin.define({
         // injected block is skipped entirely for projects with no memories and
         // the user may have no project instructions at all.
         description:
-          "Store a durable memory. stack_fact is shared across all projects; " +
-          "project_fact (the default) is visible only in this project unless recalled with " +
-          "global: true. Use after user corrections (immediately), architecture decisions, " +
-          "non-trivial fixes, environment facts, and stated preferences. " +
+          "Store a durable memory. This is the only way anything you learn survives past " +
+          "this session - unwritten context is lost permanently when the session ends, so " +
+          "write immediately rather than deferring to the end of a task. " +
+          "stack_fact is shared across all projects; project_fact (the default) is visible " +
+          "only in this project unless recalled with global: true. " +
+          "Call this whenever the user corrects you or states a preference, you discover a " +
+          "non-obvious reason or constraint, you solve something that took more than one " +
+          "attempt, or you learn an environment fact not visible in the code. " +
           "Do not store session progress, secrets, or anything the code itself already states. " +
           "Duplicate writes are never rejected - run memory_consolidate afterward to clean up " +
           "near-duplicates if the corpus has accumulated restatements of one fact.",

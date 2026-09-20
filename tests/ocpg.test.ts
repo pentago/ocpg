@@ -93,7 +93,8 @@ describe("DB access layer", () => {
       expect(output1.system.length).toBe(1);
       const block = output1.system[0];
       expect(block).toContain("<persistent-project-memory>");
-      expect(block).toContain("Before non-trivial work, check these. After user corrections, architecture decisions, or non-trivial fixes, call memory_remember. Use memory_recall to search past lessons.");
+      expect(block).toContain("This is your memory of this project across sessions.");
+      expect(block).toContain("Write to memory when any of these happen - do not defer, the session ends without warning and unwritten context is lost permanently:");
 
       // Warm call (cache hit): the cache is keyed by directory, so any later
       // request for the same project reuses this block without a query.

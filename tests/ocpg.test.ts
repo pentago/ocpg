@@ -1749,6 +1749,147 @@ describe("DB access layer", () => {
     });
   });
 
+  describe("consolidate: extractDetails/detailConflicts (regression, no embeddings needed)", () => {
+    // Pure-function regression net for the detail cross-check itself (spec:
+    // "detail cross-check for consolidation's meaning pass", 2026-09-20) - no
+    // DB writes, no Ollama, so this runs unconditionally.
+    test("extracts numbers, paths, and a proper noun, skipping the sentence-initial word", () => {
+      const d = __internals.extractDetails(
+        "Jira tickets reference the config at /etc/systemd/system/api.service, rate limit 100 requests per minute, updated 2026-09-19.",
+      );
+      expect(d.numbers.has("100")).toBe(true);
+      expect(d.numbers.has("2026-09-19")).toBe(true);
+      expect([...d.paths].some((p) => p.startsWith("/etc/systemd/system/"))).toBe(true);
+      // "Jira" is sentence-initial, so it is NOT extracted as a proper noun -
+      // that word position carries no information (every sentence starts
+      // capitalized regardless of content).
+      expect(d.properNouns.has("Jira")).toBe(false);
+    });
+
+    test("a capitalized word mid-sentence is extracted as a proper noun", () => {
+      const d = __internals.extractDetails("The ticket was filed in Jira by the on-call engineer.");
+      expect(d.properNouns.has("Jira")).toBe(true);
+    });
+
+    test("absence of a detail on one side is not a conflict", () => {
+      // Spec's own example: "the API rate limit changed" (no number) must
+      // not block merging with "...is 100/min" just because one side lacks
+      // what the other has.
+      const a = __internals.extractDetails("The API rate limit is 100 requests per minute.");
+      const b = __internals.extractDetails("The API rate limit changed recently.");
+      expect(__internals.detailConflicts(a, b)).toEqual([]);
+    });
+
+    test("differing numbers on both sides is a conflict", () => {
+      const a = __internals.extractDetails("The API rate limit is 100 requests per minute.");
+      const b = __internals.extractDetails("The API rate limit was raised to 500 requests per minute.");
+      const reasons = __internals.detailConflicts(a, b);
+      expect(reasons.some((r) => r.startsWith("numbers differ"))).toBe(true);
+    });
+
+    test("differing paths on both sides is a conflict", () => {
+      const a = __internals.extractDetails("This is a system-level unit at /etc/systemd/system/.");
+      const b = __internals.extractDetails("This is a user-level unit at ~/.config/systemd/user/.");
+      const reasons = __internals.detailConflicts(a, b);
+      expect(reasons.some((r) => r.startsWith("paths differ"))).toBe(true);
+    });
+
+    test("shared/overlapping numbers on both sides is not a conflict", () => {
+      const a = __internals.extractDetails("Postgres 16 runs on port 5432.");
+      const b = __internals.extractDetails("Port 5432 is used by the Postgres 16 instance.");
+      expect(__internals.detailConflicts(a, b)).toEqual([]);
+    });
+
+    test("plain prose with no extractable details on either side never conflicts", () => {
+      const a = __internals.extractDetails("The staging cluster must be drained before any upgrade.");
+      const b = __internals.extractDetails("Before any upgrade the staging cluster must be drained.");
+      expect(__internals.detailConflicts(a, b)).toEqual([]);
+    });
+  });
+
+  describe("consolidate: [meaning-uncertain] bucket (detail cross-check gates the meaning pass)", () => {
+    const untilEmbedded = async (id: number): Promise<boolean> => {
+      for (let i = 0; i < 100; i++) {
+        const [row] = await __internals.sql`SELECT embedding IS NOT NULL AS has FROM memories WHERE id = ${id}` as { has: boolean }[];
+        if (row.has) return true;
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      return false;
+    };
+
+    test.skipIf(!hybridReady)("a rate-limit change (differing number, same shape) is NOT auto-merged - flagged [meaning-uncertain] instead", async () => {
+      // Cosine measured directly against bge-m3 for this exact fixture pair:
+      // ~0.898 (above CONSOLIDATE_EMBED_THRESHOLD 0.83); trigram Jaccard
+      // ~0.63 (below DEDUP_SIMILARITY 0.8) - the wording pass must not catch
+      // it, so any change in behavior here is provably the detail check.
+      const project = "/tmp/ocpg-test-consolidate-uncertain-numbers";
+      const marker = `zzzconsolratelimit${Date.now()}`;
+      try {
+        const first = await __internals.remember(
+          { content: `Fixture ${marker}: the API rate limit is 100 requests per minute.` },
+          { directory: project, sessionID: "un" },
+        );
+        const firstId = Number(first.match(/#(\d+)/)?.[1]);
+        const second = await __internals.remember(
+          { content: `Fixture ${marker}: the API rate limit was raised to 500 requests per minute.` },
+          { directory: project, sessionID: "un" },
+        );
+        const secondId = Number(second.match(/#(\d+)/)?.[1]);
+        expect(await untilEmbedded(firstId)).toBe(true);
+        expect(await untilEmbedded(secondId)).toBe(true);
+
+        const result = await __internals.consolidate();
+        expect(result).toContain("[meaning-uncertain]");
+        expect(result).toContain("numbers differ");
+        expect(result).toContain(marker);
+
+        // Neither row is deleted - a conflicting pair is reported, not merged.
+        const [a] = await __internals.sql`SELECT count(*) AS n FROM memories WHERE id = ${firstId}` as { n: string }[];
+        const [b] = await __internals.sql`SELECT count(*) AS n FROM memories WHERE id = ${secondId}` as { n: string }[];
+        expect(Number(a.n)).toBe(1);
+        expect(Number(b.n)).toBe(1);
+      } finally {
+        await __internals.sql`DELETE FROM memories WHERE project = ${project}`;
+        __internals.invalidateInjection(project);
+      }
+    });
+
+    test.skipIf(!hybridReady)("a system-level vs user-level systemd unit path (differing path, same shape) is NOT auto-merged - flagged [meaning-uncertain] instead", async () => {
+      // Cosine measured directly for this fixture pair: ~0.930; trigram
+      // Jaccard ~0.52 - well below DEDUP_SIMILARITY, so the wording pass
+      // cannot be responsible for either outcome here.
+      const project = "/tmp/ocpg-test-consolidate-uncertain-paths";
+      const marker = `zzzconsolsystemd${Date.now()}`;
+      try {
+        const first = await __internals.remember(
+          { content: `Fixture ${marker}: this systemd unit is installed system-wide at /etc/systemd/system/myapp.service.` },
+          { directory: project, sessionID: "up" },
+        );
+        const firstId = Number(first.match(/#(\d+)/)?.[1]);
+        const second = await __internals.remember(
+          { content: `Fixture ${marker}: this systemd unit is installed per-user at ~/.config/systemd/user/myapp.service.` },
+          { directory: project, sessionID: "up" },
+        );
+        const secondId = Number(second.match(/#(\d+)/)?.[1]);
+        expect(await untilEmbedded(firstId)).toBe(true);
+        expect(await untilEmbedded(secondId)).toBe(true);
+
+        const result = await __internals.consolidate();
+        expect(result).toContain("[meaning-uncertain]");
+        expect(result).toContain("paths differ");
+        expect(result).toContain(marker);
+
+        const [a] = await __internals.sql`SELECT count(*) AS n FROM memories WHERE id = ${firstId}` as { n: string }[];
+        const [b] = await __internals.sql`SELECT count(*) AS n FROM memories WHERE id = ${secondId}` as { n: string }[];
+        expect(Number(a.n)).toBe(1);
+        expect(Number(b.n)).toBe(1);
+      } finally {
+        await __internals.sql`DELETE FROM memories WHERE project = ${project}`;
+        __internals.invalidateInjection(project);
+      }
+    });
+  });
+
   describe("consolidate: isTemplatedAutoLog predicate (regression, no embeddings needed)", () => {
     // Permanent regression net for the exclusion predicate itself: runs the
     // exact SQL fragment consolidate() uses (via __internals.isTemplatedAutoLog),

@@ -967,6 +967,82 @@ function isTemplatedAutoLog(client: SQL) {
   )`;
 }
 
+// A second, independent signal for the meaning pass, on top of embedding
+// similarity: the QQP stress test (bench/qqp-consolidate.ts, 2026-09-20)
+// found no threshold that safely separates "same fact, reworded" from
+// "same sentence shape, different fact" - e.g. a rate limit changing from
+// 100 to 500 requests/minute, or a system-level vs a user-level systemd
+// unit path, both score high on cosine despite differing in exactly the
+// specific detail that matters. This extracts those specific details
+// (numbers, paths, capitalized names) with regexes only - no model call,
+// consistent with the earlier decision to drop the judge model entirely.
+type DetailSet = {
+  numbers: Set<string>;
+  paths: Set<string>;
+  properNouns: Set<string>;
+};
+
+// Deliberately coarse regexes, expected to need tuning against more real
+// content over time - proper-noun extraction especially: a lowercase
+// technical name (e.g. "bge-m3") is not capitalized and so is not caught by
+// this pass; that is an accepted gap, not a bug, for the first version of
+// this check.
+function extractDetails(content: string): DetailSet {
+  const numbers = new Set<string>();
+  for (const m of content.matchAll(/\b\d[\d,.:/-]*\b/g)) {
+    const v = m[0].replace(/[.,:/-]+$/, "");
+    if (v) numbers.add(v);
+  }
+
+  const paths = new Set<string>();
+  for (const m of content.matchAll(/(?:~|\.{1,2})?\/[^\s,;:()]+/g)) {
+    const v = m[0].replace(/[.,;:]+$/, "");
+    if (v.length > 1) paths.add(v);
+  }
+
+  const properNouns = new Set<string>();
+  for (const sentence of content.split(/(?<=[.!?])\s+/)) {
+    const words = sentence.trim().split(/\s+/);
+    // Skip index 0: a capitalized sentence-initial word is not distinctive
+    // (every sentence starts capitalized regardless of content).
+    for (let i = 1; i < words.length; i++) {
+      const w = words[i].replace(/^[^A-Za-z]+|[^A-Za-z0-9-]+$/g, "");
+      if (w.length > 1 && /^[A-Z][a-zA-Z0-9-]*$/.test(w)) properNouns.add(w);
+    }
+  }
+
+  return { numbers, paths, properNouns };
+}
+
+// A category conflicts only when BOTH sides have extracted values AND those
+// values are disjoint - absence on one side is not a conflict (nothing to
+// disagree with), per spec: "the API rate limit changed" (no number) must
+// not be blocked from merging with "...is 100/min" just because one side
+// lacks the detail the other has.
+function categoryConflict(a: Set<string>, b: Set<string>): boolean {
+  if (a.size === 0 || b.size === 0) return false;
+  for (const v of a) if (b.has(v)) return false;
+  return true;
+}
+
+// Returns one human-readable reason per conflicting category (numbers,
+// paths, names), or an empty array when the pair has no conflict -
+// including the common case where neither side has any extractable detail
+// at all, which must never block a merge it has nothing to check.
+function detailConflicts(a: DetailSet, b: DetailSet): string[] {
+  const reasons: string[] = [];
+  if (categoryConflict(a.numbers, b.numbers)) {
+    reasons.push(`numbers differ (${[...a.numbers].join(", ")} vs ${[...b.numbers].join(", ")})`);
+  }
+  if (categoryConflict(a.paths, b.paths)) {
+    reasons.push(`paths differ (${[...a.paths].join(", ")} vs ${[...b.paths].join(", ")})`);
+  }
+  if (categoryConflict(a.properNouns, b.properNouns)) {
+    reasons.push(`names differ (${[...a.properNouns].join(", ")} vs ${[...b.properNouns].join(", ")})`);
+  }
+  return reasons;
+}
+
 // Deterministic consolidation, no model calls inside the plugin: find
 // near-duplicate clusters, keep the newest of each, delete the rest. The
 // deleted texts are returned verbatim so the CALLING agent - itself a model -
@@ -979,7 +1055,11 @@ function isTemplatedAutoLog(client: SQL) {
 // unchanged from the original implementation) and embedding cosine
 // similarity (meaning-level duplicates worded completely differently, the
 // case trigram structurally cannot reach). Each is capped at 25 clusters per
-// run so a wildly-duplicated corpus cannot turn into one huge report.
+// run so a wildly-duplicated corpus cannot turn into one huge report. The
+// meaning pass additionally gates every candidate pair through
+// detailConflicts: a specific number/path/name that differs between an
+// otherwise-similar pair blocks the auto-merge and routes that pair to
+// [meaning-uncertain] in the report instead (see extractDetails' comment).
 async function consolidate(): Promise<string> {
   try {
     // --- Pass 1: wording (trigram similarity over content) ---
@@ -1013,6 +1093,8 @@ async function consolidate(): Promise<string> {
     const wordingGroups = clusters.filter((c) => c.length > 1).slice(0, 25);
 
     let removed = 0;
+    let removedGroups = 0;
+    let uncertainPairs = 0;
     const report: string[] = [];
     for (const cluster of wordingGroups) {
       const survivor = cluster[0].row;
@@ -1021,6 +1103,7 @@ async function consolidate(): Promise<string> {
         await sql`DELETE FROM memories WHERE id = ${r.id}`;
       }
       removed += removedRows.length;
+      removedGroups++;
       // Show what died so the calling agent can merge unique facts back into
       // the survivor.
       report.push(
@@ -1073,26 +1156,61 @@ async function consolidate(): Promise<string> {
 
       for (const cluster of meaningGroups) {
         const survivor = cluster[0];
-        const removedRows = cluster.slice(1);
-        for (const r of removedRows) {
+        const survivorDetails = extractDetails(survivor.content);
+        // Detail cross-check (see extractDetails/detailConflicts): a pair
+        // only auto-merges if, on top of the embedding threshold, no
+        // specific number/path/name conflicts between it and the survivor.
+        // A conflicting member is pulled OUT of the auto-merge on its own -
+        // it does not void the rest of an otherwise-clean cluster.
+        const clean: (typeof cluster)[number][] = [];
+        const uncertain: Array<{ row: (typeof cluster)[number]; reasons: string[] }> = [];
+        for (const row of cluster.slice(1)) {
+          const reasons = detailConflicts(survivorDetails, extractDetails(row.content));
+          if (reasons.length > 0) uncertain.push({ row, reasons });
+          else clean.push(row);
+        }
+
+        for (const r of clean) {
           await sql`DELETE FROM memories WHERE id = ${r.id}`;
         }
-        removed += removedRows.length;
-        report.push(
-          `[meaning] Kept #${survivor.id}: ${truncateMemory(survivor.content)}\n` +
-            removedRows.map((r) => `  removed #${r.id}: ${truncateMemory(r.content)}`).join("\n"),
-        );
+        removed += clean.length;
+        if (clean.length > 0) {
+          removedGroups++;
+          report.push(
+            `[meaning] Kept #${survivor.id}: ${truncateMemory(survivor.content)}\n` +
+              clean.map((r) => `  removed #${r.id}: ${truncateMemory(r.content)}`).join("\n"),
+          );
+        }
+        for (const u of uncertain) {
+          uncertainPairs++;
+          report.push(
+            `[meaning-uncertain] #${survivor.id} vs #${u.row.id} - high similarity but ${u.reasons.join("; ")}; not merged, review manually.\n` +
+              `  #${survivor.id}: ${truncateMemory(survivor.content)}\n` +
+              `  #${u.row.id}: ${truncateMemory(u.row.content)}`,
+          );
+        }
       }
     }
 
     if (report.length === 0) return "No duplicates found; nothing to consolidate.";
 
     if (removed > 0) injectionCache.clear();
-    return (
-      `Removed ${removed} duplicate ${removed === 1 ? "memory" : "memories"} across ${report.length} groups (kept the newest of each; [wording] = matched by trigram similarity, [meaning] = matched by embedding similarity).\n` +
-      `Check the removed texts - if any carries a fact the kept memory lacks, merge it in with memory_update:\n\n` +
-      report.join("\n")
-    );
+    const summary: string[] = [];
+    if (removed > 0) {
+      summary.push(
+        `Removed ${removed} duplicate ${removed === 1 ? "memory" : "memories"} across ${removedGroups} group${removedGroups === 1 ? "" : "s"} ` +
+          `(kept the newest of each; [wording] = matched by trigram similarity, [meaning] = matched by embedding similarity).`,
+      );
+      summary.push("Check the removed texts - if any carries a fact the kept memory lacks, merge it in with memory_update:");
+    }
+    if (uncertainPairs > 0) {
+      summary.push(
+        `${uncertainPairs} similar pair${uncertainPairs === 1 ? "" : "s"} flagged [meaning-uncertain]: high embedding similarity but a specific ` +
+          `number, path, or name differs, so nothing was auto-merged - review each and use memory_update to merge if it's genuinely the same ` +
+          `fact, or leave both if they're distinct.`,
+      );
+    }
+    return `${summary.join("\n")}\n\n${report.join("\n")}`;
   } catch (e: unknown) {
     return toolError("consolidate", "consolidate", e);
   }
@@ -1305,6 +1423,7 @@ const ocpg = Plugin.define({
         description:
           "Remove near-duplicate memories: keeps the newest of each near-duplicate group anywhere in the store and deletes the rest, returning the removed texts. " +
           "Finds duplicates two ways - matching wording (trigram similarity) and matching meaning (embedding similarity, catches the same fact stated in different words). " +
+          "A meaning-level pair whose numbers, paths, or names conflict despite high similarity is flagged as [meaning-uncertain] instead of merged - review it and use memory_update yourself. " +
           "After running it, merge any unique fact from the removed texts into the kept memory via memory_update. Deterministic - run it when the user asks to tidy or consolidate memories.",
         input: {
           type: "object",
@@ -1365,6 +1484,8 @@ const __internals = {
   storeEmbedding,
   CONSOLIDATE_EMBED_THRESHOLD,
   isTemplatedAutoLog,
+  extractDetails,
+  detailConflicts,
   rrfMerge,
   hybridMerge,
   vectorLiteral,

@@ -657,6 +657,47 @@ Reproducible via `bun bench/ocpg-shaped-consolidate.ts` (no external
 dataset - the corpus is generated in-process; needs a reachable Ollama and
 a `CREATEDB`-capable `OCPG_*` user, same as the other consolidate benches).
 
+## Normalize extracted details, formatting-sensitivity fix (2026-09-20, same bench)
+
+Follow-up to the re-test above: it found a bounded, honestly-documented
+gap - `extractDetails()` compared raw strings, so formatting differences
+that don't change meaning (`1,000` vs `1000`, `2.5.0` vs `2.5`, a trailing
+slash, `Jira` vs `JIRA`) were wrongly treated as conflicts. Added a
+normalization step per category (numbers: strip thousands separators,
+compare numerically, and treat a version-shaped prefix match like `2.5` vs
+`2.5.0` as non-conflicting while `2.5` vs `3.0` still conflicts; paths:
+strip trailing slashes, stay case-sensitive; proper nouns: compare
+case-insensitively) applied only to the comparison - reports still show the
+raw value as written. Re-ran the exact same bench:
+
+| fn-stress pair                      | before   | after                    |
+| ------------------------------------ | -------- | ------------------------ |
+| `1,000` vs `1000`                    | blocked  | merged cleanly            |
+| `2.5.0` vs `2.5`                     | blocked  | merged cleanly            |
+| `/var/log/app` vs `/var/log/app/`    | blocked  | merged cleanly            |
+| `Jira` vs `JIRA`                     | blocked  | merged cleanly            |
+| `02:00` vs `2:00 AM` (leading zero)  | merged   | blocked (out of scope - not a number/path/proper-noun formatting rule this spec covers) |
+
+Full-bench metrics (candidates at threshold 0.83, 479 total):
+
+| metric                                | before | after |
+| -------------------------------------- | ------ | ----- |
+| true duplicates blocked (of 316 TP)    | 5      | 1     |
+| FPR (of what's auto-merged)            | 0.005  | 0.005 |
+| `update-*` catch rate (rate-limit, systemd path, config-location) | 100% (0 clean merges) | 100% (0 clean merges), unchanged |
+
+FPR held exactly at 0.005 (normalization didn't reopen any false
+positive - a real version change like `2.5` vs `3.0` still conflicts, both
+`update-config-location` and `update-env-values-file`/`update-rate-limit`/
+`update-system-vs-user-unit` stayed at 0/40 clean merges), and the
+true-duplicates-blocked cost dropped from 5/316 to 1/316 - the only
+remaining block is the leading-zero time case, which is a real gap but
+outside this fix's scope (times aren't one of the three normalized
+categories). Reproducible via the same `bun bench/ocpg-shaped-consolidate.ts`
+command; the regression suite also gained a permanent
+`extractDetails`/`detailConflicts` unit test for the version-prefix
+judgment call (`tests/ocpg.test.ts`, no DB/Ollama needed).
+
 ## Cross-session recall signal (2026-09-20, `bun bench/cross-session.ts`, 485/4970/49980-row bench DBs)
 
 Spec: replace the dormant `access_count` (bumped on every recall, unused by

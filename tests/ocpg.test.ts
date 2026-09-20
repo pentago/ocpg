@@ -1805,6 +1805,43 @@ describe("DB access layer", () => {
       const b = __internals.extractDetails("Before any upgrade the staging cluster must be drained.");
       expect(__internals.detailConflicts(a, b)).toEqual([]);
     });
+
+    // Formatting-sensitivity fix (spec: "normalize extracted details",
+    // 2026-09-20) - these differ only in formatting, not in meaning, and
+    // must not land in [meaning-uncertain].
+    test("a thousands separator is not a conflict (1,000 vs 1000)", () => {
+      const a = __internals.extractDetails("The API rate limit is 1,000 requests per minute.");
+      const b = __internals.extractDetails("The API rate limit is 1000 requests per minute.");
+      expect(__internals.detailConflicts(a, b)).toEqual([]);
+    });
+
+    test("a trailing slash is not a conflict", () => {
+      const a = __internals.extractDetails("Application logs are shipped to /var/log/app.");
+      const b = __internals.extractDetails("Application logs land in /var/log/app/.");
+      expect(__internals.detailConflicts(a, b)).toEqual([]);
+    });
+
+    test("proper noun casing is not a conflict (Jira vs JIRA)", () => {
+      const a = __internals.extractDetails("Reach out to Jira for ticket status.");
+      const b = __internals.extractDetails("Reach out to JIRA for ticket status.");
+      expect(__internals.detailConflicts(a, b)).toEqual([]);
+    });
+
+    // The one normalization rule here that's a judgment call, not a pure
+    // mechanical fix: a version prefix ("2.5" vs "2.5.0") is imprecision,
+    // not a conflict, but a real version change ("2.5" vs "3.0") must still
+    // conflict - this pair is the most likely place a future edit could
+    // silently break that distinction.
+    test("a version prefix is not a conflict, but a real version change still is", () => {
+      const a = __internals.extractDetails("The release version is 2.5.0.");
+      const b = __internals.extractDetails("The release is now at version 2.5.");
+      expect(__internals.detailConflicts(a, b)).toEqual([]);
+
+      const c = __internals.extractDetails("The release version is 2.5.");
+      const d = __internals.extractDetails("The release version is 3.0.");
+      const reasons = __internals.detailConflicts(c, d);
+      expect(reasons.some((r) => r.startsWith("numbers differ"))).toBe(true);
+    });
   });
 
   describe("consolidate: [meaning-uncertain] bucket (detail cross-check gates the meaning pass)", () => {

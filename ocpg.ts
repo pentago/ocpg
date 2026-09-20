@@ -1018,26 +1018,72 @@ function extractDetails(content: string): DetailSet {
 // values are disjoint - absence on one side is not a conflict (nothing to
 // disagree with), per spec: "the API rate limit changed" (no number) must
 // not be blocked from merging with "...is 100/min" just because one side
-// lacks the detail the other has.
-function categoryConflict(a: Set<string>, b: Set<string>): boolean {
+// lacks the detail the other has. "Disjoint" is judged by `equivalent`
+// rather than raw string equality, so formatting differences that don't
+// change meaning (see the three `*Equivalent` functions below) don't count
+// as a real conflict.
+function categoryConflict(a: Set<string>, b: Set<string>, equivalent: (x: string, y: string) => boolean): boolean {
   if (a.size === 0 || b.size === 0) return false;
-  for (const v of a) if (b.has(v)) return false;
+  for (const x of a) for (const y of b) if (equivalent(x, y)) return false;
   return true;
+}
+
+// Real notes format the same number differently ("1,000" vs "1000") without
+// meaning anything different, so strip thousands separators and compare
+// numerically when both sides parse as plain numbers. Version-shaped values
+// (2+ dot-separated digit groups, e.g. "2.5.0") get a separate rule: one
+// side being a strict prefix of the other ("2.5" vs "2.5.0") is treated as
+// imprecision, not a conflict - but "2.5" vs "3.0" still conflicts, since
+// that is a real version change, the exact thing this check exists to catch.
+const PLAIN_NUMBER = /^\d+(\.\d+)?$/;
+const VERSION_SHAPED = /^\d+(\.\d+)+$/;
+
+function isVersionPrefix(x: string, y: string): boolean {
+  const xs = x.split(".");
+  const ys = y.split(".");
+  if (xs.length >= ys.length) return false;
+  return xs.every((seg, i) => seg === ys[i]);
+}
+
+function numbersEquivalent(x: string, y: string): boolean {
+  if (x === y) return true;
+  const nx = x.replace(/,/g, "");
+  const ny = y.replace(/,/g, "");
+  if (nx === ny) return true;
+  if (PLAIN_NUMBER.test(nx) && PLAIN_NUMBER.test(ny)) return Number(nx) === Number(ny);
+  if (VERSION_SHAPED.test(nx) && VERSION_SHAPED.test(ny)) return isVersionPrefix(nx, ny) || isVersionPrefix(ny, nx);
+  return false;
+}
+
+// A trailing slash doesn't change what path is meant ("/var/log/app" vs
+// "/var/log/app/"); case stays significant, since ocpg's actual content
+// describes real (case-sensitive Linux) filesystem paths.
+function pathsEquivalent(x: string, y: string): boolean {
+  const strip = (v: string) => (v.length > 1 ? v.replace(/\/+$/, "") || v : v);
+  return strip(x) === strip(y);
+}
+
+// Proper nouns conflict on identity, not on how they happen to be cased
+// ("Jira" vs "JIRA" is the same product name).
+function properNounsEquivalent(x: string, y: string): boolean {
+  return x.toLowerCase() === y.toLowerCase();
 }
 
 // Returns one human-readable reason per conflicting category (numbers,
 // paths, names), or an empty array when the pair has no conflict -
 // including the common case where neither side has any extractable detail
-// at all, which must never block a merge it has nothing to check.
+// at all, which must never block a merge it has nothing to check. Reasons
+// always quote the raw extracted values, never the normalized form used
+// internally for comparison, so a report stays readable.
 function detailConflicts(a: DetailSet, b: DetailSet): string[] {
   const reasons: string[] = [];
-  if (categoryConflict(a.numbers, b.numbers)) {
+  if (categoryConflict(a.numbers, b.numbers, numbersEquivalent)) {
     reasons.push(`numbers differ (${[...a.numbers].join(", ")} vs ${[...b.numbers].join(", ")})`);
   }
-  if (categoryConflict(a.paths, b.paths)) {
+  if (categoryConflict(a.paths, b.paths, pathsEquivalent)) {
     reasons.push(`paths differ (${[...a.paths].join(", ")} vs ${[...b.paths].join(", ")})`);
   }
-  if (categoryConflict(a.properNouns, b.properNouns)) {
+  if (categoryConflict(a.properNouns, b.properNouns, properNounsEquivalent)) {
     reasons.push(`names differ (${[...a.properNouns].join(", ")} vs ${[...b.properNouns].join(", ")})`);
   }
   return reasons;

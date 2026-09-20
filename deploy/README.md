@@ -63,6 +63,18 @@ CREATE INDEX IF NOT EXISTS idx_memories_trgm ON memories USING gin (content gin_
 CREATE EXTENSION IF NOT EXISTS vector;
 ALTER TABLE memories ADD COLUMN IF NOT EXISTS embedding vector(1024);
 CREATE INDEX IF NOT EXISTS idx_memories_embedding ON memories USING hnsw (embedding vector_cosine_ops);
+
+-- Cross-session recall signal: which SESSIONS have independently recalled a
+-- memory, not how many times (that's access_count, unused by ranking - see
+-- ocpg.ts's crossSessionBoost comment). The PRIMARY KEY makes repeated
+-- recalls within one session count once, which is what makes this safe to
+-- use as a small ranking tiebreak.
+CREATE TABLE IF NOT EXISTS memory_recalls (
+  memory_id  integer NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+  session_id text NOT NULL,
+  recalled_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (memory_id, session_id)
+);
 ```
 
 Every statement is idempotent - re-running the block is a no-op.

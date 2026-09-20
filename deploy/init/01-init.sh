@@ -40,6 +40,17 @@ psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" <<-'EOSQL'
 	-- self-join (content % content). Without it the join is O(n^2) similarity
 	-- scans - fine for hundreds of rows, slow for tens of thousands.
 	CREATE INDEX idx_memories_trgm ON memories USING gin (content gin_trgm_ops);
+
+	-- Cross-session recall signal: which sessions have independently recalled
+	-- a memory (not "how many times", which is access_count - see ocpg.ts's
+	-- crossSessionBoost comment for why that distinction matters). The
+	-- PRIMARY KEY makes repeated recalls within one session count once.
+	CREATE TABLE memory_recalls (
+	  memory_id  integer NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+	  session_id text NOT NULL,
+	  recalled_at timestamptz NOT NULL DEFAULT now(),
+	  PRIMARY KEY (memory_id, session_id)
+	);
 EOSQL
 
 echo "ocpg: created table memories in database $POSTGRES_DB"

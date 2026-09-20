@@ -93,7 +93,8 @@ describe("DB access layer", () => {
       expect(output1.system.length).toBe(1);
       const block = output1.system[0];
       expect(block).toContain("<persistent-project-memory>");
-      expect(block).toContain("Before non-trivial work, check these. After user corrections, architecture decisions, or non-trivial fixes, call memory_remember. Use memory_recall to search past lessons.");
+      expect(block).toContain("This is your memory of this project across sessions.");
+      expect(block).toContain("Write to memory when any of these happen - do not defer, the session ends without warning and unwritten context is lost permanently:");
 
       // Warm call (cache hit): the cache is keyed by directory, so any later
       // request for the same project reuses this block without a query.
@@ -765,6 +766,96 @@ describe("DB access layer", () => {
         expect(newerIdx).toBeGreaterThan(-1);
         expect(olderIdx).toBeGreaterThan(-1);
         expect(newerIdx).toBeLessThan(olderIdx);
+      } finally {
+        await __internals.sql`DELETE FROM memories WHERE project = ${ctx.directory}`;
+      }
+    });
+  });
+
+  describe("cross-session recall signal (fixing dormant access_count)", () => {
+    const ctx = { directory: "/tmp/ocpg-test-xsession", sessionID: "xsess-a" };
+
+    test("recall records the calling session in memory_recalls, idempotent within a session", async () => {
+      const marker = `zzzxsess${Date.now()}`;
+      try {
+        const stored = await __internals.remember({ content: `Cross-session probe ${marker} for recall recording.` }, ctx);
+        const id = Number(stored.match(/#(\d+)/)?.[1]);
+        await __internals.recall({ query: marker }, ctx);
+        await __internals.recall({ query: marker }, ctx);
+        await __internals.recall({ query: marker }, ctx);
+        // Fire-and-forget: give the abandoned INSERT a beat to land.
+        await new Promise((r) => setTimeout(r, 50));
+        const rows = await __internals.sql`
+          SELECT session_id FROM memory_recalls WHERE memory_id = ${id}
+        ` as { session_id: string }[];
+        // Three recalls from the SAME session must collapse to one row - the
+        // PRIMARY KEY on (memory_id, session_id) is what makes repeat
+        // exposure within a session not compound, unlike access_count.
+        expect(rows.length).toBe(1);
+        expect(rows[0].session_id).toBe(ctx.sessionID);
+      } finally {
+        await __internals.sql`DELETE FROM memories WHERE project = ${ctx.directory}`;
+      }
+    });
+
+    test("distinct sessions each add evidence; the same session never does", async () => {
+      const marker = `zzzxsessdistinct${Date.now()}`;
+      try {
+        const stored = await __internals.remember({ content: `Cross-session distinct probe ${marker}.` }, ctx);
+        const id = Number(stored.match(/#(\d+)/)?.[1]);
+        await __internals.recall({ query: marker }, { directory: ctx.directory, sessionID: "xsess-b" });
+        await __internals.recall({ query: marker }, { directory: ctx.directory, sessionID: "xsess-b" });
+        await __internals.recall({ query: marker }, { directory: ctx.directory, sessionID: "xsess-c" });
+        await new Promise((r) => setTimeout(r, 50));
+        const [row] = await __internals.sql`
+          SELECT count(DISTINCT session_id)::int AS n FROM memory_recalls WHERE memory_id = ${id}
+        ` as { n: number }[];
+        expect(row.n).toBe(2);
+      } finally {
+        await __internals.sql`DELETE FROM memories WHERE project = ${ctx.directory}`;
+      }
+    });
+
+    test("recall without a sessionID (__internals callers) skips the record, never throws", async () => {
+      const marker = `zzzxsessnosession${Date.now()}`;
+      try {
+        const stored = await __internals.remember({ content: `No-session probe ${marker}.` }, ctx);
+        const id = Number(stored.match(/#(\d+)/)?.[1]);
+        const result = await __internals.recall({ query: marker }, { directory: ctx.directory });
+        expect(result).toContain(marker);
+        await new Promise((r) => setTimeout(r, 50));
+        const rows = await __internals.sql`SELECT 1 FROM memory_recalls WHERE memory_id = ${id}`;
+        expect(rows.length).toBe(0);
+      } finally {
+        await __internals.sql`DELETE FROM memories WHERE project = ${ctx.directory}`;
+      }
+    });
+
+    test("the tiebreak breaks a near-tie without overriding relevance", async () => {
+      const marker = `zzzxsessrank${Date.now()}`;
+      try {
+        // Two rows tie on relevance (same single matching term, same
+        // project); a real relevance gap must still win regardless of the
+        // tiebreak, so this row also carries a second, rarer matching term.
+        const strongerStored = await __internals.remember(
+          { content: `${marker} appears here twice: ${marker} makes this the stronger relevance match.` },
+          ctx,
+        );
+        const strongerId = Number(strongerStored.match(/#(\d+)/)?.[1]);
+        const weakerStored = await __internals.remember({ content: `${marker} appears here only once, a weaker match.` }, ctx);
+        const weakerId = Number(weakerStored.match(/#(\d+)/)?.[1]);
+
+        // Recall the weaker row from five distinct sessions - the maximum
+        // the cap credits - then confirm the stronger, un-recalled row still
+        // ranks first: the tiebreak must never outrank real relevance.
+        for (let s = 0; s < 5; s++) {
+          await __internals.sql`
+            INSERT INTO memory_recalls (memory_id, session_id) VALUES (${weakerId}, ${`xsess-rank-${s}`})
+            ON CONFLICT DO NOTHING
+          `;
+        }
+        const result = await __internals.recall({ query: marker, limit: 5 }, ctx);
+        expect(result.indexOf(`#${strongerId}`)).toBeLessThan(result.indexOf(`#${weakerId}`));
       } finally {
         await __internals.sql`DELETE FROM memories WHERE project = ${ctx.directory}`;
       }

@@ -396,3 +396,56 @@ parallel sentences) are NOT templated and were confirmed unfixable by
 threshold alone: excluding them by raising the threshold past 0.84 would
 also have excluded 3 of the corpus's confirmed-correct merges (0.83-0.87
 range). Accepted as a residual, reviewable (not silent) false-merge rate.
+
+## Cross-session recall signal (2026-09-20, `bun bench/cross-session.ts`, 485/4970/49980-row bench DBs)
+
+Spec: replace the dormant `access_count` (bumped on every recall, unused by
+ranking since a prior rich-get-richer revert) with a new `memory_recalls`
+table keyed `(memory_id, session_id)` - `COUNT(DISTINCT session_id)` is the
+signal, not raw exposure, because the PRIMARY KEY makes repeat recalls
+within one session count once. Proposed ORDER BY addition:
+`LEAST(cross_session_count, 5) * 0.002` (capped, weighted well below the
+existing same-project boost of 0.01).
+
+Benched against `buildRelevanceQuery`'s existing query mix, with a simulated
+reuse history (15% of each topic's memories recalled from 2-5 distinct fake
+sessions, the rest cold - the same starting point every real memory has
+today):
+
+| dataset | metric | baseline | + xsess tiebreak |
+| ------- | ------ | -------- | ----------------- |
+| 485 rows (n=346) | recall / mrr / prec | .318 / .334 / .293 | .318 / **.336** / .293 |
+| 4970 rows (n=357) | recall / mrr / prec | .396 / .399 / .396 | .396 / **.401** / .396 |
+| 49980 rows (n=372) | recall / mrr / prec | .376 / .376 / .376 | .376 / **.379** / .376 |
+
+Recall and precision are unchanged at all three sizes (identical to 3
+decimals); MRR improves slightly and consistently (+0.002 to +0.003) - the
+tiebreak nudges genuinely-reused memories very slightly higher without
+touching which rows qualify or displacing anything, exactly the "small
+tiebreak, not a ranking replacement" role the spec asked for.
+
+The failure this replaces `access_count` because of: spam-recalling one
+memory 50x from a SINGLE session must not move its rank, only genuinely
+distinct sessions may. Verified directly (not just argued) at all three
+sizes - a virgin, mid-ranked row's first recall (a real 0->1 signal) is
+allowed to move its rank; 49 additional recalls from that SAME session then
+leave both `cross_session_count` and rank exactly where the first recall put
+them, while 5 more recalls from genuinely distinct sessions move it further
+(bounded by the cap):
+
+```
+memory #289 (485 rows):  virgin rank 3 -> first recall rank 0 -> 49 more same-session recalls: rank 0 (unchanged)
+                         -> 5 distinct-session recalls: rank 0 (already best, cap has no further room to show)
+memory #236 (4970 rows): virgin rank 1 -> first recall rank 1 -> 49 more same-session recalls: rank 1 (unchanged)
+                         -> 5 distinct-session recalls: rank 0
+memory #30 (49980 rows): virgin rank 6 -> first recall rank 4 -> 49 more same-session recalls: rank 4 (unchanged)
+                         -> 5 distinct-session recalls: rank 0
+```
+
+Shipped: `crossSessionJoin`/`crossSessionBoost` in `ocpg.ts`, added to
+`buildRelevanceQuery`'s ORDER BY and `recall()`'s directed-query ORDER BY;
+the `memory_recalls` table is a new additive migration
+(`deploy/init/01-init.sh`, `deploy/README.md`'s upgrade block,
+`bench/generate.ts`'s DDL). `access_count`/`last_accessed_at` are untouched -
+still bumped on every recall, still unused by ranking, kept only as data
+that might back a future "never recalled" cleanup signal.

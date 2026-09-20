@@ -45,6 +45,16 @@ CREATE TABLE memories (
 CREATE INDEX idx_memories_search ON memories USING gin (search_vector);
 CREATE INDEX idx_memories_tags   ON memories USING gin (tags);
 CREATE INDEX idx_memories_project_created ON memories (project, created_at DESC);
+
+-- Cross-session recall signal (bench/cross-session.ts): COUNT(DISTINCT
+-- session_id) is the ranking tiebreak, never raw access_count. Empty in a
+-- freshly generated dataset - simulated by cross-session.ts, not here.
+CREATE TABLE memory_recalls (
+  memory_id  integer NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+  session_id text NOT NULL,
+  recalled_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (memory_id, session_id)
+);
 `;
 
 // admin = the connection that creates/drops databases.

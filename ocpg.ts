@@ -292,6 +292,14 @@ function formatBlock(rows: InjectionRow[], projectDir: string): string {
   if (rows.length === 0) return "";
   const lines: string[] = [
     "<persistent-project-memory>",
+    // Framing goes BEFORE the rows, not after: it must be read as "this is
+    // what you already know" before the model sees the list, not skimmed as
+    // a footnote once attention has moved on to the rows themselves.
+    "This is your memory of this project across sessions. You have no other",
+    "access to it - anything not recorded here or retrievable via memory_recall",
+    "did not survive. Treat these as established facts you already know, not",
+    "suggestions.",
+    "",
     `Project: ${projectDir}`,
     "Memories:",
   ];
@@ -304,8 +312,23 @@ function formatBlock(rows: InjectionRow[], projectDir: string): string {
     lines.push(`- [${row.date}] (${origin})${tagStr} ${sanitizeMemory(truncateMemory(row.content))}`);
   }
   lines.push("");
+  // Concrete, observable triggers replace "non-trivial work": a threshold the
+  // model evaluates in its own favor always resolves toward skipping, so each
+  // bullet names an event instead of asking for a judgment call. The "lost
+  // permanently" framing states the cost of skipping, which the old trailing
+  // line never did.
   lines.push(
-    "Before non-trivial work, check these. After user corrections, architecture decisions, or non-trivial fixes, call memory_remember. Use memory_recall to search past lessons.",
+    "Write to memory when any of these happen - do not defer, the session ends without warning and unwritten context is lost permanently:",
+  );
+  lines.push("- the user corrects you, states a preference, or tells you how they want something done");
+  lines.push("- you discover why something is the way it is (a constraint, a gotcha, a non-obvious reason behind a decision)");
+  lines.push("- you solve something that took more than one attempt");
+  lines.push("- you learn a fact about this environment that isn't visible in the code");
+  lines.push("");
+  // Framed as self-interested efficiency, not rule compliance: finding a past
+  // answer is cheaper than rediscovering it.
+  lines.push(
+    "Search memory (memory_recall) before starting anything you have not done in this session - past attempts, decisions, and fixes are there, and finding them is cheaper than rediscovering them.",
   );
   lines.push("</persistent-project-memory>");
   return lines.join("\n");
@@ -374,19 +397,46 @@ function buildRecencyQuery(client: SQL, directory: string) {
   `;
 }
 
+// Cross-session recall tiebreak (spec: cross-session-recall-signal.md):
+// COUNT(DISTINCT session_id) from memory_recalls, capped and weighted well
+// below the same-project boost (0.01) so it only breaks near-ties, never
+// overrides relevance. Deliberately NOT access_count - that column is bumped
+// on every recall regardless of session, which is exactly the rich-get-richer
+// signal a prior attempt reverted (see recall()'s comment). The PRIMARY KEY on
+// (memory_id, session_id) in memory_recalls makes repeated recalls from ONE
+// session count once, so this only grows from genuinely separate sessions
+// reaching for the same memory - slow to accumulate by design, which is what
+// makes it safe to rank on.
+function crossSessionJoin(client: SQL) {
+  return client`
+    LEFT JOIN (
+      SELECT memory_id, count(DISTINCT session_id) AS xsess
+      FROM memory_recalls
+      GROUP BY memory_id
+    ) recalls ON recalls.memory_id = memories.id
+  `;
+}
+
+function crossSessionBoost(client: SQL) {
+  return client`LEAST(coalesce(recalls.xsess, 0), 5) * 0.002`;
+}
+
 function buildRelevanceQuery(client: SQL, tsQuery: string, directory: string) {
   // Relevance: full-text search over every visible memory - global types
   // from anywhere, project_fact from the origin project - with a small
-  // same-project boost to break rank ties toward locally stored memories.
+  // same-project boost to break rank ties toward locally stored memories,
+  // plus the smaller cross-session tiebreak above.
   return client`
     SELECT content, coalesce(tags, '{}') AS tags,
            to_char(created_at, 'YYYY-MM-DD') AS date,
            project
     FROM memories
+    ${crossSessionJoin(client)}
     WHERE search_vector @@ to_tsquery('english', ${tsQuery})
       AND ${visibleRows(client, directory)}
     ORDER BY ts_rank(search_vector, to_tsquery('english', ${tsQuery}))
-             + (CASE WHEN project = ${directory} THEN 0.01 ELSE 0 END) DESC,
+             + (CASE WHEN project = ${directory} THEN 0.01 ELSE 0 END)
+             + ${crossSessionBoost(client)} DESC,
              created_at DESC
     LIMIT 20
   `;
@@ -552,7 +602,7 @@ function toolError(kind: string, action: string, e: unknown): string {
 
 async function recall(
   args: RecallArgs,
-  ctx: { directory: string },
+  ctx: { directory: string; sessionID?: string },
 ): Promise<string> {
   try {
     const limit = resolveLimit(args.limit);
@@ -575,9 +625,12 @@ async function recall(
     // (matching the injection fallback). A frequency blend was tried and
     // removed: bumping exactly the returned top-5 is a rich-get-richer loop -
     // live corpus rows pinned the top slot after a few runs. access_count
-    // stays as data collection; no ranking consumes it.
+    // stays as data collection; no ranking consumes it. The cross-session
+    // tiebreak is different in kind (see crossSessionBoost's comment): it
+    // only grows from distinct sessions independently reaching for a memory,
+    // not from raw exposure, which is what makes it safe to rank on.
     const orderBy = q
-      ? sql`ORDER BY ts_rank(search_vector, to_tsquery('english', ${tsQuery})) DESC`
+      ? sql`ORDER BY ts_rank(search_vector, to_tsquery('english', ${tsQuery})) + ${crossSessionBoost(sql)} DESC`
       : sql`ORDER BY created_at DESC`;
 
     // Hybrid: with a searchable query, embed it concurrently so a warm bge-m3
@@ -592,6 +645,7 @@ async function recall(
              to_char(created_at, 'YYYY-MM-DD') AS date,
              project, memory_type
       FROM memories
+      ${crossSessionJoin(sql)}
       WHERE 1=1 ${visibleCond} ${queryCond} ${tagCond}
       ${orderBy}
       LIMIT ${q ? EMBED_CANDIDATES : limit}
@@ -630,6 +684,19 @@ async function recall(
       void sql`UPDATE memories SET access_count = access_count + 1, last_accessed_at = now() WHERE id = ANY(${sql.array(ids, "int8")})`.catch(
         (e: unknown) => logError("access", `ocpg access bump failed: ${e instanceof Error ? e.message : String(e)}`),
       );
+    }
+    // Cross-session recall signal: records which session reached for each
+    // returned memory. The PRIMARY KEY on (memory_id, session_id) makes this
+    // naturally idempotent - repeated recalls within one session count once,
+    // so only genuinely distinct sessions grow crossSessionBoost's count.
+    // Skipped without a sessionID (only __internals callers omit it); never
+    // allowed to block or fail the recall itself.
+    if (ids.length > 0 && ctx.sessionID) {
+      void sql`
+        INSERT INTO memory_recalls (memory_id, session_id)
+        SELECT unnest(${sql.array(ids, "int8")}), ${ctx.sessionID}
+        ON CONFLICT (memory_id, session_id) DO NOTHING
+      `.catch((e: unknown) => logError("xsess", `ocpg cross-session record failed: ${e instanceof Error ? e.message : String(e)}`));
     }
 
     if (rows.length === 0) return "No memories found.";
@@ -1087,7 +1154,11 @@ const ocpg = Plugin.define({
         // breaks direct invocation without adding value.
         options: { codemode: false },
         description:
-          "Search past memories. The stack_fact type is always searched; this project's project_fact memories are searched by default. Use before non-trivial work to check for relevant lessons, fixes, and decisions.",
+          "Search past memories - your own record of previous sessions, which you otherwise have no access to. " +
+          "Search before starting anything you have not already done in this session: a past attempt, decision, " +
+          "or fix is almost always cheaper to find than to rediscover. Matches on both keywords and meaning, so " +
+          "approximate phrasing works. The stack_fact type is always searched; this project's project_fact " +
+          "memories are searched by default.",
         input: {
           type: "object",
           properties: {
@@ -1110,8 +1181,8 @@ const ocpg = Plugin.define({
           },
           additionalProperties: false,
         },
-        execute: async (input) => {
-          return { content: await recall(input as RecallArgs, { directory }) };
+        execute: async (input, tool) => {
+          return { content: await recall(input as RecallArgs, { directory, sessionID: tool.sessionID }) };
         },
       });
       editor.add({
@@ -1122,10 +1193,14 @@ const ocpg = Plugin.define({
         // injected block is skipped entirely for projects with no memories and
         // the user may have no project instructions at all.
         description:
-          "Store a durable memory. stack_fact is shared across all projects; " +
-          "project_fact (the default) is visible only in this project unless recalled with " +
-          "global: true. Use after user corrections (immediately), architecture decisions, " +
-          "non-trivial fixes, environment facts, and stated preferences. " +
+          "Store a durable memory. This is the only way anything you learn survives past " +
+          "this session - unwritten context is lost permanently when the session ends, so " +
+          "write immediately rather than deferring to the end of a task. " +
+          "stack_fact is shared across all projects; project_fact (the default) is visible " +
+          "only in this project unless recalled with global: true. " +
+          "Call this whenever the user corrects you or states a preference, you discover a " +
+          "non-obvious reason or constraint, you solve something that took more than one " +
+          "attempt, or you learn an environment fact not visible in the code. " +
           "Do not store session progress, secrets, or anything the code itself already states. " +
           "Duplicate writes are never rejected - run memory_consolidate afterward to clean up " +
           "near-duplicates if the corpus has accumulated restatements of one fact.",
@@ -1283,6 +1358,8 @@ const __internals = {
   buildRecencyQuery,
   buildRelevanceQuery,
   buildVectorQuery,
+  crossSessionJoin,
+  crossSessionBoost,
   embed,
   embedAndStore,
   storeEmbedding,

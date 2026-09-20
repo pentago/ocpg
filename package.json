@@ -18,6 +18,7 @@
     "bench:rrf-slots": "bun bench/rrf-slots.ts",
     "bench:cross-session": "bun bench/cross-session.ts",
     "bench:qqp-consolidate": "bun bench/qqp-consolidate.ts",
+    "bench:ocpg-shaped-consolidate": "bun bench/ocpg-shaped-consolidate.ts",
     "backfill": "bun deploy/backfill.ts"
   },
   "exports": {

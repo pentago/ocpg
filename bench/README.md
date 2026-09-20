@@ -540,6 +540,123 @@ Readings:
    the check is expected to do more work on ocpg's own real corpus, which
    has far more numbers/paths/names per memory than a Quora question does.
 
+## Detail cross-check re-test on ocpg-shaped content (2026-09-20, `bun bench/ocpg-shaped-consolidate.ts`)
+
+Follow-up spec: the QQP result above is real but QQP itself can't test the
+hypothesis cleanly - Quora questions rarely contain numbers, paths, or
+proper nouns, so most QQP pairs simply have nothing for the detail check to
+catch. This bench builds a labeled corpus that DOES look like ocpg's real
+content: 808 pairs (368 duplicate / 440 distinct) generated in-process from
+the same 40-topic infra vocabulary `bench/generate.ts` already uses
+(postgres, systemd, wireguard, terraform, ...), across 12 categories:
+
+- `duplicate` (309 candidates at threshold) - same fact, reworded, injected
+  number/path/name value UNCHANGED.
+- `update-<shape>` (7 shapes: rate-limit, port, retry-count, system-vs-user
+  unit path, config-location, env-values-file, alert-routing/dependency-bot/
+  ci-provider tool names) - same shape, injected value CHANGED - a
+  genuinely different fact, exactly the two real incidents' shape (rate
+  limit 100->500; `/etc/systemd/system/` vs `~/.config/systemd/user/`).
+- `distinct-related` - same topic, different aspect, general templates (the
+  "topically related but different fact" class QQP also showed).
+- `fn-stress` (8 hand-picked pairs) - genuine near-duplicates where a
+  number/path/name differs only in formatting (comma grouping, trailing
+  zero, trailing slash, letter case, leading zero) or is spelled out on one
+  side - stress-tests whether the check introduces new false negatives.
+
+Calibration (same shape as the QQP table): duplicate 0.787-0.997 (mean
+.902), distinct 0.498-0.936 (mean .794) - a real gap exists but the ranges
+still overlap around 0.83, same qualitative shape as QQP, not the 26-pair
+set's clean separation.
+
+Threshold sweep (before the detail check) - baseline FPR at 0.83 is
+**worse** than QQP's (0.370 vs 0.200), because this corpus is deliberately
+built with pairs in the exact shape that fools cosine similarity (same
+sentence, one specific value swapped):
+
+| threshold | precision | recall | FPR   |
+| --------- | --------- | ------ | ----- |
+| 0.75      | 0.544     | 1.000  | 0.700 |
+| 0.80      | 0.622     | 0.984  | 0.500 |
+| **0.83**  | **0.660** | **0.859** | **0.370** |
+| 0.86      | 0.673     | 0.783  | 0.318 |
+| 0.90      | 0.679     | 0.679  | 0.268 |
+
+Detail cross-check applied on top of the shipped threshold - 479 candidates
+(316 true duplicate / 163 distinct):
+
+| outcome                                              | TP  | FP  |
+| ----------------------------------------------------- | --- | --- |
+| clean (auto-merged, same as today)                     | 311 | 2   |
+| `[meaning-uncertain]` (blocked, flagged for review)    | 5   | 161 |
+
+| metric                                | before | after |
+| -------------------------------------- | ------ | ----- |
+| precision (of what's auto-merged)      | 0.660  | 0.994 |
+| recall (auto-merged, silent)           | 0.859  | 0.845 |
+| recall (auto-merged + flagged review)  | 0.859  | 0.859 |
+| FPR (of what's auto-merged)            | 0.370  | 0.005 |
+
+Per-category breakdown (candidates only):
+
+| category                  | candidates | clean | uncertain |
+| -------------------------- | ---------- | ----- | --------- |
+| duplicate                   | 309        | 309   | 0         |
+| distinct-related             | 2          | 2     | 0         |
+| fn-stress                   | 7          | 2     | 5         |
+| update-rate-limit           | 40         | 0     | 40        |
+| update-system-vs-user-unit  | 40         | 0     | 40        |
+| update-config-location       | 40         | 0     | 40        |
+| update-env-values-file       | 40         | 0     | 40        |
+| update-ci-provider           | 1          | 0     | 1         |
+| update-port / update-retry-count / update-alert-routing / update-dependency-bot | 0 | - | - (never reached cosine 0.83 as a pair in the first place) |
+
+Readings:
+
+1. **This confirms the "corpus mismatch" explanation, decisively.**
+   161/163 false positives (98.8%) are correctly rerouted to
+   `[meaning-uncertain]` instead of silently merged; FPR of what's actually
+   auto-merged drops from 0.370 to 0.005 - near elimination, not a marginal
+   improvement. The `update-*` categories (the exact shape of both real
+   incidents) are caught at effectively 100% wherever they reached the
+   similarity threshold at all (0 clean merges in any `update-*` row) - the
+   check does exactly what it was designed to do once the corpus actually
+   contains the failure mode.
+2. **The false-negative cost stays small and explicit**: 5/316 true
+   duplicates (1.6%) are now routed to review instead of silently merged -
+   lower than QQP's 2.1%, still small. Per-pair `fn-stress` detail: comma
+   grouping (`1,000` vs `1000`), a dropped trailing zero (`2.5.0` vs `2.5`),
+   a trailing slash (`/var/log/app` vs `/var/log/app/`), letter case
+   (`Jira` vs `JIRA`), and a leading zero (`02:00` vs `2:00`) all get
+   blocked - a real, honestly-documented gap in a regex-only check (no
+   number/path/name normalization), consistent with `extractDetails`'
+   comment that this component is the most likely to need iteration. Two
+   `fn-stress` pairs merge cleanly by design: a spelled-out number ("three
+   replicas") produces no conflict because one side has nothing to conflict
+   with (absence rule), and a unit-suffix number (`300 seconds` vs `300s`)
+   extracts the identical token on both sides. The spec's own ambiguous
+   example ("meeting moved from 3pm to 4pm" vs "the meeting is now at 4pm")
+   also merges cleanly here - not because the check is lenient about the
+   change, but because the first sentence mentions BOTH times, so its
+   number set `{3,4}` overlaps the second sentence's `{4}` and the overlap
+   rule (not disjoint) waves it through; a version phrased as two isolated,
+   non-overlapping mentions would conflict like the other five.
+3. **`[meaning-uncertain]` bucket size (20.5% of all scored pairs) looks
+   large only because this corpus is adversarially dense with the exact
+   failure mode** (every `update-*` pair exists specifically to trigger it)
+   - it is not representative of a real memory corpus's overall duplicate
+   rate, only of how well the check performs when the failure mode is
+   actually present. The QQP bench's 1.3% bucket size is the more
+   representative "ambient" rate for ordinary content.
+4. **Overturns nothing** - the "does the extraction actually work" concern
+   the spec raised is answered: it does, decisively, on content shaped like
+   ocpg's own memories. The QQP result was a corpus mismatch, not a weak
+   fix.
+
+Reproducible via `bun bench/ocpg-shaped-consolidate.ts` (no external
+dataset - the corpus is generated in-process; needs a reachable Ollama and
+a `CREATEDB`-capable `OCPG_*` user, same as the other consolidate benches).
+
 ## Cross-session recall signal (2026-09-20, `bun bench/cross-session.ts`, 485/4970/49980-row bench DBs)
 
 Spec: replace the dormant `access_count` (bumped on every recall, unused by

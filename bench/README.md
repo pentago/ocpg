@@ -482,6 +482,64 @@ language at scale, with the caveat in reading 3 that QQP's own genre may
 overstate the real-corpus risk. Any change to `CONSOLIDATE_EMBED_THRESHOLD`
 is an explicit follow-up, not part of this result.
 
+## Detail cross-check for the meaning pass (2026-09-20, same `bun bench/qqp-consolidate.ts` run, re-scored)
+
+Spec: "detail cross-check for consolidation's meaning pass" - the QQP stress
+test above showed no threshold safely separates duplicate from distinct at
+scale. This adds a second, independent, regex-only signal
+(`extractDetails`/`detailConflicts` in `ocpg.ts`): a candidate pair (cosine
+>= 0.83, same as today) only auto-merges if its extracted numbers, paths, and
+capitalized names either agree or are absent on at least one side. A
+conflicting pair is NOT merged - it is reported as `[meaning-uncertain]`
+instead, for the calling agent to resolve via `memory_update` or leave alone.
+No model call, no change to `CONSOLIDATE_EMBED_THRESHOLD` itself.
+
+Re-scoring the same 5,000-pair QQP sample's 2,555 threshold-candidates
+(2,054 true duplicate / 501 distinct) through the detail check:
+
+| outcome                          | TP   | FP  |
+| --------------------------------- | ---- | --- |
+| clean (auto-merged, same as today) | 2010 | 481 |
+| `[meaning-uncertain]` (blocked, flagged for review) | 44 | 20 |
+
+| metric                                | before | after |
+| -------------------------------------- | ------ | ----- |
+| precision (of what's auto-merged)      | 0.804  | 0.807 |
+| recall (auto-merged, silent)           | 0.822  | 0.804 |
+| recall (auto-merged + flagged review)  | 0.822  | 0.822 |
+| FPR (of what's auto-merged)            | 0.200  | 0.192 |
+
+Readings:
+
+1. **On QQP specifically, the effect is small**: FPR drops from 0.200 to
+   0.192 (20/501 false positives, 4.0%, correctly rerouted to
+   `[meaning-uncertain]`), and 44/2054 true duplicates (2.1%) are now
+   blocked from silent auto-merge and routed to review instead - a small,
+   explicit, reviewable cost, not a silent loss. The `[meaning-uncertain]`
+   bucket is 64 pairs, 1.3% of all scored pairs - small enough to review.
+2. **This is the expected result given QQP's own genre, not a failed
+   check.** The QQP stress test's own scoping caveat (reading 3, above)
+   applies again here even more directly: QQP false positives are
+   near-duplicate *questions* on the same handful of topics ("What are some
+   ways to calculate moles?" / "How do you calculate the moles of acid?"),
+   which mostly share no numbers, paths, or proper nouns to conflict on in
+   the first place - there is nothing for this check to catch. The concrete
+   failure mode this check targets (a rate limit changing from 100 to 500
+   requests/minute, a `/etc/systemd/system/` vs `~/.config/systemd/user/`
+   path) is a shape ocpg's own real memory corpus produces far more often
+   than QQP's question pairs do - version numbers, ports, file paths, tool
+   names. Both spec examples were verified directly against bge-m3
+   (`tests/ocpg.test.ts`, "consolidate: [meaning-uncertain] bucket"): cosine
+   ~0.898 and ~0.930 respectively, both above 0.83, both now routed to
+   `[meaning-uncertain]` instead of silently merged.
+3. **Ship gate met on the terms the spec set**: no large new false-negative
+   cost (2.1% of true positives, explicit and reviewable, not silent), and
+   the uncertain bucket stays small. The spec's target FPR drop was
+   explicitly left as "a judgment call once real data is in, not fixed in
+   advance" - on QQP the drop is small for the genre-scoping reason above;
+   the check is expected to do more work on ocpg's own real corpus, which
+   has far more numbers/paths/names per memory than a Quora question does.
+
 ## Cross-session recall signal (2026-09-20, `bun bench/cross-session.ts`, 485/4970/49980-row bench DBs)
 
 Spec: replace the dormant `access_count` (bumped on every recall, unused by

@@ -188,6 +188,59 @@ try {
       `${t.toFixed(2)}      | ${precision.toFixed(3)}     | ${recall.toFixed(3)}  | ${fpr.toFixed(3)} | ${tp}    ${fp}    ${fn}    ${tn}${flag}`,
     );
   }
+
+  // --- Detail cross-check re-run (spec: "detail cross-check for
+  // consolidation's meaning pass", 2026-09-20) - only applies to pairs the
+  // similarity pass already flagged as candidates (cosine >= shipped
+  // threshold), exactly like consolidate()'s real gate order.
+  console.log("\n=== Detail cross-check applied on top of the shipped threshold (0.83) ===");
+  const T = __internals.CONSOLIDATE_EMBED_THRESHOLD;
+  const scoredWithText = (await db`
+    SELECT g.is_duplicate, (1 - (m1.embedding <=> m2.embedding))::float8 AS cosine, m1.content AS c1, m2.content AS c2
+    FROM qqp_ground_truth g
+    JOIN memories m1 ON m1.id = g.memory_id_1
+    JOIN memories m2 ON m2.id = g.memory_id_2
+    WHERE m1.embedding IS NOT NULL AND m2.embedding IS NOT NULL
+  `) as { is_duplicate: boolean; cosine: number; c1: string; c2: string }[];
+
+  const candidates = scoredWithText.filter((r) => r.cosine >= T);
+  let cleanTp = 0;
+  let cleanFp = 0;
+  let uncertainTp = 0;
+  let uncertainFp = 0;
+  for (const r of candidates) {
+    const conflicts = __internals.detailConflicts(__internals.extractDetails(r.c1), __internals.extractDetails(r.c2));
+    const conflicting = conflicts.length > 0;
+    if (conflicting && r.is_duplicate) uncertainTp++;
+    else if (conflicting && !r.is_duplicate) uncertainFp++;
+    else if (!conflicting && r.is_duplicate) cleanTp++;
+    else cleanFp++;
+  }
+  const totalDup = scored.filter((r) => r.is_duplicate).length;
+  const totalDist = scored.filter((r) => !r.is_duplicate).length;
+  const baselineFp = candidates.filter((r) => !r.is_duplicate).length;
+  const baselineTp = candidates.filter((r) => r.is_duplicate).length;
+
+  console.log(`Candidates at threshold (cosine >= ${T}): ${candidates.length} (${baselineTp} true duplicate / ${baselineFp} distinct)`);
+  console.log(`  -> clean (no detail conflict, auto-merged same as before): TP=${cleanTp} FP=${cleanFp}`);
+  console.log(`  -> [meaning-uncertain] (detail conflict, NOT merged, flagged for review): TP=${uncertainTp} FP=${uncertainFp}`);
+  console.log("");
+  const precisionAuto = cleanTp + cleanFp > 0 ? cleanTp / (cleanTp + cleanFp) : 0;
+  const recallAutoOnly = totalDup > 0 ? cleanTp / totalDup : 0;
+  const recallIncludingReview = totalDup > 0 ? (cleanTp + uncertainTp) / totalDup : 0;
+  const fprAuto = totalDist > 0 ? cleanFp / totalDist : 0;
+  console.log(`precision (auto-merged only):            ${precisionAuto.toFixed(3)} (baseline: ${(baselineTp / candidates.length).toFixed(3)})`);
+  console.log(`recall (auto-merged only, silent):        ${recallAutoOnly.toFixed(3)}`);
+  console.log(`recall (auto-merged + flagged for review): ${recallIncludingReview.toFixed(3)} (baseline: ${(baselineTp / totalDup).toFixed(3)})`);
+  console.log(`FPR (auto-merged only):                    ${fprAuto.toFixed(3)} (baseline: ${(baselineFp / totalDist).toFixed(3)})`);
+  console.log("");
+  console.log(
+    `Previously-false-positive pairs now correctly routed to [meaning-uncertain] instead of a silent merge: ${uncertainFp}/${baselineFp} (${((uncertainFp / baselineFp) * 100).toFixed(1)}%)`,
+  );
+  console.log(
+    `Previously-true-positive pairs now blocked from auto-merge (routed to [meaning-uncertain], a new review cost, not a silent loss): ${uncertainTp}/${baselineTp} (${((uncertainTp / baselineTp) * 100).toFixed(1)}%)`,
+  );
+  console.log(`[meaning-uncertain] bucket size (share of ALL scored pairs, reviewability check): ${candidates.length > 0 ? (((uncertainTp + uncertainFp) / scored.length) * 100).toFixed(1) : "0.0"}%`);
 } finally {
   await db.close({ timeout: 0 }).catch(() => {});
   await __internals.dispose();

@@ -83,6 +83,13 @@ async function legacyMinilmUsable(db: SQL): Promise<boolean> {
   return sample.every((r, i) => cosine(JSON.parse(r.embedding), fresh[i]) >= 0.999);
 }
 
+async function ollamaHasModel(name: string): Promise<boolean> {
+  const res = await fetch(`${ollama}/api/tags`);
+  if (!res.ok) return false;
+  const { models } = (await res.json()) as { models: Array<{ name: string }> };
+  return models.some((m) => m.name === name || m.name === `${name}:latest`);
+}
+
 async function ensureColumn(db: SQL, col: string, dims: number): Promise<void> {
   await db`CREATE EXTENSION IF NOT EXISTS vector`;
   await db.unsafe(`ALTER TABLE memories ADD COLUMN IF NOT EXISTS ${col} vector(${dims})`);
@@ -130,11 +137,22 @@ async function benchDataset(size: number): Promise<void> {
     await ensureColumn(db, colName(model), dims);
     await fill(db, colName(model), model);
 
-    const legacyOk = await legacyMinilmUsable(db);
-    if (!legacyOk) console.log(`  legacy MiniLM column does not match ollama ${MINILM} - re-embedding it`);
-    else console.log(`  legacy MiniLM column verified against ollama ${MINILM} - reusing`);
-    await ensureColumn(db, colName(MINILM), 384);
-    await fill(db, colName(MINILM), MINILM);
+    // MiniLM is an optional secondary baseline (a previous experiment's
+    // column, if it exists). Skip it entirely rather than pulling a new model
+    // onto the host when it isn't already available.
+    const minilmAvailable = await ollamaHasModel(MINILM);
+    if (!minilmAvailable) {
+      console.log(`  ${MINILM} not pulled on ${ollama} - skipping the MiniLM baseline`);
+    } else {
+      // The column must exist before the legacy check queries it - on a fresh
+      // compose container (no volume, see compose.yaml) it never does, and an
+      // empty/all-NULL column correctly reads as "not usable" below.
+      await ensureColumn(db, colName(MINILM), 384);
+      const legacyOk = await legacyMinilmUsable(db);
+      if (!legacyOk) console.log(`  legacy MiniLM column does not match ollama ${MINILM} - re-embedding it`);
+      else console.log(`  legacy MiniLM column verified against ollama ${MINILM} - reusing`);
+      await fill(db, colName(MINILM), MINILM);
+    }
 
     // --- strategies -------------------------------------------------------
     const queryCache = new Map<string, string>();
@@ -155,7 +173,7 @@ async function benchDataset(size: number): Promise<void> {
     });
     const strategies = [
       embedStrategy(`embed-${model}`, colName(model), model),
-      embedStrategy("embed-minilm", colName(MINILM), MINILM),
+      ...(minilmAvailable ? [embedStrategy("embed-minilm", colName(MINILM), MINILM)] : []),
       {
         name: "hybrid-rrf",
         describe: `RRF(k=60) merge of fts-or (prod) + embed-${model} 20-row candidate lists`,

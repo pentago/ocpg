@@ -1477,6 +1477,9 @@ const ocpg = Plugin.define({
                 "project_fact (default) = true about THIS specific project/customer only " +
                 "(an environment quirk, a customer's specific request, a one-off workaround) " +
                 "- visible only in this project unless the caller asks for global search. " +
+                "episodic = reserved for a future feature; visible everywhere like stack_fact, " +
+                "but nothing assigns it automatically today - default to project_fact or " +
+                "stack_fact unless you have a specific reason to use it. " +
                 "Test: would this fact help in a different customer's repo using the same " +
                 "tools? If yes, stack_fact. If no, project_fact.",
             },

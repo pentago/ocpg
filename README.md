@@ -4,7 +4,7 @@ Postgres-backed persistent memory plugin for [OpenCode](https://opencode.ai).
 
 ## What it does
 
-ocpg gives your OpenCode agent memory that survives across sessions and projects. Every memory is a row in one Postgres `memories` table. Three things happen around it:
+ocpg gives your OpenCode agent memory that survives across sessions and projects. Every memory is a row in one Postgres `memories` table. Four things happen around it:
 
 **1. Memories get in - three ways**
 - The agent calls `memory_remember` when it decides something is worth keeping.
@@ -23,6 +23,9 @@ If Ollama is unreachable, the vector half is skipped and search silently degrade
 **3. Duplicates get cleaned up - on demand, never automatically.**
 Writes are never rejected. `memory_consolidate` is the cleanup tool, and you (or the agent) run it when you want. It makes two passes - trigram wording similarity, then embedding meaning similarity - keeps the newest of each duplicate group, and **returns the text of everything it deleted** so nothing is lost silently.
 
+**4. Corrections replace, not just add.**
+Call `memory_remember` with `supersedes: <id>` when a new memory corrects or reverses an older one. The old memory is marked as superseded (not deleted) and stops showing up in recall or injection, so a correction can't end up sitting next to the outdated fact it was meant to replace. `memory_recall` with `includeSuperseded: true` brings it back into view, noting what replaced it.
+
 ### Scoping: the one concept worth understanding
 
 Every memory has a **type**, and the type decides who can see it:
@@ -39,6 +42,7 @@ The test when storing something: *would this help in a different customer's repo
 - **Run `memory_consolidate` occasionally**, not constantly. It's cheap and it shows you what it removed before you lose anything.
 - **Phrase recall queries naturally.** Hybrid search means you don't have to remember your original wording - meaning-based matching covers the gap.
 - **Keep memories self-contained.** "Use jose, not jsonwebtoken, for Edge compatibility" survives out of context; "we decided on the second option" does not.
+- **Use `supersedes` when you correct something**, not a second unrelated memory. Two memories that disagree with no link between them is exactly the situation `supersedes` exists to avoid.
 
 ---
 
@@ -97,7 +101,7 @@ Visibility is **type-based**:
 | -------------- | ------------------------------ | ---------------------------------------------- |
 | `stack_fact`   | Global                         | True about the tooling/stack itself - portable to any project using the same stack (a Terraform module quirk, a Helm convention) |
 | `project_fact` | Origin project only (default)  | True about this specific project/customer only; pass `global: true` on `memory_recall` to reach across projects |
-| `episodic`     | Reserved, unused                | -                                              |
+| `episodic`     | Global (same rule as `stack_fact`)  | Reserved for a future feature; nothing writes it automatically today, but a manual `memory_remember` with this type stores and is visible everywhere, same as `stack_fact` |
 
 `memory_forget` / `memory_update` follow the same rule: a foreign project's `project_fact` is off-limits (the call fails and names the owning project); the global type (`stack_fact`) is maintainable from any project.
 
@@ -137,8 +141,9 @@ Writes are never rejected for duplicates - cleanup is `memory_consolidate`'s job
 
 - **`[wording]`** - trigram content similarity (>=80%): catches restatements that share most of their wording (the old FTS-on-first-60-chars rule missed 28 such pairs on the real corpus).
 - **`[meaning]`** - embedding cosine similarity (bge-m3, >=0.83): catches the same fact stated in completely different words, which trigram similarity structurally cannot reach. Only memories that have an embedding participate, and templated auto-generated content (background-task status logs, session-compaction summaries, per-app checklist entries) is excluded - real-corpus testing found that boilerplate sentence shapes drive cosine similarity high between genuinely different facts (different task IDs, sessions, apps).
+- **`[meaning-uncertain]`** - a pair that matched by meaning, but with a specific number, path, or name that differs between them (a rate limit of 100 vs 500; two different file paths). Close enough to look like a duplicate, different enough that deleting either side could lose a real fact - so neither is touched. Review the pair yourself and use `memory_update` if it turns out to be the same fact after all.
 
-Both passes keep the newest of every group and delete the rest (capped at 25 groups per pass per run), returning the removed texts so the agent can merge back any unique detail with `memory_update`. The meaning pass also refuses to cluster across a project boundary that `memory_forget`/`memory_update` already won't cross. Near-duplicates are also collapsed out of the injected block automatically between consolidations. The wording pass needs the trgm index; fresh installs from [`deploy/`](./deploy) get it automatically, existing databases run the upgrade block in [`deploy/README.md`](./deploy/README.md). The meaning pass needs the `embedding` column populated - rows Ollama never reached simply aren't candidates for it.
+Both passes (`[wording]`, `[meaning]`) keep the newest of every group and delete the rest (capped at 25 groups per pass per run), returning the removed texts so the agent can merge back any unique detail with `memory_update`. `[meaning-uncertain]` pairs are the exception - nothing is deleted, they're only reported. The meaning pass also refuses to cluster across a project boundary that `memory_forget`/`memory_update` already won't cross. Near-duplicates are also collapsed out of the injected block automatically between consolidations. The wording pass needs the trgm index; fresh installs from [`deploy/`](./deploy) get it automatically, existing databases run the upgrade block in [`deploy/README.md`](./deploy/README.md). The meaning pass needs the `embedding` column populated - rows Ollama never reached simply aren't candidates for it.
 
 If the database is unreachable, memory injection is skipped and the tools return a generic error - a slow or dead database never blocks a model request.
 

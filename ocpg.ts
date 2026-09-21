@@ -13,11 +13,12 @@ type DbConfig = {
   database: string;
   ssl: SslMode;
 };
-type RecallArgs = { query?: string; limit?: number; tags?: string[]; global?: boolean };
+type RecallArgs = { query?: string; limit?: number; tags?: string[]; global?: boolean; includeSuperseded?: boolean };
 type RememberArgs = {
   content: string;
   tags?: string[];
   type?: MemoryType;
+  supersedes?: number;
 };
 type ForgetArgs = { id: number };
 type UpdateArgs = { id: number; content: string; tags?: string[]; type?: MemoryType };
@@ -377,6 +378,17 @@ function visibleRows(client: SQL, directory: string) {
   return client`(memory_type != 'project_fact' OR project = ${directory})`;
 }
 
+// A superseded memory (supersede-tracking: memory_remember's `supersedes`
+// argument) is history, not current fact - it must never surface as ambient
+// context or in a normal recall. Layered ON TOP of visibleRows rather than
+// merged into it: forget and memory_update must still be able to reach a
+// superseded row (delete it outright, or fix a bad supersede link), so the
+// ownership check they run stays separate from the "is this current"
+// check recall/injection run.
+function notSuperseded(client: SQL) {
+  return client`superseded_by IS NULL`;
+}
+
 // Recency query shared by the recency mode and the no-match fallback: latest
 // visible rows, newest first. Global by design - the project column records
 // origin, not visibility, for global types; project_fact is origin-scoped
@@ -391,7 +403,7 @@ function buildRecencyQuery(client: SQL, directory: string) {
            to_char(created_at, 'YYYY-MM-DD') AS date,
            project
     FROM memories
-    WHERE ${visibleRows(client, directory)}
+    WHERE ${visibleRows(client, directory)} AND ${notSuperseded(client)}
     ORDER BY created_at DESC
     LIMIT 20
   `;
@@ -434,6 +446,7 @@ function buildRelevanceQuery(client: SQL, tsQuery: string, directory: string) {
     ${crossSessionJoin(client)}
     WHERE search_vector @@ to_tsquery('english', ${tsQuery})
       AND ${visibleRows(client, directory)}
+      AND ${notSuperseded(client)}
     ORDER BY ts_rank(search_vector, to_tsquery('english', ${tsQuery}))
              + (CASE WHEN project = ${directory} THEN 0.01 ELSE 0 END)
              + ${crossSessionBoost(client)} DESC,
@@ -456,6 +469,7 @@ function buildVectorQuery(client: SQL, vectorLit: string, directory: string) {
     FROM memories
     WHERE embedding IS NOT NULL
       AND ${visibleRows(client, directory)}
+      AND ${notSuperseded(client)}
     ORDER BY embedding <=> ${vectorLit}::vector
     LIMIT ${EMBED_CANDIDATES}
   `;
@@ -609,6 +623,9 @@ async function recall(
     // Visibility: the global type (stack_fact) everywhere; project_fact only
     // from the origin project unless the caller opts in with global: true.
     const visibleCond = args.global ? sql`` : sql`AND ${visibleRows(sql, ctx.directory)}`;
+    // Superseded memories are hidden by default (same posture as injection);
+    // includeSuperseded surfaces them for history/audit, annotated below.
+    const supersededCond = args.includeSuperseded ? sql`` : sql`AND ${notSuperseded(sql)}`;
     const q = args.query ?? "";
     const tsQuery = q ? orTsQuery(q) : "";
     const queryCond = q
@@ -643,13 +660,13 @@ async function recall(
     const keywordRows = await sql`
       SELECT id, content, coalesce(tags, '{}') AS tags,
              to_char(created_at, 'YYYY-MM-DD') AS date,
-             project, memory_type
+             project, memory_type, superseded_by
       FROM memories
       ${crossSessionJoin(sql)}
-      WHERE 1=1 ${visibleCond} ${queryCond} ${tagCond}
+      WHERE 1=1 ${visibleCond} ${supersededCond} ${queryCond} ${tagCond}
       ${orderBy}
       LIMIT ${q ? EMBED_CANDIDATES : limit}
-    ` as (MemoryRow & { memory_type: string })[];
+    ` as (MemoryRow & { memory_type: string; superseded_by: number | null })[];
 
     let rows = keywordRows;
     const vecs = await embedding;
@@ -658,12 +675,12 @@ async function recall(
       const vectorRows = await (sql`
         SELECT id, content, coalesce(tags, '{}') AS tags,
                to_char(created_at, 'YYYY-MM-DD') AS date,
-               project, memory_type
+               project, memory_type, superseded_by
         FROM memories
-        WHERE embedding IS NOT NULL ${visibleCond} ${tagCond}
+        WHERE embedding IS NOT NULL ${visibleCond} ${supersededCond} ${tagCond}
         ORDER BY embedding <=> ${vectorLiteral(vecs[0])}::vector
         LIMIT ${EMBED_CANDIDATES}
-      ` as unknown as Promise<(MemoryRow & { memory_type: string })[]>).catch((e: unknown) => {
+      ` as unknown as Promise<(MemoryRow & { memory_type: string; superseded_by: number | null })[]>).catch((e: unknown) => {
         logError("embed-query", `ocpg vector query failed, keyword-only: ${e instanceof Error ? e.message : String(e)}`);
         return null;
       });
@@ -708,7 +725,10 @@ async function recall(
         // episodic is worth surfacing; project_fact is the default every
         // pre-column row carries, so printing it is pure noise.
         const typeStr = r.memory_type === "project_fact" ? "" : ` [${r.memory_type}]`;
-        return `[${r.date}] [${r.project}]${typeStr}${tagStr}\n#${r.id}\n${r.content}`;
+        // Only ever set when includeSuperseded surfaced this row - a normal
+        // recall never returns a superseded row to annotate in the first place.
+        const supersededStr = r.superseded_by ? ` [superseded by #${r.superseded_by}]` : '';
+        return `[${r.date}] [${r.project}]${typeStr}${tagStr}\n#${r.id}${supersededStr}\n${r.content}`;
       })
       .join('\n---\n');
   } catch (e: unknown) {
@@ -748,6 +768,14 @@ function validateWrite(args: RememberArgs): string | null {
 // injected block.
 const DEDUP_SIMILARITY = 0.8;
 
+// Thrown (and caught) only for the `supersedes` boundary/existence checks
+// inside remember()'s transaction - distinct from a generic DB failure so the
+// catch block can return the specific message instead of toolError's generic
+// one, and so the thrown error rolls back the insert too (supersede failing
+// must not silently leave the new memory stored with no link, nor leave it
+// stored at all - same "fail loud, not a silent no-op" posture as forget/update).
+class SupersedeError extends Error {}
+
 async function remember(
   args: RememberArgs,
   ctx: { directory: string; sessionID: string },
@@ -756,27 +784,71 @@ async function remember(
     const invalid = validateWrite(args);
     if (invalid) return invalid;
 
+    let supersedesId: number | undefined;
+    if (args.supersedes !== undefined) {
+      const n = Number(args.supersedes);
+      if (!Number.isInteger(n) || n <= 0) {
+        return "ERROR: supersedes must be a positive integer (the #id shown by memory_recall).";
+      }
+      supersedesId = n;
+    }
+
     // Tags are stored verbatim - the project column records origin, not visibility.
     const tags = args.tags ?? [];
     const basename = ctx.directory.split('/').pop() ?? ctx.directory;
 
     // sql.array(tags) alone encodes text[] with quoted elements under bun 1.4.2;
     // the element type hint is required for clean array storage.
-    const inserted = await sql`
-      INSERT INTO memories (content, tags, session_id, project, memory_type)
-      VALUES (${args.content}, ${sql.array(tags, "text")}, ${ctx.sessionID}, ${ctx.directory}, ${resolveMemoryType(args.type)})
-      RETURNING id
-    ` as { id: number }[];
+    let newId: number;
+    if (supersedesId !== undefined) {
+      // Atomic: insert the new memory and link the old one in one
+      // transaction. If the supersede target is unreachable (wrong project,
+      // or gone), the whole thing rolls back - no orphaned insert.
+      newId = await sql.begin(async (tx) => {
+        const inserted = await tx`
+          INSERT INTO memories (content, tags, session_id, project, memory_type)
+          VALUES (${args.content}, ${tx.array(tags, "text")}, ${ctx.sessionID}, ${ctx.directory}, ${resolveMemoryType(args.type)})
+          RETURNING id
+        ` as { id: number }[];
+        const id = inserted[0].id;
+
+        const linked = await tx`
+          UPDATE memories SET superseded_by = ${id}
+          WHERE id = ${supersedesId} AND ${visibleRows(tx, ctx.directory)}
+          RETURNING id
+        ` as { id: number }[];
+        if (linked.length === 0) {
+          const exists = await tx`SELECT project, memory_type FROM memories WHERE id = ${supersedesId}` as { project: string; memory_type: string }[];
+          if (exists.length > 0) {
+            throw new SupersedeError(
+              `memory #${supersedesId} is a ${exists[0].memory_type} belonging to ${exists[0].project}; cannot supersede it from here. Only that project's agent can mark it superseded.`,
+            );
+          }
+          throw new SupersedeError(`no memory #${supersedesId}; nothing to supersede.`);
+        }
+        return id;
+      });
+    } else {
+      const inserted = await sql`
+        INSERT INTO memories (content, tags, session_id, project, memory_type)
+        VALUES (${args.content}, ${sql.array(tags, "text")}, ${ctx.sessionID}, ${ctx.directory}, ${resolveMemoryType(args.type)})
+        RETURNING id
+      ` as { id: number }[];
+      newId = inserted[0].id;
+    }
 
     // Fire-and-forget: a failure leaves embedding NULL, keyword search keeps
     // working, and the backfill (deploy/backfill.ts) fills the gap later.
-    void embedAndStore(inserted[0].id, args.content);
+    void embedAndStore(newId, args.content);
 
     // The injection block is global, but its cache is keyed by the calling
-    // directory + prompt; clear the directory's keys.
+    // directory + prompt; clear the directory's keys. A supersede changes
+    // what's current for every project too (the old row stops surfacing),
+    // same as any other write.
     invalidateInjection(ctx.directory);
-    return `Stored memory #${inserted[0].id} (project ${basename}).`;
+    return `Stored memory #${newId} (project ${basename}).`;
   } catch (e: unknown) {
+    if (e instanceof SupersedeError) return `ERROR: ${e.message}`;
     return toolError("remember", "remember", e);
   }
 }
@@ -1109,9 +1181,14 @@ function detailConflicts(a: DetailSet, b: DetailSet): string[] {
 async function consolidate(): Promise<string> {
   try {
     // --- Pass 1: wording (trigram similarity over content) ---
+    // Superseded rows are already-resolved history (an explicit decision was
+    // made about them via `supersedes`), not accidental near-duplicates for
+    // this pass to guess about - excluded the same way isTemplatedAutoLog
+    // excludes a different kind of not-a-candidate row.
     const rows = await sql`
       SELECT id, content, coalesce(tags, '{}') AS tags, created_at
       FROM memories
+      WHERE superseded_by IS NULL
       ORDER BY created_at DESC
     ` as { id: number; content: string; tags: string[]; created_at: Date }[];
 
@@ -1173,6 +1250,8 @@ async function consolidate(): Promise<string> {
       JOIN memories b ON a.id < b.id
       WHERE a.embedding IS NOT NULL
         AND b.embedding IS NOT NULL
+        AND a.superseded_by IS NULL
+        AND b.superseded_by IS NULL
         AND (1 - (a.embedding <=> b.embedding)) >= ${CONSOLIDATE_EMBED_THRESHOLD}
         AND ${mutuallyVisible(sql)}
         AND NOT ${isTemplatedAutoLogPair(sql)}
@@ -1186,7 +1265,7 @@ async function consolidate(): Promise<string> {
       const embedRows = (await sql`
         SELECT id, content, coalesce(tags, '{}') AS tags, created_at
         FROM memories
-        WHERE embedding IS NOT NULL AND NOT ${isTemplatedAutoLog(sql)}
+        WHERE embedding IS NOT NULL AND superseded_by IS NULL AND NOT ${isTemplatedAutoLog(sql)}
         ORDER BY created_at DESC
       `) as { id: number; content: string; tags: string[]; created_at: Date }[];
 
@@ -1322,7 +1401,9 @@ const ocpg = Plugin.define({
           "Search before starting anything you have not already done in this session: a past attempt, decision, " +
           "or fix is almost always cheaper to find than to rediscover. Matches on both keywords and meaning, so " +
           "approximate phrasing works. The stack_fact type is always searched; this project's project_fact " +
-          "memories are searched by default.",
+          "memories are searched by default. An empty query returns the most recent visible memories (recency " +
+          "browse mode) rather than an empty result - useful for \"show me the last N memories\" without a " +
+          "specific search term.",
         input: {
           type: "object",
           properties: {
@@ -1340,6 +1421,13 @@ const ocpg = Plugin.define({
                 "Also search other projects' project_fact memories (default: only this " +
                 "project's project_fact memories, plus all stack_fact memories, " +
                 "which are always global).",
+            },
+            includeSuperseded: {
+              type: "boolean",
+              description:
+                "Include memories that have been superseded by a newer one (default: false, " +
+                "hidden). Each included row is annotated with what replaced it - use this to " +
+                "review history, not for everyday recall.",
             },
             limit: { type: "number", description: "1-20, default 5" },
           },
@@ -1367,7 +1455,11 @@ const ocpg = Plugin.define({
           "attempt, or you learn an environment fact not visible in the code. " +
           "Do not store session progress, secrets, or anything the code itself already states. " +
           "Duplicate writes are never rejected - run memory_consolidate afterward to clean up " +
-          "near-duplicates if the corpus has accumulated restatements of one fact.",
+          "near-duplicates if the corpus has accumulated restatements of one fact. " +
+          "If this memory corrects, replaces, or reverses an earlier one, pass supersedes: <id> " +
+          "(get the id from memory_recall) instead of just narrating the change in prose. The " +
+          "old memory is then excluded from normal recall and injection, but stays in history " +
+          "rather than being deleted - use memory_recall with includeSuperseded: true to see it.",
         input: {
           type: "object",
           properties: {
@@ -1396,6 +1488,13 @@ const ocpg = Plugin.define({
                 "Fine-grained facets: decision, debug, env, architecture, workaround, " +
                 "language:<x>, framework:<x>, tool:<x>. The origin project is recorded " +
                 "automatically (a project column, not a tag) - never add project:<name>.",
+            },
+            supersedes: {
+              type: "number",
+              description:
+                "The #id (from memory_recall) of an earlier memory this one corrects, " +
+                "replaces, or reverses. Same project boundary as memory_forget/memory_update: " +
+                "a foreign project's project_fact cannot be superseded from here.",
             },
           },
           required: ["content"],
@@ -1523,6 +1622,8 @@ const __internals = {
   buildRecencyQuery,
   buildRelevanceQuery,
   buildVectorQuery,
+  visibleRows,
+  notSuperseded,
   crossSessionJoin,
   crossSessionBoost,
   embed,

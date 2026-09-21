@@ -42,7 +42,7 @@ The test when storing something: *would this help in a different customer's repo
 
 ---
 
-Uses the `memories` table (`content`, `tags`, `session_id`, `project`, `created_at`, `search_vector`, `embedding`, `memory_type`, `access_count`, `last_accessed_at`, `updated_at`) plus a `memory_recalls` table (which sessions have recalled a memory, feeding a small ranking tiebreak) and the `pg_trgm` + `vector` extensions, and exposes `memory_recall` / `memory_remember` / `memory_forget` / `memory_update` / `memory_consolidate` tools.
+Uses the `memories` table (`content`, `tags`, `session_id`, `project`, `created_at`, `search_vector`, `embedding`, `memory_type`, `access_count`, `last_accessed_at`, `updated_at`, `superseded_by`) plus a `memory_recalls` table (which sessions have recalled a memory, feeding a small ranking tiebreak) and the `pg_trgm` + `vector` extensions, and exposes `memory_recall` / `memory_remember` / `memory_forget` / `memory_update` / `memory_consolidate` tools.
 
 ## Install
 
@@ -121,6 +121,7 @@ Five agent tools are registered: `memory_remember` (store), `memory_recall` (sea
 
 - Visibility follows the type (see the table above); `memory_recall` takes `global: true` to also search other projects' `project_fact` memories (`stack_fact` is always searched regardless of this flag).
 - Duplicate writes are **never rejected** - `memory_remember` is a plain store. Near-duplicates are collapsed out of the injected block automatically, and `memory_consolidate` cleans them up when you ask.
+- `memory_remember` takes an optional `supersedes: <id>` to mark an earlier memory as replaced rather than just narrating the change in prose - see "Supersede tracking" below.
 
 Writes are capped at 4000 characters of content, 10 tags, and 64 characters per tag; oversized writes are rejected with the actual size rather than silently truncated. Memories carry a `type` (`stack_fact`, `project_fact` default, or `episodic` - see the visibility table above).
 
@@ -140,6 +141,10 @@ Writes are never rejected for duplicates - cleanup is `memory_consolidate`'s job
 Both passes keep the newest of every group and delete the rest (capped at 25 groups per pass per run), returning the removed texts so the agent can merge back any unique detail with `memory_update`. The meaning pass also refuses to cluster across a project boundary that `memory_forget`/`memory_update` already won't cross. Near-duplicates are also collapsed out of the injected block automatically between consolidations. The wording pass needs the trgm index; fresh installs from [`deploy/`](./deploy) get it automatically, existing databases run the upgrade block in [`deploy/README.md`](./deploy/README.md). The meaning pass needs the `embedding` column populated - rows Ollama never reached simply aren't candidates for it.
 
 If the database is unreachable, memory injection is skipped and the tools return a generic error - a slow or dead database never blocks a model request.
+
+### Supersede tracking
+
+A correction or a reverted decision used to leave the OLD memory in place, discoverable by recall/injection exactly like a current fact - the only signal it was reverted was a *later*, unrelated memory narrating the change in prose, which recall/injection have no reason to always return together. `memory_remember` now takes an optional `supersedes: <id>`: the new memory is inserted and the old one is marked `superseded_by` in a single transaction (either both happen or neither does - a rejected supersede, e.g. across a project boundary, rolls back the whole write). A superseded memory is excluded from `memory_recall` and injection by default - it is not deleted, just no longer treated as current - and stays visible with `memory_recall`'s `includeSuperseded: true`, annotated with what replaced it. `memory_consolidate` also skips superseded rows entirely on both passes: they are already a resolved, explicit decision, not an accidental duplicate to guess about. Forgetting the *newer* memory un-supersedes the old one (`ON DELETE SET NULL`) rather than leaving a dangling reference; forgetting or updating the superseded memory itself works as normal, since ownership checks are separate from "is this current".
 
 ## Development
 

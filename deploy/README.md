@@ -75,6 +75,13 @@ CREATE TABLE IF NOT EXISTS memory_recalls (
   recalled_at timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (memory_id, session_id)
 );
+
+-- Supersede tracking: memory_remember's `supersedes` argument sets this to
+-- link a corrected/replaced memory to its replacement. Non-null rows are
+-- history - hidden from normal recall/injection, never deleted outright.
+-- ON DELETE SET NULL: forgetting the superseding memory un-supersedes the
+-- old one instead of leaving a dangling reference.
+ALTER TABLE memories ADD COLUMN IF NOT EXISTS superseded_by integer REFERENCES memories(id) ON DELETE SET NULL;
 ```
 
 Every statement is idempotent - re-running the block is a no-op.

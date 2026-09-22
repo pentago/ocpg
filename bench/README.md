@@ -750,3 +750,81 @@ the `memory_recalls` table is a new additive migration
 `bench/generate.ts`'s DDL). `access_count`/`last_accessed_at` are untouched -
 still bumped on every recall, still unused by ranking, kept only as data
 that might back a future "never recalled" cleanup signal.
+
+## Embeddinggemma:300m migration - threshold re-verification (2026-09-21/22, `bun bench/embeddinggemma-calibration.ts` + re-run of `bun bench/ocpg-shaped-consolidate.ts`)
+
+Production's default embedding model switched from bge-m3 to
+embeddinggemma:300m (smaller, faster, better retrieval quality per earlier
+benchmarking). `CONSOLIDATE_EMBED_THRESHOLD` (0.83) was calibrated against
+bge-m3's specific cosine distribution - a different model has no guaranteed
+relationship to those numbers, so this re-ran the exact same calibration
+methodology from scratch rather than assuming the value carries over.
+
+**Step 0 finding**: the live production DB was already migrated (schema at
+`vector(768)`, all rows backfilled, `OCPG_EMBED_MODEL=embeddinggemma:300m`
+set) - only `ocpg.ts`'s hardcoded default and `bench/ollama-backends.ts`'s
+default had been changed (uncommitted), nothing else had followed through.
+
+**26-pair recalibration** (`bench/embeddinggemma-calibration.ts` - the same
+26 hand-labeled pairs from the deleted `bench/judge.ts`, recovered verbatim
+from git history at commit `4032d1d~1`, re-embedded with embeddinggemma:300m
+via the real production endpoint):
+
+| category  | min   | max   | mean  | n  | bge-m3 (for comparison) |
+| --------- | ----- | ----- | ----- | -- | ------------------------ |
+| duplicate | 0.789 | 0.925 | 0.866 | 8  | 0.784-0.956, mean .882 |
+| update    | 0.540 | 0.813 | 0.669 | 8  | 0.573-0.874, mean .775 |
+| distinct  | 0.332 | 0.749 | 0.473 | 10 | 0.505-0.760, mean .585 |
+
+embeddinggemma separates duplicate from distinct slightly *more* cleanly
+than bge-m3 did on this set (gap of 0.04 between duplicate-min and
+distinct-max, vs bge-m3's 0.024). 0.83 sits clear of every distinct pair
+here too.
+
+**Large-scale validation** (`bun bench/ocpg-shaped-consolidate.ts`, updated
+to take `--dims` so its scratch schema matches whichever model is
+configured - 808 pairs, re-run at the unchanged threshold 0.83 with
+embeddinggemma:300m):
+
+| metric                                              | bge-m3 (2026-09-20, after normalization fix) | embeddinggemma:300m (this run) |
+| ----------------------------------------------------- | -------------------- | -------------------------------- |
+| FPR (of what's auto-merged, after detail check)       | 0.005                | **0.002**                        |
+| true duplicates blocked (false-negative cost)         | 1/316 (0.3%)         | 1/281 (0.4%)                      |
+| `update-*` catch rate (pairs that reached threshold)  | 100% (0 clean merges) | 100% (0 clean merges), unchanged |
+| `[meaning-uncertain]` bucket size                     | ~20.5%               | 16.6%                             |
+
+Readings:
+
+1. **0.83 independently re-verified, not carried over.** Both the small
+   hand-labeled set and the large purpose-built corpus land on the same
+   number the bge-m3 calibration did - a genuine re-measurement that
+   happened to agree, not an assumption that "the model switch shouldn't
+   matter."
+2. **Every gate the bge-m3 migration had to clear, embeddinggemma clears
+   too, at the same or better numbers**: lower FPR, same 100% update-category
+   catch rate, lower false-negative cost. No regression from the model
+   switch on any axis this bench measures.
+3. **`ocpg.ts`'s threshold comment was rewritten** to cite these
+   embeddinggemma-specific numbers instead of the stale bge-m3-only ones,
+   per the "complete the embeddinggemma:300m migration" spec's explicit
+   requirement not to silently relabel an unverified value.
+4. **`deploy/backfill.ts`'s dimension guard was verified to actually fire**,
+   not just assumed to: tested against a throwaway `vector(1024)` column
+   (refused, named the mismatch) and again after correcting it to `768`
+   (succeeded). Full manual QA in the "complete the embeddinggemma:300m
+   migration" spec's session history.
+5. **Not re-measured**: the bge-m3-vs-embeddinggemma retrieval-quality
+   comparison the migration decision itself was based on (paraphrase recall,
+   latency) has no recorded artifact in this repo - `bench/embed.ts`
+   supports it (`--model`, parameterized), but reproducing it would need
+   pulling embeddinggemma onto the host GPU Ollama instance (it currently
+   only has bge-m3), an out-of-repo system change not made without asking.
+   The backend-latency table in `deploy/README.md` ("CPU suffices") also
+   still reflects bge-m3 measurements, not re-benchmarked for the same
+   reason - directionally still plausible (embeddinggemma is a smaller
+   model) but not independently confirmed.
+
+`bench/generate.ts` was checked and needs no change: it has no `embedding`
+column in its DDL at all (`bench/embed.ts` manages its own
+model-parameterized column dynamically via `ensureColumn`), so there is no
+hardcoded dimension there to drift from production.

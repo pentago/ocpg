@@ -21,7 +21,7 @@ const backends: Array<{ name: string; base: string }> = [
   { name: "container-cpu", base: opt("--cpu", "http://localhost:11444") },
 ];
 const iters = Number(opt("--iters", "20"));
-const MODEL = process.env.OCPG_EMBED_MODEL || "bge-m3";
+const MODEL = process.env.OCPG_EMBED_MODEL || "embeddinggemma:300m";
 
 // A realistic injection-path query and a realistic memory-sized write.
 const QUERY = "how do I rotate tls certificates without downtime";

@@ -1481,7 +1481,7 @@ describe("DB access layer", () => {
         expect(changed).toBe(true);
 
         // The stored vector must now BE an embedding of the new content, not
-        // the old: bge-m3 is deterministic, so same-text cosine is ~1.
+        // the old: embedding models are deterministic, so same-text cosine is ~1.
         const [row] = await __internals.sql`SELECT embedding::text AS e FROM memories WHERE id = ${id}` as { e: string }[];
         const storedVec = JSON.parse(row.e) as number[];
         const [oldVec, newVec] = (await __internals.embed([PARA_CONTENT, newContent], 5000)) as number[][];
@@ -1501,11 +1501,14 @@ describe("DB access layer", () => {
 
   describe("consolidate: embedding-based pass (meaning-level duplicates)", () => {
     // Cosine similarities for these exact fixtures were measured directly
-    // against bge-m3 before writing this test: the duplicate pair is ~0.946
-    // (above CONSOLIDATE_EMBED_THRESHOLD 0.83), the distinct pair ~0.57
-    // (comfortably below). Trigram Jaccard for both pairs is ~0.24-0.67,
-    // below DEDUP_SIMILARITY (0.8) - the wording pass must not catch either,
-    // so any group found here is provably the meaning pass's work.
+    // against the configured embedding model (embeddinggemma:300m as of the
+    // embeddinggemma migration, previously bge-m3): the duplicate pair is
+    // ~0.926 (above CONSOLIDATE_EMBED_THRESHOLD 0.83), the distinct pair
+    // ~0.21 (comfortably below - bge-m3 measured ~0.57 for the same pair, a
+    // different model's distribution, not a fixture change). Trigram
+    // Jaccard for both pairs is ~0.24-0.67, below DEDUP_SIMILARITY (0.8) -
+    // the wording pass must not catch either, so any group found here is
+    // provably the meaning pass's work.
     const untilEmbedded = async (id: number): Promise<boolean> => {
       for (let i = 0; i < 100; i++) {
         const [row] = await __internals.sql`SELECT embedding IS NOT NULL AS has FROM memories WHERE id = ${id}` as { has: boolean }[];
@@ -1855,10 +1858,14 @@ describe("DB access layer", () => {
     };
 
     test.skipIf(!hybridReady)("a rate-limit change (differing number, same shape) is NOT auto-merged - flagged [meaning-uncertain] instead", async () => {
-      // Cosine measured directly against bge-m3 for this exact fixture pair:
-      // ~0.898 (above CONSOLIDATE_EMBED_THRESHOLD 0.83); trigram Jaccard
-      // ~0.63 (below DEDUP_SIMILARITY 0.8) - the wording pass must not catch
-      // it, so any change in behavior here is provably the detail check.
+      // Cosine measured directly against the configured embedding model
+      // (embeddinggemma:300m as of the embeddinggemma migration, previously
+      // bge-m3) for this exact fixture pair including its "Fixture <marker>:"
+      // prefix: ~0.890 (above CONSOLIDATE_EMBED_THRESHOLD 0.83; bge-m3
+      // measured ~0.898 for the same pair - close, but re-verified, not
+      // assumed). Trigram Jaccard ~0.63 (below DEDUP_SIMILARITY 0.8) - the
+      // wording pass must not catch it, so any change in behavior here is
+      // provably the detail check.
       const project = "/tmp/ocpg-test-consolidate-uncertain-numbers";
       const marker = `zzzconsolratelimit${Date.now()}`;
       try {
@@ -1892,9 +1899,12 @@ describe("DB access layer", () => {
     });
 
     test.skipIf(!hybridReady)("a system-level vs user-level systemd unit path (differing path, same shape) is NOT auto-merged - flagged [meaning-uncertain] instead", async () => {
-      // Cosine measured directly for this fixture pair: ~0.930; trigram
-      // Jaccard ~0.52 - well below DEDUP_SIMILARITY, so the wording pass
-      // cannot be responsible for either outcome here.
+      // Cosine measured directly against the currently configured embedding
+      // model for this fixture pair: ~0.926 (embeddinggemma:300m; ~0.930
+      // with bge-m3 previously - close, but independently re-verified after
+      // the embeddinggemma migration, not assumed). Trigram Jaccard ~0.52 -
+      // well below DEDUP_SIMILARITY, so the wording pass cannot be
+      // responsible for either outcome here.
       const project = "/tmp/ocpg-test-consolidate-uncertain-paths";
       const marker = `zzzconsolsystemd${Date.now()}`;
       try {
@@ -2007,6 +2017,254 @@ describe("DB access layer", () => {
       expect(
         await matches("User created the systemd user service file at ~/.config/systemd/user/openfortivpn-origo.service and supporting wrapper scripts at ~/.config/waybar/indicators/openfortivpn-origo, toggle-vpn, and vpn.sh for starting, stopping, and checking service status"),
       ).toBe(false);
+    });
+  });
+
+  describe("supersede tracking (memory_remember `supersedes`, recall `includeSuperseded`)", () => {
+    const ctx = { directory: "/tmp/ocpg-test-supersede", sessionID: "supersede-t" };
+
+    test("supersedes links the old memory to the new one atomically", async () => {
+      try {
+        const old = await __internals.remember({ content: "Judge model ships as the write-time dedup path." }, ctx);
+        const oldId = Number(old.match(/#(\d+)/)?.[1]);
+
+        const result = await __internals.remember(
+          { content: "Judge model removed; memory_consolidate's meaning pass replaces it.", supersedes: oldId },
+          ctx,
+        );
+        expect(result).toContain("Stored memory #");
+        const newId = Number(result.match(/#(\d+)/)?.[1]);
+
+        const [row] = await __internals.sql`SELECT superseded_by FROM memories WHERE id = ${oldId}` as { superseded_by: number | null }[];
+        expect(row.superseded_by).toBe(newId);
+      } finally {
+        await __internals.sql`DELETE FROM memories WHERE project = ${ctx.directory}`;
+      }
+    });
+
+    test("a superseded memory is hidden from default recall and injection, but visible with includeSuperseded", async () => {
+      const marker = `zzzsuper${Date.now()}`;
+      try {
+        const old = await __internals.remember({ content: `Old fact ${marker} about the deploy gate, now stale.` }, ctx);
+        const oldId = Number(old.match(/#(\d+)/)?.[1]);
+        const created = await __internals.remember(
+          { content: `Corrected fact ${marker} about the deploy gate.`, supersedes: oldId },
+          ctx,
+        );
+        const newId = Number(created.match(/#(\d+)/)?.[1]);
+
+        const defaultRecall = await __internals.recall({ query: marker }, ctx);
+        expect(defaultRecall).not.toContain(`Old fact ${marker}`);
+        expect(defaultRecall).toContain(`Corrected fact ${marker}`);
+
+        const full = await __internals.recall({ query: marker, includeSuperseded: true }, ctx);
+        expect(full).toContain(`#${oldId} [superseded by #${newId}]`);
+        expect(full).toContain(`Old fact ${marker}`);
+
+        __internals.invalidateInjection(ctx.directory);
+        const output: { system: string[] } = { system: [] };
+        await __internals.handleTransform(output, ctx.directory, marker);
+        const block = output.system.join("");
+        expect(block).not.toContain(`Old fact ${marker}`);
+        expect(block).toContain(`Corrected fact ${marker}`);
+      } finally {
+        await __internals.sql`DELETE FROM memories WHERE project = ${ctx.directory}`;
+        __internals.invalidateInjection(ctx.directory);
+      }
+    });
+
+    test("supersedes rejects a non-integer id without touching the store", async () => {
+      const [before] = await __internals.sql`SELECT count(*) AS n FROM memories WHERE project = ${ctx.directory}` as { n: string }[];
+      expect(await __internals.remember({ content: "valid content here", supersedes: -1 }, ctx)).toContain("positive integer");
+      expect(await __internals.remember({ content: "valid content here", supersedes: 1.5 }, ctx)).toContain("positive integer");
+      const [after] = await __internals.sql`SELECT count(*) AS n FROM memories WHERE project = ${ctx.directory}` as { n: string }[];
+      expect(Number(after.n)).toBe(Number(before.n));
+    });
+
+    test("supersedes a nonexistent id fails and stores nothing", async () => {
+      const [before] = await __internals.sql`SELECT count(*) AS n FROM memories WHERE project = ${ctx.directory}` as { n: string }[];
+      const control = await __internals.remember(
+        { content: "Valid content that must not survive a bad supersede target." },
+        { ...ctx, sessionID: "supersede-t2" },
+      );
+      expect(control).toContain("Stored memory #");
+      const missing = await __internals.remember(
+        { content: "Valid content aimed at a supersede target that does not exist.", supersedes: 999999999 },
+        ctx,
+      );
+      expect(missing).toContain("ERROR");
+      expect(missing).toContain("no memory #999999999");
+      const [after] = await __internals.sql`SELECT count(*) AS n FROM memories WHERE project = ${ctx.directory}` as { n: string }[];
+      // Only the control call's row was added - the failed supersede stored nothing.
+      expect(Number(after.n)).toBe(Number(before.n) + 1);
+      await __internals.sql`DELETE FROM memories WHERE project = ${ctx.directory}`;
+    });
+
+    test("supersedes a foreign project's project_fact fails and rolls back the whole write", async () => {
+      const other = "/tmp/ocpg-test-supersede-other";
+      try {
+        const foreign = await __internals.remember(
+          { content: "Foreign project fact that must not be superseded remotely." },
+          { directory: other, sessionID: "o" },
+        );
+        const foreignId = Number(foreign.match(/#(\d+)/)?.[1]);
+
+        const [before] = await __internals.sql`SELECT count(*) AS n FROM memories WHERE project = ${ctx.directory}` as { n: string }[];
+        const result = await __internals.remember(
+          { content: "Attempted cross-project supersede, must not be stored anywhere.", supersedes: foreignId },
+          ctx,
+        );
+        expect(result).toContain("ERROR");
+        expect(result).toContain("belonging to");
+        expect(result).toContain("cannot supersede");
+
+        const [after] = await __internals.sql`SELECT count(*) AS n FROM memories WHERE project = ${ctx.directory}` as { n: string }[];
+        expect(Number(after.n)).toBe(Number(before.n));
+
+        const [row] = await __internals.sql`SELECT superseded_by FROM memories WHERE id = ${foreignId}` as { superseded_by: number | null }[];
+        expect(row.superseded_by).toBe(null);
+      } finally {
+        await __internals.sql`DELETE FROM memories WHERE project = ${other}`;
+      }
+    });
+
+    test("a stack_fact IS supersedable from another project - global types are shared", async () => {
+      const other = "/tmp/ocpg-test-supersede-stack-other";
+      try {
+        const stack = await __internals.remember(
+          { content: "Stack fact: old CI image tag pinning approach, soon replaced.", type: "stack_fact" },
+          { directory: other, sessionID: "o" },
+        );
+        const stackId = Number(stack.match(/#(\d+)/)?.[1]);
+
+        const result = await __internals.remember(
+          { content: "Stack fact, corrected: CI image now pins by digest, not tag.", type: "stack_fact", supersedes: stackId },
+          ctx,
+        );
+        expect(result).toContain("Stored memory #");
+        const [row] = await __internals.sql`SELECT superseded_by FROM memories WHERE id = ${stackId}` as { superseded_by: number | null }[];
+        expect(row.superseded_by).not.toBe(null);
+      } finally {
+        await __internals.sql`DELETE FROM memories WHERE project = ${other}`;
+        await __internals.sql`DELETE FROM memories WHERE project = ${ctx.directory}`;
+      }
+    });
+
+    test("forgetting the superseding memory un-supersedes the old one (ON DELETE SET NULL)", async () => {
+      try {
+        const old = await __internals.remember({ content: "Old note that will briefly be superseded, then un-superseded." }, ctx);
+        const oldId = Number(old.match(/#(\d+)/)?.[1]);
+        const created = await __internals.remember(
+          { content: "Replacement note, soon to be forgotten itself.", supersedes: oldId },
+          ctx,
+        );
+        const newId = Number(created.match(/#(\d+)/)?.[1]);
+
+        let [row] = await __internals.sql`SELECT superseded_by FROM memories WHERE id = ${oldId}` as { superseded_by: number | null }[];
+        expect(row.superseded_by).toBe(newId);
+
+        expect(await __internals.forget({ id: newId }, ctx)).toBe(`Deleted memory #${newId}.`);
+
+        [row] = await __internals.sql`SELECT superseded_by FROM memories WHERE id = ${oldId}` as { superseded_by: number | null }[];
+        expect(row.superseded_by).toBe(null);
+      } finally {
+        await __internals.sql`DELETE FROM memories WHERE project = ${ctx.directory}`;
+      }
+    });
+
+    test("forgetting or updating a superseded memory itself still works - ownership checks stay separate from currency", async () => {
+      try {
+        const old = await __internals.remember({ content: "Old note that stays forgettable even once superseded by another." }, ctx);
+        const oldId = Number(old.match(/#(\d+)/)?.[1]);
+        await __internals.remember(
+          { content: "Replacement note for the forgettable-once-superseded check above.", supersedes: oldId },
+          ctx,
+        );
+
+        expect(
+          await __internals.updateMemory({ id: oldId, content: "Edited superseded content - still allowed to edit it." }, ctx),
+        ).toBe(`Updated memory #${oldId}.`);
+        expect(await __internals.forget({ id: oldId }, ctx)).toBe(`Deleted memory #${oldId}.`);
+      } finally {
+        await __internals.sql`DELETE FROM memories WHERE project = ${ctx.directory}`;
+      }
+    });
+
+    test("memory_consolidate's wording pass skips a memory once it is superseded", async () => {
+      // Two near-identical rows (word-reordered restatement, same shape as
+      // the plain wording-pass test above) would normally be merged by
+      // consolidate's first pass - unless one of them is already superseded,
+      // in which case it's excluded from the candidate pool entirely and its
+      // near-dupe partner is left with nothing to cluster against.
+      const project = "/tmp/ocpg-test-consolidate-supersede-wording";
+      const original = "The release pipeline must pause for manual approval before touching the production database.";
+      const restated = "Before touching the production database, the release pipeline must pause for manual approval.";
+      try {
+        const a = await __internals.remember({ content: original }, { directory: project, sessionID: "csw" });
+        const aId = Number(a.match(/#(\d+)/)?.[1]);
+        const a2 = await __internals.remember({ content: restated }, { directory: project, sessionID: "csw" });
+        const a2Id = Number(a2.match(/#(\d+)/)?.[1]);
+        const c = await __internals.remember(
+          { content: "Replacement memory: the release pipeline's manual approval step was automated away.", supersedes: aId },
+          { directory: project, sessionID: "csw" },
+        );
+        const cId = Number(c.match(/#(\d+)/)?.[1]);
+
+        await __internals.consolidate();
+
+        const [rowA] = await __internals.sql`SELECT count(*) AS n FROM memories WHERE id = ${aId}` as { n: string }[];
+        const [rowA2] = await __internals.sql`SELECT count(*) AS n FROM memories WHERE id = ${a2Id}` as { n: string }[];
+        const [rowC] = await __internals.sql`SELECT count(*) AS n FROM memories WHERE id = ${cId}` as { n: string }[];
+        expect(Number(rowA.n)).toBe(1);
+        expect(Number(rowA2.n)).toBe(1);
+        expect(Number(rowC.n)).toBe(1);
+      } finally {
+        await __internals.sql`DELETE FROM memories WHERE project = ${project}`;
+        __internals.invalidateInjection(project);
+      }
+    });
+
+    test.skipIf(!hybridReady)("memory_consolidate's meaning pass skips a memory once it is superseded", async () => {
+      const project = "/tmp/ocpg-test-consolidate-supersede-meaning";
+      const marker = `zzzconsolsupersedemeaning${Date.now()}`;
+      const untilEmbedded = async (id: number): Promise<boolean> => {
+        for (let i = 0; i < 100; i++) {
+          const [row] = await __internals.sql`SELECT embedding IS NOT NULL AS has FROM memories WHERE id = ${id}` as { has: boolean }[];
+          if (row.has) return true;
+          await new Promise((r) => setTimeout(r, 100));
+        }
+        return false;
+      };
+      try {
+        const a = await __internals.remember(
+          { content: `Fixture ${marker}: the production database runs Postgres 16 on port 5432.` },
+          { directory: project, sessionID: "csm" },
+        );
+        const aId = Number(a.match(/#(\d+)/)?.[1]);
+        const a2 = await __internals.remember(
+          { content: `Fixture ${marker}: Postgres 16 is the production database version, listening on port 5432.` },
+          { directory: project, sessionID: "csm" },
+        );
+        const a2Id = Number(a2.match(/#(\d+)/)?.[1]);
+        expect(await untilEmbedded(aId)).toBe(true);
+        expect(await untilEmbedded(a2Id)).toBe(true);
+
+        const c = await __internals.remember(
+          { content: `Fixture ${marker}: replacement memory, the database was migrated off Postgres entirely.`, supersedes: aId },
+          { directory: project, sessionID: "csm" },
+        );
+        expect(c).toContain("Stored memory #");
+
+        await __internals.consolidate();
+
+        const [rowA] = await __internals.sql`SELECT count(*) AS n FROM memories WHERE id = ${aId}` as { n: string }[];
+        const [rowA2] = await __internals.sql`SELECT count(*) AS n FROM memories WHERE id = ${a2Id}` as { n: string }[];
+        expect(Number(rowA.n)).toBe(1);
+        expect(Number(rowA2.n)).toBe(1);
+      } finally {
+        await __internals.sql`DELETE FROM memories WHERE project = ${project}`;
+        __internals.invalidateInjection(project);
+      }
     });
   });
 });

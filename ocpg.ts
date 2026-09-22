@@ -24,6 +24,7 @@ type ForgetArgs = { id: number };
 type UpdateArgs = { id: number; content: string; tags?: string[]; type?: MemoryType };
 type TagsArgs = { limit?: number; global?: boolean };
 type ConsolidateArgs = { dryRun?: boolean };
+type RetagArgs = { old: string; new: string };
 
 // Defaults to "disable" so the common localhost setup is unchanged; set OCPG_SSL
 // when the database is remote, otherwise the SCRAM handshake crosses the network
@@ -799,6 +800,55 @@ async function listTags(args: TagsArgs, ctx: { directory: string }, client: SQL 
   }
 }
 
+// Only the length cap is worth enforcing here (mirrors validateWrite's tag
+// check, same error shape) - a rename target that would itself be an invalid
+// tag to write shouldn't be allowed to land via a different path.
+function validateRetag(args: RetagArgs): string | null {
+  if (typeof args.old !== "string" || args.old.length === 0) {
+    return "ERROR: old must be a non-empty tag string.";
+  }
+  if (typeof args.new !== "string" || args.new.length === 0) {
+    return "ERROR: new must be a non-empty tag string.";
+  }
+  if (args.new.length > MAX_TAG_LENGTH) {
+    return `ERROR: each tag must be a string of at most ${MAX_TAG_LENGTH} characters.`;
+  }
+  return null;
+}
+
+// Renames a tag across every row the caller can currently reach - same
+// project-boundary guard as forget/update (visibleRows()), not memory_tags'
+// global search flag: a write's reach is inherent to which rows the WHERE
+// clause can touch, not something to opt into widening. array_replace()
+// alone does NOT deduplicate: a row already tagged both `old` and `new`
+// would end up with `new` twice (verified directly against Postgres, not
+// assumed) - the DISTINCT/unnest wrap is required, not optional polish.
+async function retag(args: RetagArgs, ctx: { directory: string }): Promise<string> {
+  try {
+    const invalid = validateRetag(args);
+    if (invalid) return invalid;
+
+    const updated = await sql`
+      UPDATE memories
+      SET tags = ARRAY(SELECT DISTINCT unnest(array_replace(tags, ${args.old}, ${args.new})))
+      WHERE tags @> ARRAY[${args.old}]
+        AND ${visibleRows(sql, ctx.directory)}
+      RETURNING id
+    ` as { id: number }[];
+
+    if (updated.length === 0) {
+      return `No memories tagged "${args.old}".`;
+    }
+    // A rename can touch stack_fact/episodic rows visible from every
+    // project's injected block, so a per-directory invalidateInjection()
+    // isn't enough - same reasoning as memory_consolidate's real-removal clear.
+    injectionCache.clear();
+    return `Retagged ${updated.length} ${updated.length === 1 ? "memory" : "memories"}: "${args.old}" → "${args.new}".`;
+  } catch (e: unknown) {
+    return toolError("retag", "retag", e);
+  }
+}
+
 // Rejects rather than truncates: a clipped memory loses its tail silently,
 // while an error reports the actual size and lets the agent retry shorter.
 function validateWrite(args: RememberArgs): string | null {
@@ -1079,6 +1129,21 @@ function mutuallyVisible(client: SQL) {
   return client`((a.memory_type != 'project_fact' AND b.memory_type != 'project_fact') OR a.project = b.project)`;
 }
 
+// Same condition as mutuallyVisible(), but for the wording pass: its
+// similarity computation happens in TS (trigrams()/nearDupeSets()), not a SQL
+// join, so the guard has to be a plain boolean check on two already-fetched
+// rows instead of a SQL fragment. `a.project = b.project` is NULL-unsafe in
+// SQL (NULL never equals NULL); mirrored here explicitly rather than relying
+// on JS's `null === null` (true), which would silently disagree with the SQL
+// version for rows with no project set.
+function mutuallyVisibleRows(
+  a: { memory_type: string; project: string | null },
+  b: { memory_type: string; project: string | null },
+): boolean {
+  if (a.memory_type !== "project_fact" && b.memory_type !== "project_fact") return true;
+  return a.project !== null && b.project !== null && a.project === b.project;
+}
+
 // Excludes structurally templated, auto-generated content from the meaning
 // pass: verified against the real corpus (2026-09-19 audit, see AGENTS.md)
 // that three fixed sentence templates - background-task status logs from the
@@ -1265,11 +1330,11 @@ async function consolidate(args: ConsolidateArgs = {}): Promise<string> {
     // this pass to guess about - excluded the same way isTemplatedAutoLog
     // excludes a different kind of not-a-candidate row.
     const rows = await sql`
-      SELECT id, content, coalesce(tags, '{}') AS tags, created_at
+      SELECT id, content, coalesce(tags, '{}') AS tags, created_at, memory_type, project
       FROM memories
       WHERE superseded_by IS NULL
       ORDER BY created_at DESC
-    ` as { id: number; content: string; tags: string[]; created_at: Date }[];
+    ` as { id: number; content: string; tags: string[]; created_at: Date; memory_type: string; project: string | null }[];
 
     // Greedy clustering newest-first: each row joins the first cluster whose
     // representative (the newest member) it near-dupes. Trigram sets are built
@@ -1281,6 +1346,14 @@ async function consolidate(args: ConsolidateArgs = {}): Promise<string> {
     const clusters: Array<Array<Entry>> = [];
     for (const entry of entries) {
       const host = clusters.find((c) => {
+        // Comparisons are always against the cluster's anchor (c[0], the
+        // newest member that started it) - never against every existing
+        // member - so a single check here is enough to keep the whole
+        // cluster mutually visible: if the anchor is global, anything can
+        // join it (including rows from different projects, which is
+        // correct - the global row is what survives); if the anchor is a
+        // project_fact, only its own project's rows can join.
+        if (!mutuallyVisibleRows(c[0].row, entry.row)) return false;
         const ra = c[0].set.size;
         const rb = entry.set.size;
         // Jaccard >= 0.8 is impossible when one set is much smaller; the
@@ -1707,6 +1780,27 @@ const ocpg = Plugin.define({
           return { content: await listTags(input as TagsArgs, { directory }) };
         },
       });
+      editor.add({
+        name: "memory_retag",
+        options: { codemode: false },
+        description:
+          "Rename a tag across every memory that has it - e.g. after memory_tags shows both 'postgres' and " +
+          "'tool:postgres' exist, use this to collapse them into one. Only affects tags; content and type are " +
+          "untouched. project_fact memories can only be retagged from their origin project, same as " +
+          "memory_forget/memory_update.",
+        input: {
+          type: "object",
+          properties: {
+            old: { type: "string", description: "The existing tag to rename." },
+            new: { type: "string", description: "The tag to rename it to." },
+          },
+          required: ["old", "new"],
+          additionalProperties: false,
+        },
+        execute: async (input) => {
+          return { content: await retag(input as RetagArgs, { directory }) };
+        },
+      });
     });
 
     // Close the SQL pool when the last plugin instance unloads.
@@ -1730,6 +1824,8 @@ const __internals = {
   consolidate,
   listTags,
   resolveTagsLimit,
+  retag,
+  validateRetag,
   lengthNudge,
   extractMemoryRequest,  captureFromPrompt,
   invalidateInjection,
@@ -1761,6 +1857,7 @@ const __internals = {
   embedAndStore,
   storeEmbedding,
   CONSOLIDATE_EMBED_THRESHOLD,
+  mutuallyVisibleRows,
   isTemplatedAutoLog,
   extractDetails,
   detailConflicts,

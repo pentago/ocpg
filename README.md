@@ -143,7 +143,8 @@ Uses the `memories` table (`content`, `tags`, `session_id`, `project`,
 `memory_recalls` table (which sessions have recalled a memory, feeding a
 small ranking tiebreak) and the `pg_trgm` + `vector` extensions, and
 exposes `memory_recall` / `memory_remember` / `memory_forget` /
-`memory_update` / `memory_consolidate` / `memory_tags` tools.
+`memory_update` / `memory_consolidate` / `memory_tags` / `memory_retag`
+tools.
 
 ## Install
 
@@ -265,19 +266,24 @@ concurrently with the keyword query, well inside the query budget.
 
 ## Tools
 
-Six agent tools are registered: `memory_remember` (store),
+Seven agent tools are registered: `memory_remember` (store),
 `memory_recall` (search), `memory_forget` (delete by id), `memory_update`
 (rewrite an existing memory, keeping its original learned date),
-`memory_consolidate` (remove near-duplicates on demand), and
+`memory_consolidate` (remove near-duplicates on demand),
 `memory_tags` (list tags currently in use, with counts, to reuse an
-existing tag instead of minting a near-duplicate). The agent reads
-their usage rules from the tool schemas - as the user, the things worth
-knowing are:
+existing tag instead of minting a near-duplicate), and `memory_retag`
+(rename a tag across every memory that has it, once `memory_tags` shows
+two variants of the same tag exist). The agent reads their usage rules
+from the tool schemas - as the user, the things worth knowing are:
 
 - Visibility follows the type (see the table above); `memory_recall`
   takes `global: true` to also search other projects' `project_fact`
   memories (`stack_fact` is always searched regardless of this flag).
   `memory_tags` takes the same flag, plus `limit` (default 200).
+  `memory_retag` follows the same project-boundary rule as
+  `memory_forget`/`memory_update` (no `global` flag - a rename's reach
+  is whatever it's already allowed to touch, not something to opt into
+  widening).
 - Duplicate writes are **never rejected** - `memory_remember` is a plain
   store. Near-duplicates are collapsed out of the injected block
   automatically, and `memory_consolidate` cleans them up when you ask.
@@ -343,9 +349,9 @@ Both passes (`[wording]`, `[meaning]`) keep the newest of every group and
 delete the rest (capped at 25 groups per pass per run), returning the
 removed texts so the agent can merge back any unique detail with
 `memory_update`. `[meaning-uncertain]` pairs are the exception - nothing
-is deleted, they're only reported. The meaning pass also refuses to
-cluster across a project boundary that `memory_forget`/`memory_update`
-already won't cross. Near-duplicates are also collapsed out of the
+is deleted, they're only reported. Both passes refuse to cluster across
+a project boundary that `memory_forget`/`memory_update` already won't
+cross. Near-duplicates are also collapsed out of the
 injected block automatically between consolidations. The wording pass
 needs the trgm index; fresh installs from [`deploy/`](./deploy) get it
 automatically, existing databases run the upgrade block in

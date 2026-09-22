@@ -1,6 +1,6 @@
 {
   "name": "@dzhi/ocpg",
-  "version": "0.41.0",
+  "version": "0.42.0",
   "type": "module",
   "description": "Postgres-backed persistent memory plugin for OpenCode",
   "main": "ocpg.ts",

@@ -2063,6 +2063,123 @@ describe("DB access layer", () => {
     });
   });
 
+  describe("consolidate: wording pass project-boundary guard (regression, no embeddings needed)", () => {
+    // Unit-level regression net for mutuallyVisibleRows() itself, mirroring
+    // the isTemplatedAutoLog predicate test above: fast, no DB, no Ollama.
+    test("mutuallyVisibleRows: mirrors mutuallyVisible()'s SQL condition exactly", () => {
+      const projectFact = (project: string) => ({ memory_type: "project_fact", project });
+      const stackFact = (project: string) => ({ memory_type: "stack_fact", project });
+
+      // Two project_fact rows: same project visible, different project not.
+      expect(__internals.mutuallyVisibleRows(projectFact("/a"), projectFact("/a"))).toBe(true);
+      expect(__internals.mutuallyVisibleRows(projectFact("/a"), projectFact("/b"))).toBe(false);
+      // Global types are mutually visible regardless of project.
+      expect(__internals.mutuallyVisibleRows(stackFact("/a"), stackFact("/b"))).toBe(true);
+      // Mixed: one project_fact + one global, different projects -> NOT
+      // visible (mutuallyVisible requires EITHER both non-project_fact, OR
+      // same project - one side being global doesn't exempt the other).
+      expect(__internals.mutuallyVisibleRows(projectFact("/a"), stackFact("/b"))).toBe(false);
+      expect(__internals.mutuallyVisibleRows(stackFact("/a"), projectFact("/b"))).toBe(false);
+      // Mixed, same project: visible (the project_fact side's own project matches).
+      expect(__internals.mutuallyVisibleRows(projectFact("/a"), stackFact("/a"))).toBe(true);
+      // NULL-unsafe project comparison, mirroring SQL's NULL != NULL: two
+      // project_fact rows with no project set must NOT be treated as the
+      // same project just because both are null in JS.
+      expect(__internals.mutuallyVisibleRows({ memory_type: "project_fact", project: null }, { memory_type: "project_fact", project: null })).toBe(false);
+    });
+
+    // End-to-end: two near-verbatim project_fact memories from DIFFERENT
+    // projects must not be clustered/deleted by the wording pass, even
+    // though their content alone would clear the trigram threshold easily
+    // (same reordering trick used elsewhere in this suite for a same-project
+    // near-dupe pair).
+    test("QA: near-verbatim project_fact memories from different projects are NOT merged", async () => {
+      const projectA = `/tmp/ocpg-test-wordbound-a-${Date.now()}`;
+      const projectB = `/tmp/ocpg-test-wordbound-b-${Date.now()}`;
+      const marker = `zzzwordbound${Date.now()}`;
+      const original = `Fixture ${marker}: the staging cluster must be drained before any node pool upgrade, otherwise in-flight jobs are lost.`;
+      const restated = `Fixture ${marker}: before any node pool upgrade the staging cluster must be drained, otherwise in-flight jobs are lost.`;
+      try {
+        const aStored = await __internals.remember({ content: original }, { directory: projectA, sessionID: "wb" });
+        const aId = Number(aStored.match(/#(\d+)/)?.[1]);
+        const bStored = await __internals.remember({ content: restated }, { directory: projectB, sessionID: "wb" });
+        const bId = Number(bStored.match(/#(\d+)/)?.[1]);
+
+        const result = await __internals.consolidate();
+        expect(result).not.toContain(`#${aId}`);
+        expect(result).not.toContain(`#${bId}`);
+
+        const [rowA] = await __internals.sql`SELECT count(*) AS n FROM memories WHERE id = ${aId}` as { n: string }[];
+        const [rowB] = await __internals.sql`SELECT count(*) AS n FROM memories WHERE id = ${bId}` as { n: string }[];
+        expect(Number(rowA.n)).toBe(1);
+        expect(Number(rowB.n)).toBe(1);
+      } finally {
+        await __internals.sql`DELETE FROM memories WHERE project IN (${projectA}, ${projectB})`;
+        __internals.invalidateInjection(projectA);
+        __internals.invalidateInjection(projectB);
+      }
+    });
+
+    // Global types must remain clusterable across projects - this fix must
+    // not accidentally scope the whole wording pass down to per-project.
+    test("QA: near-verbatim stack_fact memories from different projects ARE still merged", async () => {
+      const projectA = `/tmp/ocpg-test-wordbound-global-a-${Date.now()}`;
+      const projectB = `/tmp/ocpg-test-wordbound-global-b-${Date.now()}`;
+      const marker = `zzzwordboundglobal${Date.now()}`;
+      const original = `Fixture ${marker}: the ArgoCD ApplicationSet needs a finalizer tweak before it can sync cleanly.`;
+      const restated = `Fixture ${marker}: before it can sync cleanly, the ArgoCD ApplicationSet needs a finalizer tweak.`;
+      try {
+        const aStored = await __internals.remember({ content: original, type: "stack_fact" }, { directory: projectA, sessionID: "wb" });
+        const aId = Number(aStored.match(/#(\d+)/)?.[1]);
+        const bStored = await __internals.remember({ content: restated, type: "stack_fact" }, { directory: projectB, sessionID: "wb" });
+        const bId = Number(bStored.match(/#(\d+)/)?.[1]);
+
+        const result = await __internals.consolidate();
+        expect(result).toContain("[wording]");
+        expect(result).toMatch(new RegExp(`removed #${aId}|removed #${bId}`));
+
+        const [rowA] = await __internals.sql`SELECT count(*) AS n FROM memories WHERE id = ${aId}` as { n: string }[];
+        const [rowB] = await __internals.sql`SELECT count(*) AS n FROM memories WHERE id = ${bId}` as { n: string }[];
+        expect(Number(rowA.n) + Number(rowB.n)).toBe(1);
+      } finally {
+        await __internals.sql`DELETE FROM memories WHERE project IN (${projectA}, ${projectB})`;
+        __internals.invalidateInjection(projectA);
+        __internals.invalidateInjection(projectB);
+      }
+    });
+
+    // Mixed pair, different projects: mutuallyVisible()'s exact condition
+    // (either both non-project_fact, OR same project) must be followed -
+    // one project_fact side means this pair is NOT mutually visible even
+    // though the other side is global.
+    test("QA: a project_fact + stack_fact pair from different projects is NOT merged", async () => {
+      const projectA = `/tmp/ocpg-test-wordbound-mixed-a-${Date.now()}`;
+      const projectB = `/tmp/ocpg-test-wordbound-mixed-b-${Date.now()}`;
+      const marker = `zzzwordboundmixed${Date.now()}`;
+      const original = `Fixture ${marker}: the on-call rotation must be updated before the sprint planning meeting starts.`;
+      const restated = `Fixture ${marker}: before the sprint planning meeting starts the on-call rotation must be updated.`;
+      try {
+        const aStored = await __internals.remember({ content: original }, { directory: projectA, sessionID: "wb" });
+        const aId = Number(aStored.match(/#(\d+)/)?.[1]);
+        const bStored = await __internals.remember({ content: restated, type: "stack_fact" }, { directory: projectB, sessionID: "wb" });
+        const bId = Number(bStored.match(/#(\d+)/)?.[1]);
+
+        const result = await __internals.consolidate();
+        expect(result).not.toContain(`#${aId}`);
+        expect(result).not.toContain(`#${bId}`);
+
+        const [rowA] = await __internals.sql`SELECT count(*) AS n FROM memories WHERE id = ${aId}` as { n: string }[];
+        const [rowB] = await __internals.sql`SELECT count(*) AS n FROM memories WHERE id = ${bId}` as { n: string }[];
+        expect(Number(rowA.n)).toBe(1);
+        expect(Number(rowB.n)).toBe(1);
+      } finally {
+        await __internals.sql`DELETE FROM memories WHERE project IN (${projectA}, ${projectB})`;
+        __internals.invalidateInjection(projectA);
+        __internals.invalidateInjection(projectB);
+      }
+    });
+  });
+
   describe("supersede tracking (memory_remember `supersedes`, recall `includeSuperseded`)", () => {
     const ctx = { directory: "/tmp/ocpg-test-supersede", sessionID: "supersede-t" };
 
@@ -2386,6 +2503,148 @@ describe("DB access layer", () => {
       } finally {
         await __internals.sql`DELETE FROM memories WHERE project = ${project}`;
         __internals.invalidateInjection(project);
+      }
+    });
+  });
+
+  describe("memory_retag: bulk tag rename", () => {
+    test("QA happy: renames a tag across projects respecting visibility - project_fact stays scoped, stack_fact goes anywhere", async () => {
+      const projectA = `/tmp/ocpg-test-retag-a-${Date.now()}`;
+      const projectB = `/tmp/ocpg-test-retag-b-${Date.now()}`;
+      const marker = `zzzretag${Date.now()}`;
+      const oldTag = `${marker}-old`;
+      const newTag = `${marker}-new`;
+      try {
+        const aStored = await __internals.remember(
+          { content: `Fixture ${marker}: project A's own fact.`, tags: [oldTag] },
+          { directory: projectA, sessionID: "rt" },
+        );
+        const aId = Number(aStored.match(/#(\d+)/)?.[1]);
+        const bStored = await __internals.remember(
+          { content: `Fixture ${marker}: project B's own fact, must stay untouched.`, tags: [oldTag] },
+          { directory: projectB, sessionID: "rt" },
+        );
+        const bId = Number(bStored.match(/#(\d+)/)?.[1]);
+        const globalStored = await __internals.remember(
+          { content: `Fixture ${marker}: a stack fact, visible everywhere.`, tags: [oldTag], type: "stack_fact" },
+          { directory: projectB, sessionID: "rt" },
+        );
+        const globalId = Number(globalStored.match(/#(\d+)/)?.[1]);
+
+        // Called from project A: only A's own project_fact row plus the
+        // global row are reachable/renamed - project B's project_fact row
+        // must stay on the old tag.
+        const result = await __internals.retag({ old: oldTag, new: newTag }, { directory: projectA });
+        expect(result).toBe(`Retagged 2 memories: "${oldTag}" → "${newTag}".`);
+
+        const [rowA] = await __internals.sql`SELECT tags FROM memories WHERE id = ${aId}` as { tags: string[] }[];
+        const [rowB] = await __internals.sql`SELECT tags FROM memories WHERE id = ${bId}` as { tags: string[] }[];
+        const [rowGlobal] = await __internals.sql`SELECT tags FROM memories WHERE id = ${globalId}` as { tags: string[] }[];
+        expect(rowA.tags).toContain(newTag);
+        expect(rowA.tags).not.toContain(oldTag);
+        expect(rowB.tags).toContain(oldTag);
+        expect(rowB.tags).not.toContain(newTag);
+        expect(rowGlobal.tags).toContain(newTag);
+      } finally {
+        await __internals.sql`DELETE FROM memories WHERE project IN (${projectA}, ${projectB})`;
+        __internals.invalidateInjection(projectA);
+        __internals.invalidateInjection(projectB);
+      }
+    });
+
+    test("QA: a row already tagged both old and new ends up with exactly one instance of new, not a duplicate", async () => {
+      const project = `/tmp/ocpg-test-retag-collapse-${Date.now()}`;
+      const marker = `zzzretagcollapse${Date.now()}`;
+      const oldTag = `${marker}-old`;
+      const newTag = `${marker}-new`;
+      try {
+        const stored = await __internals.remember(
+          { content: `Fixture ${marker}: already carries both tags.`, tags: [oldTag, newTag] },
+          { directory: project, sessionID: "rt" },
+        );
+        const id = Number(stored.match(/#(\d+)/)?.[1]);
+
+        const result = await __internals.retag({ old: oldTag, new: newTag }, { directory: project });
+        expect(result).toBe(`Retagged 1 memory: "${oldTag}" → "${newTag}".`);
+
+        const [row] = await __internals.sql`SELECT tags FROM memories WHERE id = ${id}` as { tags: string[] }[];
+        expect(row.tags.filter((t) => t === newTag).length).toBe(1);
+        expect(row.tags).not.toContain(oldTag);
+      } finally {
+        await __internals.sql`DELETE FROM memories WHERE project = ${project}`;
+        __internals.invalidateInjection(project);
+      }
+    });
+
+    test("QA edge: renaming a tag that doesn't exist anywhere returns the zero-match message, doesn't error", async () => {
+      const missingTag = `zzzretag-nonexistent-${Date.now()}`;
+      const result = await __internals.retag(
+        { old: missingTag, new: "whatever" },
+        { directory: `/tmp/ocpg-test-retag-none-${Date.now()}` },
+      );
+      expect(result).toBe(`No memories tagged "${missingTag}".`);
+    });
+
+    test("QA edge: new exceeding MAX_TAG_LENGTH is rejected with the tag-validation error shape, no rows touched", async () => {
+      const project = `/tmp/ocpg-test-retag-toolong-${Date.now()}`;
+      const marker = `zzzretaglong${Date.now()}`;
+      const oldTag = `${marker}-old`;
+      try {
+        const stored = await __internals.remember(
+          { content: `Fixture ${marker}: should not be touched.`, tags: [oldTag] },
+          { directory: project, sessionID: "rt" },
+        );
+        const id = Number(stored.match(/#(\d+)/)?.[1]);
+
+        const result = await __internals.retag({ old: oldTag, new: "x".repeat(65) }, { directory: project });
+        expect(result).toBe("ERROR: each tag must be a string of at most 64 characters.");
+
+        const [row] = await __internals.sql`SELECT tags FROM memories WHERE id = ${id}` as { tags: string[] }[];
+        expect(row.tags).toEqual([oldTag]);
+      } finally {
+        await __internals.sql`DELETE FROM memories WHERE project = ${project}`;
+        __internals.invalidateInjection(project);
+      }
+    });
+
+    test("QA: retag invalidates the injected block everywhere, not just the calling project (stack_fact tags are global)", async () => {
+      const projectA = `/tmp/ocpg-test-retag-cache-a-${Date.now()}`;
+      const projectB = `/tmp/ocpg-test-retag-cache-b-${Date.now()}`;
+      const marker = `zzzretagcache${Date.now()}`;
+      const oldTag = `${marker}-old`;
+      const newTag = `${marker}-new`;
+      try {
+        __internals.setInjectionMode("relevance");
+        const stored = await __internals.remember(
+          { content: `Fixture ${marker}: a globally visible stack fact for cache invalidation.`, tags: [oldTag], type: "stack_fact" },
+          { directory: projectA, sessionID: "rt" },
+        );
+        const id = Number(stored.match(/#(\d+)/)?.[1]);
+
+        // Prime project B's injection cache with a prompt that surfaces this
+        // memory - project B never wrote it, but the global type must still
+        // be visible and cached there.
+        __internals.invalidateInjection(projectB);
+        const prompt = __internals.extractPromptQuery([{ role: "user", content: [{ type: "text", text: marker }] }]);
+        const before: { system: string[] } = { system: [] };
+        await __internals.handleTransform(before, projectB, prompt);
+        expect(before.system.join("")).toContain(`[${oldTag}]`);
+
+        const result = await __internals.retag({ old: oldTag, new: newTag }, { directory: projectA });
+        expect(result).toBe(`Retagged 1 memory: "${oldTag}" → "${newTag}".`);
+
+        // Same prompt, same (now-different) project B cache key: must reflect
+        // the rename, proving the retag cleared the cache globally rather
+        // than just for projectA.
+        const after: { system: string[] } = { system: [] };
+        await __internals.handleTransform(after, projectB, prompt);
+        expect(after.system.join("")).toContain(`[${newTag}]`);
+        expect(after.system.join("")).not.toContain(`[${oldTag}]`);
+        void id;
+      } finally {
+        await __internals.sql`DELETE FROM memories WHERE project = ${projectA}`;
+        __internals.invalidateInjection(projectA);
+        __internals.invalidateInjection(projectB);
       }
     });
   });

@@ -1,6 +1,6 @@
 {
   "name": "@dzhi/ocpg",
-  "version": "0.30.0",
+  "version": "0.40.0",
   "type": "module",
   "description": "Postgres-backed persistent memory plugin for OpenCode",
   "main": "ocpg.ts",
@@ -19,6 +19,7 @@
     "bench:cross-session": "bun bench/cross-session.ts",
     "bench:qqp-consolidate": "bun bench/qqp-consolidate.ts",
     "bench:ocpg-shaped-consolidate": "bun bench/ocpg-shaped-consolidate.ts",
+    "bench:embeddinggemma-calibration": "bun bench/embeddinggemma-calibration.ts",
     "backfill": "bun deploy/backfill.ts"
   },
   "exports": {

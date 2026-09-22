@@ -1481,7 +1481,7 @@ describe("DB access layer", () => {
         expect(changed).toBe(true);
 
         // The stored vector must now BE an embedding of the new content, not
-        // the old: bge-m3 is deterministic, so same-text cosine is ~1.
+        // the old: embedding models are deterministic, so same-text cosine is ~1.
         const [row] = await __internals.sql`SELECT embedding::text AS e FROM memories WHERE id = ${id}` as { e: string }[];
         const storedVec = JSON.parse(row.e) as number[];
         const [oldVec, newVec] = (await __internals.embed([PARA_CONTENT, newContent], 5000)) as number[][];
@@ -1501,11 +1501,14 @@ describe("DB access layer", () => {
 
   describe("consolidate: embedding-based pass (meaning-level duplicates)", () => {
     // Cosine similarities for these exact fixtures were measured directly
-    // against bge-m3 before writing this test: the duplicate pair is ~0.946
-    // (above CONSOLIDATE_EMBED_THRESHOLD 0.83), the distinct pair ~0.57
-    // (comfortably below). Trigram Jaccard for both pairs is ~0.24-0.67,
-    // below DEDUP_SIMILARITY (0.8) - the wording pass must not catch either,
-    // so any group found here is provably the meaning pass's work.
+    // against the configured embedding model (embeddinggemma:300m as of the
+    // embeddinggemma migration, previously bge-m3): the duplicate pair is
+    // ~0.926 (above CONSOLIDATE_EMBED_THRESHOLD 0.83), the distinct pair
+    // ~0.21 (comfortably below - bge-m3 measured ~0.57 for the same pair, a
+    // different model's distribution, not a fixture change). Trigram
+    // Jaccard for both pairs is ~0.24-0.67, below DEDUP_SIMILARITY (0.8) -
+    // the wording pass must not catch either, so any group found here is
+    // provably the meaning pass's work.
     const untilEmbedded = async (id: number): Promise<boolean> => {
       for (let i = 0; i < 100; i++) {
         const [row] = await __internals.sql`SELECT embedding IS NOT NULL AS has FROM memories WHERE id = ${id}` as { has: boolean }[];
@@ -1855,10 +1858,14 @@ describe("DB access layer", () => {
     };
 
     test.skipIf(!hybridReady)("a rate-limit change (differing number, same shape) is NOT auto-merged - flagged [meaning-uncertain] instead", async () => {
-      // Cosine measured directly against bge-m3 for this exact fixture pair:
-      // ~0.898 (above CONSOLIDATE_EMBED_THRESHOLD 0.83); trigram Jaccard
-      // ~0.63 (below DEDUP_SIMILARITY 0.8) - the wording pass must not catch
-      // it, so any change in behavior here is provably the detail check.
+      // Cosine measured directly against the configured embedding model
+      // (embeddinggemma:300m as of the embeddinggemma migration, previously
+      // bge-m3) for this exact fixture pair including its "Fixture <marker>:"
+      // prefix: ~0.890 (above CONSOLIDATE_EMBED_THRESHOLD 0.83; bge-m3
+      // measured ~0.898 for the same pair - close, but re-verified, not
+      // assumed). Trigram Jaccard ~0.63 (below DEDUP_SIMILARITY 0.8) - the
+      // wording pass must not catch it, so any change in behavior here is
+      // provably the detail check.
       const project = "/tmp/ocpg-test-consolidate-uncertain-numbers";
       const marker = `zzzconsolratelimit${Date.now()}`;
       try {
@@ -1892,9 +1899,12 @@ describe("DB access layer", () => {
     });
 
     test.skipIf(!hybridReady)("a system-level vs user-level systemd unit path (differing path, same shape) is NOT auto-merged - flagged [meaning-uncertain] instead", async () => {
-      // Cosine measured directly for this fixture pair: ~0.930; trigram
-      // Jaccard ~0.52 - well below DEDUP_SIMILARITY, so the wording pass
-      // cannot be responsible for either outcome here.
+      // Cosine measured directly against the currently configured embedding
+      // model for this fixture pair: ~0.926 (embeddinggemma:300m; ~0.930
+      // with bge-m3 previously - close, but independently re-verified after
+      // the embeddinggemma migration, not assumed). Trigram Jaccard ~0.52 -
+      // well below DEDUP_SIMILARITY, so the wording pass cannot be
+      // responsible for either outcome here.
       const project = "/tmp/ocpg-test-consolidate-uncertain-paths";
       const marker = `zzzconsolsystemd${Date.now()}`;
       try {

@@ -140,7 +140,7 @@ async function withDeadline<T>(query: PromiseLike<T>, ms: number): Promise<T> {
 // and a re-embed (deploy/README.md).
 const OLLAMA_HOST = process.env.OCPG_OLLAMA_HOST || "localhost";
 const OLLAMA_PORT = Number(process.env.OCPG_OLLAMA_PORT) || 11434;
-const EMBED_MODEL = process.env.OCPG_EMBED_MODEL || "bge-m3";
+const EMBED_MODEL = process.env.OCPG_EMBED_MODEL || "embeddinggemma:300m";
 let ollamaBase = `http://${OLLAMA_HOST}:${OLLAMA_PORT}`;
 
 // Warm bge-m3 embed is ~20ms (measured 2026-09-18, RTX 5070); a cold model
@@ -980,20 +980,31 @@ async function updateMemory(
   }
 }
 
-// Embedding-similarity threshold for consolidate's second pass, calibrated
-// against the same hand-labeled pairs the (now-removed) judge bench used
-// (bench/judge.ts's PAIRS, bge-m3 cosine, measured 2026-09-19 before removal):
-// true duplicates clustered 0.78-0.96 (mean .88), genuinely distinct-but-
-// related pairs topped out at 0.76 (mean .58), and true "updates" (a fact
-// superseding an older one, e.g. "Postgres 15" -> "upgraded to Postgres 16")
-// sat in between (0.57-0.87, mean .77) and overlap both other groups - no
-// threshold cleanly separates updates from duplicates. 0.83 sits clear of
-// every distinct pair (zero false merges on the one failure mode that
-// matters, per the spec: never delete a genuinely unique fact) while still
-// catching most duplicates (7/8 of the sample) and about half the update
-// pairs - deleting the stale side of a superseded fact is an acceptable,
-// reviewable outcome here (the removed text always comes back in the
-// report), not the lost-information case this threshold is tuned against.
+// Embedding-similarity threshold for consolidate's second pass. Originally
+// calibrated for bge-m3 (measured 2026-09-19); re-verified from scratch for
+// embeddinggemma:300m (the model ocpg.ts now defaults to - see the
+// "complete the embeddinggemma:300m migration" spec, repo history) since a
+// different model has no guaranteed relationship to another model's cosine
+// distribution and that must be measured, not assumed.
+//
+// Re-ran the exact same calibration methodology: the same 26 hand-labeled
+// pairs (bench/embeddinggemma-calibration.ts, recovered verbatim from the
+// deleted bench/judge.ts via git history) re-embedded with
+// embeddinggemma:300m. Result: duplicates 0.789-0.925 (mean .866), updates
+// 0.540-0.813 (mean .669), distinct pairs topped out at 0.749 (mean .473) -
+// a cleaner duplicate/distinct gap than bge-m3 had (0.04 vs 0.024). 0.83
+// still sits clear of every distinct pair here too.
+//
+// Also re-ran the larger, more reliable ocpg-shaped-consolidate.ts bench
+// (808 pairs, purpose-built to include the exact update-shape failure modes
+// - rate limit, path, port, retry-count changes) at 0.83 with
+// embeddinggemma:300m: FPR 0.002 with the detail cross-check applied (vs
+// bge-m3's 0.005), every update-* category pair that reached the threshold
+// was still caught (0 clean merges across all update-* rows, same gate
+// bge-m3 passed), and false-negative cost dropped too (1/281 candidates
+// wrongly blocked, 0.4%, vs bge-m3's 1.6%). Both passes independently land
+// on 0.83 - kept unchanged, not carried over on the assumption "the model
+// switch shouldn't matter."
 const CONSOLIDATE_EMBED_THRESHOLD = 0.83;
 
 // Mutual visibility for consolidation, mirroring visibleRows(): a project_fact

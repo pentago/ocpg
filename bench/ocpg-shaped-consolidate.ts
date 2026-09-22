@@ -34,7 +34,7 @@
 //
 // Setup: none beyond a reachable Ollama + a CREATEDB-capable OCPG_* user -
 // the corpus is generated in-process, no external dataset download.
-//   bun bench/ocpg-shaped-consolidate.ts [--ollama http://localhost:11434]
+//   bun bench/ocpg-shaped-consolidate.ts [--ollama http://localhost:11434] [--dims 1024]
 //
 // Uses a dedicated scratch database (`ocpg-shaped-consolidate-bench`) -
 // never `agent-memory-bench-*`, never the real DB. Not a change to
@@ -51,7 +51,22 @@ const opt = (name: string, fallback: string): string => {
   const i = args.indexOf(name);
   return i >= 0 ? args[i + 1] : fallback;
 };
-__internals.setOllamaBase(opt("--ollama", process.env.OCPG_BENCH_OLLAMA ?? "http://localhost:11434"));
+__internals.setOllamaBase(
+  opt(
+    "--ollama",
+    process.env.OCPG_BENCH_OLLAMA ??
+      `http://${process.env.OCPG_OLLAMA_HOST || "localhost"}:${process.env.OCPG_OLLAMA_PORT || "11434"}`,
+  ),
+);
+// The vector column's dimension must match whatever model ocpg.ts is
+// currently configured to embed with (OCPG_EMBED_MODEL) - there is no way to
+// derive dimension from a model name, so it's an explicit flag rather than
+// inferred. Defaults to embeddinggemma:300m's 768, the shipped default as of
+// the embeddinggemma migration; pass --dims 1024 to reproduce against bge-m3.
+const DIMS = Number(opt("--dims", "768"));
+// Purely for the printed log line - EMBED_MODEL itself is module-private in
+// ocpg.ts, so embed() always uses whatever it actually resolved to.
+const MODEL_LABEL = process.env.OCPG_EMBED_MODEL || "embeddinggemma:300m";
 
 const DB_NAME = "ocpg-shaped-consolidate-bench";
 const PROJECT = "/bench/ocpg-shaped-consolidate";
@@ -202,7 +217,7 @@ CREATE TABLE memories (
   project       text,
   created_at    timestamptz DEFAULT now(),
   memory_type   text        NOT NULL DEFAULT 'project_fact',
-  embedding     vector(1024),
+  embedding     vector(${DIMS}),
   CONSTRAINT memories_type_check CHECK (memory_type IN ('stack_fact', 'project_fact', 'episodic'))
 );
 CREATE INDEX idx_memories_embedding ON memories USING hnsw (embedding vector_cosine_ops);
@@ -244,7 +259,7 @@ try {
   }
   console.log(`Inserted ${pairs.length * 2} memories, ${pairs.length} ground-truth rows.`);
 
-  console.log("Embedding rows via the real pipeline (__internals.embed, bge-m3)...");
+  console.log(`Embedding rows via the real pipeline (__internals.embed, ${MODEL_LABEL})...`);
   const allRows = (await db`SELECT id, content FROM memories ORDER BY id`) as { id: number; content: string }[];
   const EMBED_BATCH = 100;
   let embedded = 0;

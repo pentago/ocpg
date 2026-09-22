@@ -9,8 +9,10 @@ psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" <<-'EOSQL'
 	-- plugin falls back to a weaker full-text rule that misses near-duplicates.
 	CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
-	-- pgvector backs the embedding half of hybrid retrieval (bge-m3 via Ollama,
-	-- 1024 dims - the column dimension is tied to the embedding model).
+	-- pgvector backs the embedding half of hybrid retrieval (embeddinggemma:300m
+	-- via Ollama, 768 dims - the column dimension is tied to the embedding
+	-- model; a different OCPG_EMBED_MODEL needs this column re-created at that
+	-- model's size, see deploy/README.md).
 	CREATE EXTENSION IF NOT EXISTS vector;
 
 	-- superseded_by (supersede tracking): set by memory_remember's
@@ -31,7 +33,7 @@ psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" <<-'EOSQL'
 	  last_accessed_at timestamptz,
 	  updated_at    timestamptz,
 	  search_vector tsvector GENERATED ALWAYS AS (to_tsvector('english', content)) STORED,
-	  embedding     vector(1024),
+	  embedding     vector(768),
 	  superseded_by integer     REFERENCES memories(id) ON DELETE SET NULL,
 	  CONSTRAINT memories_type_check
 	    CHECK (memory_type IN ('stack_fact', 'project_fact', 'episodic'))

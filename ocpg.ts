@@ -22,6 +22,8 @@ type RememberArgs = {
 };
 type ForgetArgs = { id: number };
 type UpdateArgs = { id: number; content: string; tags?: string[]; type?: MemoryType };
+type TagsArgs = { limit?: number; global?: boolean };
+type ConsolidateArgs = { dryRun?: boolean };
 
 // Defaults to "disable" so the common localhost setup is unchanged; set OCPG_SSL
 // when the database is remote, otherwise the SCRAM handshake crosses the network
@@ -576,6 +578,23 @@ const MIN_CONTENT = 10;
 const MAX_TAGS = 10;
 const MAX_TAG_LENGTH = 64;
 
+// Soft nudge only - never a rejection. Sits just above the injection block's
+// 600-char truncation point (formatBlock): past this length, injection would
+// cut the entry off anyway, so write time is the natural place to say so.
+const CONTENT_LENGTH_NUDGE = 700;
+
+// A write past this length still succeeds; the response just says so, so the
+// calling agent can shorten future entries instead of finding out later that
+// most of a long memory never made it into ambient context.
+function lengthNudge(content: string): string {
+  if (content.length <= CONTENT_LENGTH_NUDGE) return "";
+  return (
+    ` Note: this entry is ${content.length.toLocaleString()} characters - injection truncates at 600, ` +
+    "so most of this won't be visible in ambient context. Consider shortening to the essential " +
+    "1-3 sentences and putting longer rationale in project docs."
+  );
+}
+
 // --- Memory types (plan 2.1: defaulted, never required) ---
 
 // The stored vocabulary mirrors the DB CHECK constraint (memories_type_check);
@@ -598,6 +617,21 @@ function resolveLimit(raw: unknown): number {
   const n = Number(raw);
   if (!Number.isFinite(n)) return 5;
   return Math.min(Math.max(Math.trunc(n), 1), 20);
+}
+
+// memory_tags lists distinct tags, not rows - a much cheaper result per unit,
+// so its default and cap are both higher than recall's. Ordering (uses DESC,
+// tag ASC) is not itself the issue an earlier review raised; the default
+// value was. Verified against this project's own live corpus: it already
+// carries ~50 distinct tags, so a default of 50 silently starved rare/new
+// tags out of the ordinary (no-limit) call - exactly the tags this tool
+// exists to surface (an established, high-count tag needs no lookup; a
+// candidate that might already exist as a one-off does). 200 gives a
+// realistic personal/team corpus headroom before the hard 500 cap.
+function resolveTagsLimit(raw: unknown): number {
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return 200;
+  return Math.min(Math.max(Math.trunc(n), 1), 500);
 }
 
 // The model sees a generic failure; the operator sees the real message in the
@@ -736,6 +770,35 @@ async function recall(
   }
 }
 
+// Lists distinct tags in use, with counts, so a caller can reuse an
+// established tag instead of minting a near-duplicate (e.g. "postgres" vs
+// "tool:postgres"). Same visibility rule as every other read path; superseded
+// rows' tags are excluded (history, not active vocabulary). unnest over the
+// existing tags[] needs no new index at this corpus size - the GIN index on
+// tags is for the `@>` containment filter recall uses, not this aggregate.
+// `client` defaults to the module pool, same as visibleRows/notSuperseded -
+// a test can pass a dedicated connection pointed at an isolated schema to
+// exercise a genuinely empty table without touching real data.
+async function listTags(args: TagsArgs, ctx: { directory: string }, client: SQL = sql): Promise<string> {
+  try {
+    const limit = resolveTagsLimit(args.limit);
+    const visibleCond = args.global ? client`` : client`AND ${visibleRows(client, ctx.directory)}`;
+    const rows = await client`
+      SELECT tag, count(*) AS uses
+      FROM memories, unnest(tags) AS tag
+      WHERE 1=1 ${visibleCond} AND ${notSuperseded(client)}
+      GROUP BY tag
+      ORDER BY uses DESC, tag ASC
+      LIMIT ${limit}
+    ` as { tag: string; uses: string }[];
+
+    if (rows.length === 0) return "No tags found.";
+    return rows.map((r) => `${r.tag} (${r.uses})`).join("\n");
+  } catch (e: unknown) {
+    return toolError("tags", "tags", e);
+  }
+}
+
 // Rejects rather than truncates: a clipped memory loses its tail silently,
 // while an error reports the actual size and lets the agent retry shorter.
 function validateWrite(args: RememberArgs): string | null {
@@ -846,7 +909,7 @@ async function remember(
     // what's current for every project too (the old row stops surfacing),
     // same as any other write.
     invalidateInjection(ctx.directory);
-    return `Stored memory #${newId} (project ${basename}).`;
+    return `Stored memory #${newId} (project ${basename}).${lengthNudge(args.content)}`;
   } catch (e: unknown) {
     if (e instanceof SupersedeError) return `ERROR: ${e.message}`;
     return toolError("remember", "remember", e);
@@ -974,7 +1037,7 @@ async function updateMemory(
     // Content changed, so the embedding must follow - same fire-and-forget
     // path as remember.
     void embedAndStore(id, args.content);
-    return `Updated memory #${id}.`;
+    return `Updated memory #${id}.${lengthNudge(args.content)}`;
   } catch (e: unknown) {
     return toolError("update", "update", e);
   }
@@ -1189,7 +1252,12 @@ function detailConflicts(a: DetailSet, b: DetailSet): string[] {
 // detailConflicts: a specific number/path/name that differs between an
 // otherwise-similar pair blocks the auto-merge and routes that pair to
 // [meaning-uncertain] in the report instead (see extractDetails' comment).
-async function consolidate(): Promise<string> {
+async function consolidate(args: ConsolidateArgs = {}): Promise<string> {
+  const dryRun = args.dryRun === true;
+  // Report wording only - the clustering/threshold/exclusion logic below runs
+  // identically in both modes; this just labels what happened to each row and
+  // gates whether the DELETE statements actually execute.
+  const verb = dryRun ? "would remove" : "removed";
   try {
     // --- Pass 1: wording (trigram similarity over content) ---
     // Superseded rows are already-resolved history (an explicit decision was
@@ -1230,19 +1298,27 @@ async function consolidate(): Promise<string> {
     let removedGroups = 0;
     let uncertainPairs = 0;
     const report: string[] = [];
+    // Tracked regardless of dryRun: in a real run these rows are physically
+    // gone by the time pass 2 queries, so pass 2 never sees them; in a dry
+    // run nothing was actually deleted, so pass 2 must exclude them itself to
+    // see the same candidate set a real run would (and match its report).
+    const wordingRemovedIds: number[] = [];
     for (const cluster of wordingGroups) {
       const survivor = cluster[0].row;
       const removedRows = cluster.slice(1).map((e) => e.row);
-      for (const r of removedRows) {
-        await sql`DELETE FROM memories WHERE id = ${r.id}`;
+      if (!dryRun) {
+        for (const r of removedRows) {
+          await sql`DELETE FROM memories WHERE id = ${r.id}`;
+        }
       }
+      for (const r of removedRows) wordingRemovedIds.push(r.id);
       removed += removedRows.length;
       removedGroups++;
       // Show what died so the calling agent can merge unique facts back into
       // the survivor.
       report.push(
         `[wording] Kept #${survivor.id}: ${truncateMemory(survivor.content)}\n` +
-          removedRows.map((r) => `  removed #${r.id}: ${truncateMemory(r.content)}`).join("\n"),
+          removedRows.map((r) => `  ${verb} #${r.id}: ${truncateMemory(r.content)}`).join("\n"),
       );
     }
 
@@ -1263,6 +1339,8 @@ async function consolidate(): Promise<string> {
         AND b.embedding IS NOT NULL
         AND a.superseded_by IS NULL
         AND b.superseded_by IS NULL
+        AND a.id <> ALL(${sql.array(wordingRemovedIds, "int8")})
+        AND b.id <> ALL(${sql.array(wordingRemovedIds, "int8")})
         AND (1 - (a.embedding <=> b.embedding)) >= ${CONSOLIDATE_EMBED_THRESHOLD}
         AND ${mutuallyVisible(sql)}
         AND NOT ${isTemplatedAutoLogPair(sql)}
@@ -1277,6 +1355,7 @@ async function consolidate(): Promise<string> {
         SELECT id, content, coalesce(tags, '{}') AS tags, created_at
         FROM memories
         WHERE embedding IS NOT NULL AND superseded_by IS NULL AND NOT ${isTemplatedAutoLog(sql)}
+          AND id <> ALL(${sql.array(wordingRemovedIds, "int8")})
         ORDER BY created_at DESC
       `) as { id: number; content: string; tags: string[]; created_at: Date }[];
 
@@ -1307,14 +1386,14 @@ async function consolidate(): Promise<string> {
         }
 
         for (const r of clean) {
-          await sql`DELETE FROM memories WHERE id = ${r.id}`;
+          if (!dryRun) await sql`DELETE FROM memories WHERE id = ${r.id}`;
         }
         removed += clean.length;
         if (clean.length > 0) {
           removedGroups++;
           report.push(
             `[meaning] Kept #${survivor.id}: ${truncateMemory(survivor.content)}\n` +
-              clean.map((r) => `  removed #${r.id}: ${truncateMemory(r.content)}`).join("\n"),
+              clean.map((r) => `  ${verb} #${r.id}: ${truncateMemory(r.content)}`).join("\n"),
           );
         }
         for (const u of uncertain) {
@@ -1330,14 +1409,19 @@ async function consolidate(): Promise<string> {
 
     if (report.length === 0) return "No duplicates found; nothing to consolidate.";
 
-    if (removed > 0) injectionCache.clear();
+    if (removed > 0 && !dryRun) injectionCache.clear();
     const summary: string[] = [];
+    if (dryRun) {
+      summary.push("DRY RUN - nothing was deleted. Re-run without dryRun (or with dryRun: false) to actually remove these.");
+    }
     if (removed > 0) {
       summary.push(
-        `Removed ${removed} duplicate ${removed === 1 ? "memory" : "memories"} across ${removedGroups} group${removedGroups === 1 ? "" : "s"} ` +
+        `${dryRun ? "Would remove" : "Removed"} ${removed} duplicate ${removed === 1 ? "memory" : "memories"} across ${removedGroups} group${removedGroups === 1 ? "" : "s"} ` +
           `(kept the newest of each; [wording] = matched by trigram similarity, [meaning] = matched by embedding similarity).`,
       );
-      summary.push("Check the removed texts - if any carries a fact the kept memory lacks, merge it in with memory_update:");
+      if (!dryRun) {
+        summary.push("Check the removed texts - if any carries a fact the kept memory lacks, merge it in with memory_update:");
+      }
     }
     if (uncertainPairs > 0) {
       summary.push(
@@ -1583,14 +1667,44 @@ const ocpg = Plugin.define({
           "Remove near-duplicate memories: keeps the newest of each near-duplicate group anywhere in the store and deletes the rest, returning the removed texts. " +
           "Finds duplicates two ways - matching wording (trigram similarity) and matching meaning (embedding similarity, catches the same fact stated in different words). " +
           "A meaning-level pair whose numbers, paths, or names conflict despite high similarity is flagged as [meaning-uncertain] instead of merged - review it and use memory_update yourself. " +
-          "After running it, merge any unique fact from the removed texts into the kept memory via memory_update. Deterministic - run it when the user asks to tidy or consolidate memories.",
+          "After running it, merge any unique fact from the removed texts into the kept memory via memory_update. Deterministic - run it when the user asks to tidy or consolidate memories. " +
+          "Pass dryRun: true to preview what would be removed without deleting anything - review the output, then call again without dryRun to commit. " +
+          "The preview reflects the corpus at the moment it runs; if memories are added in between, a follow-up real call re-evaluates independently and may not match exactly.",
         input: {
           type: "object",
-          properties: {},
+          properties: {
+            dryRun: {
+              type: "boolean",
+              description: "Preview what would be removed without deleting anything.",
+            },
+          },
           additionalProperties: false,
         },
-        execute: async () => {
-          return { content: await consolidate() };
+        execute: async (input) => {
+          return { content: await consolidate(input as ConsolidateArgs) };
+        },
+      });
+      editor.add({
+        name: "memory_tags",
+        options: { codemode: false },
+        description:
+          "List tags currently in use, with counts, most-used first. Check this before writing a new tag to reuse " +
+          "an established one instead of minting a near-duplicate (e.g. 'postgres' vs 'tool:postgres'). Read-only, no side effects.",
+        input: {
+          type: "object",
+          properties: {
+            limit: { type: "number", description: "1-500, default 200" },
+            global: {
+              type: "boolean",
+              description:
+                "Also count tags from other projects' project_fact memories (default: only this " +
+                "project's project_fact memories, plus all stack_fact/episodic memories, which are always global).",
+            },
+          },
+          additionalProperties: false,
+        },
+        execute: async (input) => {
+          return { content: await listTags(input as TagsArgs, { directory }) };
         },
       });
     });
@@ -1614,6 +1728,9 @@ const __internals = {
   forget,
   updateMemory,
   consolidate,
+  listTags,
+  resolveTagsLimit,
+  lengthNudge,
   extractMemoryRequest,  captureFromPrompt,
   invalidateInjection,
   resolveSslMode,

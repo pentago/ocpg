@@ -36,6 +36,49 @@ beforeAll(async () => {
   __internals.invalidateInjection(FIXTURE_PROJECT);
 });
 
+// Genuine test-DB isolation for scenarios that need to see a truly empty
+// `memories` table (e.g. a new user's fresh install). Rather than deleting
+// real rows from the live `public.memories` table (even inside a transaction
+// meant to be rolled back - a stuck/killed process could leave that
+// uncommitted, or worse, commit it), this creates a throwaway schema on the
+// SAME database and points a single dedicated (non-pooled) connection at it
+// via `search_path`. The shared `__internals.sql` pool - and every real row
+// in it - is never touched. The table here is intentionally a minimal subset
+// of production columns (only what listTags' query needs): a future reuser
+// testing a different function should extend it, and should not assume `id`
+// defaults are safe to use for inserts (see the sequence-sharing note below).
+async function withIsolatedMemoriesTable<T>(fn: (client: SQL) => Promise<T>): Promise<T> {
+  const schema = `ocpg_test_iso_${Date.now()}_${Math.random().toString(36).slice(2)}`.replace(/[^a-z0-9_]/gi, "_");
+  const client = new SQL({
+    hostname: process.env.OCPG_HOST || "localhost",
+    port: Number(process.env.OCPG_PORT) || 5432,
+    username: process.env.OCPG_USER || "ocpguser",
+    password: process.env.OCPG_PASSWORD || "",
+    database: process.env.OCPG_DB || "ocpg",
+    max: 1,
+  });
+  try {
+    await client`CREATE SCHEMA ${client(schema)}`;
+    await client`SET search_path TO ${client(schema)}, public`;
+    // Minimal columns only - not a full mirror of deploy/init/01-init.sh. In
+    // particular `id` has no sequence here (nothing in this helper inserts
+    // rows today); a future reuser needing inserts must add one rather than
+    // borrowing the production `memories_id_seq` via a copied `serial` default.
+    await client`
+      CREATE TABLE memories (
+        tags text[] NOT NULL DEFAULT '{}',
+        project text,
+        memory_type text NOT NULL DEFAULT 'project_fact',
+        superseded_by integer
+      )
+    `;
+    return await fn(client);
+  } finally {
+    await client`DROP SCHEMA IF EXISTS ${client(schema)} CASCADE`.catch(() => {});
+    await client.close({ timeout: 0 }).catch(() => {});
+  }
+}
+
 afterAll(async () => {
   // Uses its own client: the final test closes the shared pool on purpose, so
   // cleanup through __internals.sql would silently fail and leak fixture rows.
@@ -2264,6 +2307,273 @@ describe("DB access layer", () => {
       } finally {
         await __internals.sql`DELETE FROM memories WHERE project = ${project}`;
         __internals.invalidateInjection(project);
+      }
+    });
+  });
+
+  describe("memory_tags: list existing tags", () => {
+    test("QA happy: counts tags for this project, respects visibility, hides superseded rows' tags", async () => {
+      const project = "/tmp/ocpg-test-tags-a";
+      const other = "/tmp/ocpg-test-tags-b";
+      const marker = `zzztag${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      const onlyTag = `${marker}-only`;
+      const sharedTag = `${marker}-shared`;
+      try {
+        await __internals.remember({ content: `Fixture for ${marker}: tag counting one.`, tags: [onlyTag, sharedTag] }, { directory: project, sessionID: "t" });
+        await __internals.remember({ content: `Fixture for ${marker}: tag counting two.`, tags: [sharedTag] }, { directory: project, sessionID: "t" });
+        // Foreign project's project_fact tag must not count without global.
+        await __internals.remember({ content: `Fixture for ${marker}: foreign project tag.`, tags: [`${marker}-foreign`] }, { directory: other, sessionID: "t" });
+        // A superseded row's tag must not count either.
+        const supersededStore = await __internals.remember(
+          { content: `Fixture for ${marker}: superseded row tag.`, tags: [`${marker}-superseded`] },
+          { directory: project, sessionID: "t" },
+        );
+        const supersededId = Number(supersededStore.match(/#(\d+)/)?.[1]);
+        await __internals.remember(
+          { content: `Fixture for ${marker}: replacement for the superseded row.`, supersedes: supersededId },
+          { directory: project, sessionID: "t" },
+        );
+
+        const result = await __internals.listTags({ limit: 500 }, { directory: project });
+        expect(result).toContain(`${onlyTag} (1)`);
+        expect(result).toContain(`${sharedTag} (2)`);
+        expect(result).not.toContain(`${marker}-foreign`);
+        expect(result).not.toContain(`${marker}-superseded`);
+
+        const globalResult = await __internals.listTags({ global: true, limit: 500 }, { directory: project });
+        expect(globalResult).toContain(`${marker}-foreign (1)`);
+      } finally {
+        await __internals.sql`DELETE FROM memories WHERE project IN (${project}, ${other})`;
+        __internals.invalidateInjection(project);
+        __internals.invalidateInjection(other);
+      }
+    });
+
+    test("QA edge: a project with no memories of its own does not error, and the result is well-formed", async () => {
+      // Cannot assert "No tags found." unconditionally here: stack_fact tags
+      // are global, so a fresh project with zero rows of its own may still
+      // see them. The behavior this guards is "never errors, never returns
+      // malformed output for a project with no local rows" - not corpus size.
+      const project = `/tmp/ocpg-test-tags-empty-${Date.now()}`;
+      const result = await __internals.listTags({}, { directory: project });
+      if (result !== "No tags found.") {
+        expect(result.split("\n").every((line) => /\(\d+\)$/.test(line))).toBe(true);
+      } else {
+        expect(result).toBe("No tags found.");
+      }
+    });
+
+    test("QA edge: a genuinely empty memories table (N=0, e.g. a fresh install) returns 'No tags found.'", async () => {
+      // Runs against an isolated schema (see withIsolatedMemoriesTable), never
+      // against the live personal corpus - this is the one scenario the test
+      // above structurally cannot cover, since stack_fact tags are global and
+      // this repo's real DB already has dozens of them.
+      await withIsolatedMemoriesTable(async (client) => {
+        const result = await __internals.listTags({}, { directory: "/tmp/ocpg-test-tags-truly-empty" }, client);
+        expect(result).toBe("No tags found.");
+      });
+    });
+
+    test("QA edge: limit caps the returned rows", async () => {
+      const project = `/tmp/ocpg-test-tags-limit-${Date.now()}`;
+      const marker = `zzztaglimit${Date.now()}`;
+      try {
+        for (let i = 0; i < 5; i++) {
+          await __internals.remember({ content: `Fixture for ${marker}: limit row ${i}.`, tags: [`${marker}-${i}`] }, { directory: project, sessionID: "t" });
+        }
+        const result = await __internals.listTags({ limit: 2 }, { directory: project });
+        expect(result.split("\n").length).toBe(2);
+      } finally {
+        await __internals.sql`DELETE FROM memories WHERE project = ${project}`;
+        __internals.invalidateInjection(project);
+      }
+    });
+  });
+
+  describe("memory_consolidate: dryRun mode", () => {
+    test("QA happy: dryRun previews a wording-pass duplicate without deleting it, matches a real run's grouping", async () => {
+      const project = `/tmp/ocpg-test-dryrun-${Date.now()}`;
+      const original = "The edge cache must be purged before a config rollout, otherwise stale rules serve for an hour.";
+      const restated = "Before a config rollout the edge cache must be purged, otherwise stale rules serve for an hour.";
+      try {
+        const first = await __internals.remember({ content: original }, { directory: project, sessionID: "dr" });
+        const firstId = Number(first.match(/#(\d+)/)?.[1]);
+        const second = await __internals.remember({ content: restated }, { directory: project, sessionID: "dr" });
+        const secondId = Number(second.match(/#(\d+)/)?.[1]);
+
+        const preview = await __internals.consolidate({ dryRun: true });
+        expect(preview).toContain("DRY RUN - nothing was deleted");
+        expect(preview).toContain("[wording]");
+        expect(preview).toContain(`would remove #${firstId}`);
+        expect(preview).toContain("edge cache must be purged");
+
+        // Nothing actually removed yet - both rows still present.
+        const [beforeA] = await __internals.sql`SELECT count(*) AS n FROM memories WHERE id = ${firstId}` as { n: string }[];
+        const [beforeB] = await __internals.sql`SELECT count(*) AS n FROM memories WHERE id = ${secondId}` as { n: string }[];
+        expect(Number(beforeA.n)).toBe(1);
+        expect(Number(beforeB.n)).toBe(1);
+
+        // A real run against the same, unmodified snapshot removes exactly
+        // what the preview said it would.
+        const real = await __internals.consolidate();
+        expect(real).not.toContain("DRY RUN");
+        expect(real).toContain("[wording]");
+        expect(real).toContain(`removed #${firstId}`);
+
+        const [afterA] = await __internals.sql`SELECT count(*) AS n FROM memories WHERE id = ${firstId}` as { n: string }[];
+        const [afterB] = await __internals.sql`SELECT count(*) AS n FROM memories WHERE id = ${secondId}` as { n: string }[];
+        expect(Number(afterA.n)).toBe(0);
+        expect(Number(afterB.n)).toBe(1);
+      } finally {
+        await __internals.sql`DELETE FROM memories WHERE project = ${project}`;
+        __internals.invalidateInjection(project);
+      }
+    });
+
+    test("QA: dryRun omitted (or false) behaves exactly as a normal run", async () => {
+      const project = `/tmp/ocpg-test-dryrun-default-${Date.now()}`;
+      const original = "The batch job queue must drain before a schema migration runs, or writes are lost.";
+      const restated = "Before a schema migration runs the batch job queue must drain, or writes are lost.";
+      try {
+        const first = await __internals.remember({ content: original }, { directory: project, sessionID: "dr2" });
+        const firstId = Number(first.match(/#(\d+)/)?.[1]);
+        await __internals.remember({ content: restated }, { directory: project, sessionID: "dr2" });
+
+        const result = await __internals.consolidate({ dryRun: false });
+        expect(result).not.toContain("DRY RUN");
+        expect(result).toContain(`removed #${firstId}`);
+        const [row] = await __internals.sql`SELECT count(*) AS n FROM memories WHERE id = ${firstId}` as { n: string }[];
+        expect(Number(row.n)).toBe(0);
+      } finally {
+        await __internals.sql`DELETE FROM memories WHERE project = ${project}`;
+        __internals.invalidateInjection(project);
+      }
+    });
+
+    // Regression for a bug found while implementing dryRun: pass 2 (meaning)
+    // queries the live table directly. In a real run, pass 1's removed rows
+    // are physically gone by the time pass 2 runs, so it never sees them; in
+    // dryRun nothing is actually deleted, so without an explicit exclusion,
+    // pass 2 would ALSO consider pass 1's "would remove" rows as candidates -
+    // silently diverging from what a real run produces. Fixture similarities
+    // measured directly against the configured embedding model: cos(A,B) =
+    // 0.985, cos(A,C) = 0.952, cos(B,C) = 0.954 (all above
+    // CONSOLIDATE_EMBED_THRESHOLD 0.83, so all three mutually qualify for the
+    // meaning pass); trigram Jaccard(A,B) = 0.878 (above DEDUP_SIMILARITY 0.8,
+    // so the wording pass catches only this pair), Jaccard(A,C) = 0.656 and
+    // Jaccard(B,C) = 0.615 (both below 0.8, so C is wording-pass invisible -
+    // any [meaning] cluster involving C is provably the meaning pass's work).
+    test.skipIf(!hybridReady)(
+      "dryRun's meaning pass does not double-count a row the wording pass already claimed",
+      async () => {
+        const project = `/tmp/ocpg-test-dryrun-parity-${Date.now()}`;
+        const marker = `zzzparity${Date.now()}`;
+        const untilEmbedded = async (id: number): Promise<boolean> => {
+          for (let i = 0; i < 100; i++) {
+            const [row] = await __internals.sql`SELECT embedding IS NOT NULL AS has FROM memories WHERE id = ${id}` as { has: boolean }[];
+            if (row.has) return true;
+            await new Promise((r) => setTimeout(r, 100));
+          }
+          return false;
+        };
+        try {
+          // A: oldest - wording pass removes it (near-verbatim dupe of B).
+          const aStored = await __internals.remember(
+            { content: `Fixture ${marker}: the production database runs Postgres 16 on port 5432.` },
+            { directory: project, sessionID: "dp" },
+          );
+          const aId = Number(aStored.match(/#(\d+)/)?.[1]);
+          // B: wording-pass survivor (a clause-reordered near-verbatim of A).
+          const bStored = await __internals.remember(
+            { content: `Fixture ${marker}: on port 5432, the production database runs Postgres 16.` },
+            { directory: project, sessionID: "dp" },
+          );
+          const bId = Number(bStored.match(/#(\d+)/)?.[1]);
+          // C: a differently-worded meaning-dupe of A/B, low enough trigram
+          // similarity to both that the wording pass never touches it.
+          const cStored = await __internals.remember(
+            { content: `Fixture ${marker}: Postgres 16 is the production database version, listening on port 5432.` },
+            { directory: project, sessionID: "dp" },
+          );
+          const cId = Number(cStored.match(/#(\d+)/)?.[1]);
+          expect(await untilEmbedded(aId)).toBe(true);
+          expect(await untilEmbedded(bId)).toBe(true);
+          expect(await untilEmbedded(cId)).toBe(true);
+
+          const preview = await __internals.consolidate({ dryRun: true });
+          expect(preview).toContain("[wording]");
+          expect(preview).toContain(`would remove #${aId}`);
+          expect(preview).toContain("[meaning]");
+          expect(preview).toContain(`would remove #${bId}`);
+
+          // The bug's signature: A appearing a second time under [meaning],
+          // on top of its legitimate [wording] mention. Buggy behavior would
+          // make this 2; the fix keeps it at exactly 1.
+          const aMentions = (preview.match(new RegExp(`would remove #${aId}\\b`, "g")) ?? []).length;
+          expect(aMentions).toBe(1);
+
+          // A real run against the same, untouched snapshot must land on the
+          // exact same final state the (fixed) preview implied: only C
+          // survives (A via wording, B via meaning, both gone).
+          await __internals.consolidate();
+          const [rowA] = await __internals.sql`SELECT count(*) AS n FROM memories WHERE id = ${aId}` as { n: string }[];
+          const [rowB] = await __internals.sql`SELECT count(*) AS n FROM memories WHERE id = ${bId}` as { n: string }[];
+          const [rowC] = await __internals.sql`SELECT count(*) AS n FROM memories WHERE id = ${cId}` as { n: string }[];
+          expect(Number(rowA.n)).toBe(0);
+          expect(Number(rowB.n)).toBe(0);
+          expect(Number(rowC.n)).toBe(1);
+        } finally {
+          await __internals.sql`DELETE FROM memories WHERE project = ${project}`;
+          __internals.invalidateInjection(project);
+        }
+      },
+    );
+  });
+
+  describe("length nudge on memory_remember / memory_update", () => {
+    const ctx = { directory: `/tmp/ocpg-test-nudge-${Date.now()}`, sessionID: "nudge" };
+
+    test("QA: a write at or under 700 characters gets the plain success message, no nudge", async () => {
+      const content = `Short nudge-test memory ${Date.now()}.`;
+      try {
+        const result = await __internals.remember({ content }, ctx);
+        expect(result).toMatch(/^Stored memory #\d+ \(project [^)]+\)\.$/);
+      } finally {
+        await __internals.sql`DELETE FROM memories WHERE content = ${content}`;
+      }
+    });
+
+    test("QA: a write over 700 characters succeeds and the response includes the nudge", async () => {
+      const content = `Long nudge-test memory ${Date.now()}: ${"x".repeat(750)}`;
+      try {
+        const result = await __internals.remember({ content }, ctx);
+        expect(result).toContain("Stored memory #");
+        expect(result).toContain(`${content.length}`);
+        expect(result).toContain("injection truncates at 600");
+      } finally {
+        await __internals.sql`DELETE FROM memories WHERE content = ${content}`;
+      }
+    });
+
+    test("QA: a write over 4000 characters still fails exactly as before, no nudge involved", async () => {
+      const result = await __internals.remember({ content: "y".repeat(4001) }, ctx);
+      expect(result).toContain("ERROR");
+      expect(result).toContain("max 4000");
+    });
+
+    test("QA: memory_update shows the same nudge when the updated content crosses the threshold", async () => {
+      const content = `Update-nudge-test memory ${Date.now()}.`;
+      try {
+        const stored = await __internals.remember({ content }, ctx);
+        const id = Number(stored.match(/#(\d+)/)?.[1]);
+        const longContent = `Updated nudge-test memory ${Date.now()}: ${"z".repeat(750)}`;
+        const result = await __internals.updateMemory({ id, content: longContent }, ctx);
+        expect(result).toContain(`Updated memory #${id}.`);
+        expect(result).toContain(`${longContent.length}`);
+        expect(result).toContain("injection truncates at 600");
+      } finally {
+        await __internals.sql`DELETE FROM memories WHERE project = ${ctx.directory}`;
+        __internals.invalidateInjection(ctx.directory);
       }
     });
   });

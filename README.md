@@ -34,7 +34,8 @@ database.
   has - memory is a helpful extra, never something that can break or
   stall a request.
 - **Nothing disappears by accident.** Cleaning up duplicate memories is
-  something you trigger on demand, and it always shows you exactly what
+  something you trigger on demand, you can preview exactly what would be
+  removed before committing to it, and it always shows you exactly what
   it removed before it's gone for good.
 - **It's yours.** Everything runs on your own Postgres database and your
   own local embedding model (via Ollama) - no data leaves your machine,
@@ -142,7 +143,7 @@ Uses the `memories` table (`content`, `tags`, `session_id`, `project`,
 `memory_recalls` table (which sessions have recalled a memory, feeding a
 small ranking tiebreak) and the `pg_trgm` + `vector` extensions, and
 exposes `memory_recall` / `memory_remember` / `memory_forget` /
-`memory_update` / `memory_consolidate` tools.
+`memory_update` / `memory_consolidate` / `memory_tags` tools.
 
 ## Install
 
@@ -264,16 +265,19 @@ concurrently with the keyword query, well inside the query budget.
 
 ## Tools
 
-Five agent tools are registered: `memory_remember` (store),
+Six agent tools are registered: `memory_remember` (store),
 `memory_recall` (search), `memory_forget` (delete by id), `memory_update`
-(rewrite an existing memory, keeping its original learned date), and
-`memory_consolidate` (remove near-duplicates on demand). The agent reads
+(rewrite an existing memory, keeping its original learned date),
+`memory_consolidate` (remove near-duplicates on demand), and
+`memory_tags` (list tags currently in use, with counts, to reuse an
+existing tag instead of minting a near-duplicate). The agent reads
 their usage rules from the tool schemas - as the user, the things worth
 knowing are:
 
 - Visibility follows the type (see the table above); `memory_recall`
   takes `global: true` to also search other projects' `project_fact`
   memories (`stack_fact` is always searched regardless of this flag).
+  `memory_tags` takes the same flag, plus `limit` (default 200).
 - Duplicate writes are **never rejected** - `memory_remember` is a plain
   store. Near-duplicates are collapsed out of the injected block
   automatically, and `memory_consolidate` cleans them up when you ask.
@@ -283,8 +287,11 @@ knowing are:
 
 Writes are capped at 4000 characters of content, 10 tags, and 64
 characters per tag; oversized writes are rejected with the actual size
-rather than silently truncated. Memories carry a `type` (`stack_fact`,
-`project_fact` default, or `episodic` - see the visibility table above).
+rather than silently truncated. A write over 700 characters still
+succeeds, but the response includes a note that most of it won't fit in
+the 600-character injected block - a nudge to keep entries short, not a
+rejection. Memories carry a `type` (`stack_fact`, `project_fact` default,
+or `episodic` - see the visibility table above).
 
 ### Automatic capture
 
@@ -305,8 +312,13 @@ whether the model separately decides to store it.
 ### Duplicates
 
 Writes are never rejected for duplicates - cleanup is
-`memory_consolidate`'s job, run on demand. It runs two passes and
-reports which one found each removed group:
+`memory_consolidate`'s job, run on demand. Pass `dryRun: true` to preview
+exactly what a real run would remove, without deleting anything - review
+the output, then call again without `dryRun` to commit. (The preview
+reflects the corpus at that moment; if memories are added in between, a
+follow-up real call re-evaluates independently and may not match
+exactly.) It runs two passes and reports which one found each removed
+group:
 
 - **`[wording]`** - trigram content similarity (>=80%): catches
   restatements that share most of their wording (the old

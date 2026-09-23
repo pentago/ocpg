@@ -616,7 +616,7 @@ function resolveMemoryType(raw: unknown): MemoryType {
 // limit would otherwise reach Postgres as LIMIT NaN.
 function resolveLimit(raw: unknown): number {
   const n = Number(raw);
-  if (!Number.isFinite(n)) return 5;
+  if (!Number.isFinite(n)) return 10;
   return Math.min(Math.max(Math.trunc(n), 1), 20);
 }
 
@@ -1597,7 +1597,7 @@ const ocpg = Plugin.define({
                 "hidden). Each included row is annotated with what replaced it - use this to " +
                 "review history, not for everyday recall.",
             },
-            limit: { type: "number", description: "1-20, default 5" },
+            limit: { type: "number", description: "1-20, default 10" },
           },
           additionalProperties: false,
         },

@@ -514,8 +514,8 @@ describe("DB access layer", () => {
     test("QA failure: non-numeric limit falls back to the default, not LIMIT NaN", async () => {
       // Raw JSON Schema input is not coerced, so a model can send a string here.
       expect(__internals.resolveLimit("3")).toBe(3);
-      expect(__internals.resolveLimit("abc")).toBe(5);
-      expect(__internals.resolveLimit(undefined)).toBe(5);
+      expect(__internals.resolveLimit("abc")).toBe(10);
+      expect(__internals.resolveLimit(undefined)).toBe(10);
       expect(__internals.resolveLimit(0)).toBe(1);
       expect(__internals.resolveLimit(999)).toBe(20);
 
